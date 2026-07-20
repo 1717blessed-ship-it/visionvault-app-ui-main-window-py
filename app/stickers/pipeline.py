@@ -16,10 +16,13 @@ from __future__ import annotations
 import enum
 import hashlib
 import json
+import logging
 import math
 import shutil
 import time
 import uuid
+
+logger = logging.getLogger(__name__)
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -56,6 +59,14 @@ class ProcessingMode(enum.Enum):
     ILLUSTRATION  = "Ilustración"
     EXISTING      = "Sticker existente"
     LOGO          = "Logo"
+
+
+class BorderMode(enum.Enum):
+    """Resultado del análisis de borde blanco sobre la imagen original."""
+    PRESERVE_EXISTING_BORDER = "borde_existente"
+    GENERATE_WHITE_BORDER    = "generar_borde"
+    NO_BORDER_REQUIRED       = "sin_borde"
+    AMBIGUOUS_WHITE_ON_WHITE = "ambiguo_blanco_sobre_blanco"
 
 
 class QualityPreset(enum.Enum):
@@ -1212,7 +1223,9 @@ class StickerProcessor:
             return Image.fromarray(alpha, mode="L")
         except (ImportError, ModuleNotFoundError):
             return StickerProcessor._grow_perimeter_background_alpha(
-                image, white_tolerance)    @staticmethod
+                image, white_tolerance)
+
+    @staticmethod
     def _uniform_background_alpha(image, tolerance: int):
         """Elimina el fondo conectado a los bordes del canvas, incluyendo bordes blancos externos.
         
@@ -1765,6 +1778,7 @@ class StickerProcessor:
                     "continuity": best_result["continuity"],
                 }
             except Exception:
+                logger.exception("Error en análisis CV de borde blanco estructural")
                 return {
                     "has_border": False,
                     "white_percentage": 0.0,
@@ -1772,11 +1786,136 @@ class StickerProcessor:
                     "continuity": 0.0,
                 }
         except Exception:
+            logger.exception("Error analizando el borde blanco estructural")
             return {
                 "has_border": False,
                 "white_percentage": 0.0,
                 "estimated_border_thickness_px": 0.0,
                 "continuity": 0.0,
+            }
+
+    @staticmethod
+    def analyze_original_border_structure(rgba):
+        """Analiza la imagen RGBA original antes de cualquier flood fill.
+
+        Determina si la imagen tiene un borde blanco exterior distinguible
+        del fondo, o si fondo y borde son indistinguibles (ambiguo).
+
+        Retorna un dict con:
+          mode: BorderMode
+          background_is_white: bool
+          border_distinguishable: bool
+          white_band_ratio: float
+          bg_color: tuple(R, G, B)
+        """
+        import numpy as np
+
+        rgb = np.asarray(rgba.convert("RGB"), dtype=np.uint8)
+        h, w = rgb.shape[:2]
+
+        alpha_ch = rgba.getchannel("A")
+        has_transparency = alpha_ch.getextrema()[0] < 250
+        if has_transparency:
+            return {
+                "mode": BorderMode.NO_BORDER_REQUIRED,
+                "background_is_white": False,
+                "border_distinguishable": False,
+                "white_band_ratio": 0.0,
+                "bg_color": (0, 0, 0),
+            }
+
+        perimeter = np.concatenate([
+            rgb[0, :], rgb[h - 1, :],
+            rgb[1:h - 1, 0], rgb[1:h - 1, w - 1]
+        ])
+        bg_color = tuple(int(v) for v in np.median(perimeter, axis=0))
+
+        bg_lum = (0.299 * bg_color[0]
+                  + 0.587 * bg_color[1]
+                  + 0.114 * bg_color[2])
+        background_is_white = bg_lum >= 248
+
+        try:
+            import cv2
+
+            bg_arr = np.array(bg_color, dtype=np.int16)
+            diffs = np.abs(rgb.astype(np.int16) - bg_arr)
+            max_diff = diffs.max(axis=2)
+            is_bg = max_diff < 35
+
+            is_white = (
+                (rgb[:, :, 0] >= 245)
+                & (rgb[:, :, 1] >= 245)
+                & (rgb[:, :, 2] >= 245)
+            )
+
+            design = (~is_bg) & (~is_white)
+
+            if not design.any():
+                mode = (BorderMode.AMBIGUOUS_WHITE_ON_WHITE
+                        if background_is_white
+                        else BorderMode.GENERATE_WHITE_BORDER)
+                return {
+                    "mode": mode,
+                    "background_is_white": background_is_white,
+                    "border_distinguishable": False,
+                    "white_band_ratio": 0.0,
+                    "bg_color": bg_color,
+                }
+
+            dilate_r = 15
+            k = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (dilate_r * 2 + 1, dilate_r * 2 + 1))
+            dilated = cv2.dilate(
+                design.astype(np.uint8) * 255, k, iterations=1)
+            ring = (dilated > 127) & (~design)
+
+            if not ring.any():
+                return {
+                    "mode": BorderMode.GENERATE_WHITE_BORDER,
+                    "background_is_white": background_is_white,
+                    "border_distinguishable": False,
+                    "white_band_ratio": 0.0,
+                    "bg_color": bg_color,
+                }
+
+            white_in_ring = float((is_white & ring).sum()
+                                  / max(1, ring.sum()))
+
+            has_design = float(design.sum()) > (h * w * 0.005)
+            border_distinguishable = (
+                has_design
+                and white_in_ring > 0.55
+                and not background_is_white
+            )
+
+            if background_is_white and has_design:
+                mode = BorderMode.AMBIGUOUS_WHITE_ON_WHITE
+            elif border_distinguishable:
+                mode = BorderMode.PRESERVE_EXISTING_BORDER
+            else:
+                mode = BorderMode.GENERATE_WHITE_BORDER
+
+            return {
+                "mode": mode,
+                "background_is_white": background_is_white,
+                "border_distinguishable": border_distinguishable,
+                "white_band_ratio": white_in_ring,
+                "bg_color": bg_color,
+            }
+
+        except Exception:
+            logger.exception("Error en analyze_original_border_structure")
+            mode = (BorderMode.AMBIGUOUS_WHITE_ON_WHITE
+                    if background_is_white
+                    else BorderMode.GENERATE_WHITE_BORDER)
+            return {
+                "mode": mode,
+                "background_is_white": background_is_white,
+                "border_distinguishable": False,
+                "white_band_ratio": 0.0,
+                "bg_color": bg_color,
             }
 
     @staticmethod
@@ -2111,57 +2250,6 @@ class StickerProcessor:
                     pts = out
                 return pts
 
-            if p.remove_spikes:
-                contours, hier = cv2.findContours(
-                    arr, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_TC89_L1)
-                if contours:
-                    refined = np.zeros_like(arr)
-                    for ci, cnt in enumerate(contours):
-                        is_hole = hier is not None and hier[0][ci][3] != -1
-                        if is_hole or len(cnt) < 8:
-                            if len(cnt) >= 3:
-                                cv2.fillPoly(refined,
-                                             [cnt.reshape(-1, 1, 2)],
-                                             0 if is_hole else 255)
-                            continue
-                        pts  = cnt.reshape(-1, 2).astype(np.float64)
-                        hidx = cv2.convexHull(cnt, returnPoints=False)
-                        if hidx is None or len(hidx) < 3:
-                            cv2.fillPoly(refined, [cnt], 255)
-                            continue
-                        hf       = sorted(hidx.flatten().tolist())
-                        new_pts: list = []
-                        for si in range(len(hf)):
-                            ia, ib = hf[si], hf[(si + 1) % len(hf)]
-                            pa, pb = pts[ia], pts[ib]
-                            new_pts.append((float(pa[0]), float(pa[1])))
-                            seg = (pts[ia + 1:ib] if ib > ia
-                                   else np.vstack([pts[ia + 1:], pts[:ib]]))
-                            if not len(seg):
-                                continue
-                            ch = pb - pa
-                            cl = float(np.linalg.norm(ch))
-                            if cl < 1e-6:
-                                new_pts.extend(
-                                    (float(q[0]), float(q[1])) for q in seg)
-                                continue
-                            cu   = ch / cl
-                            perp = np.abs((seg - pa)[:, 0] * (-cu[1]) +
-                                          (seg - pa)[:, 1] * cu[0])
-                            if not (perp.max() / px / cl * px < MAX_RATIO
-                                    and cl / px < MAX_MOUTH_MM):
-                                new_pts.extend(
-                                    (float(q[0]), float(q[1])) for q in seg)
-                        if len(new_pts) < 3:
-                            cv2.fillPoly(refined, [cnt], 255)
-                            continue
-                        poly = np.array(
-                            [[int(round(x)), int(round(y))]
-                             for x, y in new_pts], dtype=np.int32)
-                        cv2.fillPoly(refined, [poly], 255)
-                    arr = refined
-
-            # ── 7. Suavizar curvas ─────────────────────────────────────────
             if p.simplify_curves and dp_tol > 0:
                 c2, h2 = cv2.findContours(
                     arr, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
@@ -2297,6 +2385,9 @@ class StickerProcessor:
         # ── 3. Despachar al flujo correspondiente ─────────────────────────────
         case = classify_result.case
 
+        border_analysis = self.analyze_original_border_structure(rgba)
+        border_mode = border_analysis["mode"]
+
         # Construir máscara de protección en coordenadas de la imagen fuente
         prot_mask = None
         if protection_zones:
@@ -2335,16 +2426,17 @@ class StickerProcessor:
         artifacts["mask_segmentation_raw"] = str(debug_raw_mask_path)
 
         preserve_existing_white_source = (
-            case == ImageCase.C
-            and classify_result.uniform_background
-            and self._detect_white_border_structural(rgba, raw_alpha)
+            border_mode == BorderMode.PRESERVE_EXISTING_BORDER
         )
         white_border_before = self._white_outer_border_pixels(rgba, raw_alpha)
 
-        # Un PNG ya transparente trae un contorno decidido por el diseño.
-        # Evitamos que la limpieza geométrica lo expanda o deforme.
-        if ((case == ImageCase.A and not preserve_full_image)
-                or preserve_existing_white_source):
+        skip_postprocessing = (
+            (case == ImageCase.A and not preserve_full_image)
+            or preserve_existing_white_source
+            or border_mode == BorderMode.AMBIGUOUS_WHITE_ON_WHITE
+        )
+
+        if skip_postprocessing:
             refined_alpha = raw_alpha
             postprocess_meta = {
                 "holes_detected": 0,
