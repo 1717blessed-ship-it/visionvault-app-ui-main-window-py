@@ -41,6 +41,7 @@ def repo(temp_db):
         ("session_token_hash", "TEXT"),
         ("session_expires_at", "TEXT"),
         ("session_last_used_at", "TEXT"),
+        ("app_version", "TEXT DEFAULT ''"),
     ):
         if column not in existing_columns:
             conn.execute(f"ALTER TABLE mobile_devices ADD COLUMN {column} {definition}")
@@ -443,6 +444,12 @@ class TestSessionTokenGeneration:
         device = repo.validate_session_token(session_token)
         assert device is not None
         assert device["id"] == device_id
+        # Verificar campos adicionales requeridos por _get_device_status
+        assert "registered_at" in device
+        assert "app_version" in device
+        assert "is_paused" in device
+        # Verificar que is_paused es 0 para dispositivo activo
+        assert device["is_paused"] == 0
     
     def test_invalid_session_token(self, repo):
         """Session token inválido es rechazado."""

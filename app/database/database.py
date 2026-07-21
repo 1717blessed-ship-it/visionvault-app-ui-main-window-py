@@ -931,6 +931,7 @@ class ImageDatabase:
             ("session_token_hash", "TEXT"),
             ("session_expires_at", "TEXT"),
             ("session_last_used_at", "TEXT"),
+            ("app_version", "TEXT DEFAULT ''"),
         ):
             if column not in existing_columns:
                 self.connection.execute(f"ALTER TABLE mobile_devices ADD COLUMN {column} {definition}")

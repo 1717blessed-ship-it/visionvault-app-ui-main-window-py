@@ -333,7 +333,8 @@ class EventRepository:
         now = datetime.now().isoformat(timespec="seconds")
         
         device = self.conn.execute(
-            """SELECT id, device_name, platform, push_token, active, session_expires_at
+            """SELECT id, device_name, platform, push_token, active, session_expires_at,
+                      created_at, app_version
                FROM mobile_devices
                WHERE session_token_hash = ? AND active = 1""",
             (session_token_hash,),
@@ -355,7 +356,14 @@ class EventRepository:
         )
         self.conn.commit()
         
-        return dict(device)
+        # Convertir a dict con nombres de campos estables
+        device_dict = dict(device)
+        # Mapear created_at a registered_at para compatibilidad
+        device_dict["registered_at"] = device_dict["created_at"]
+        # is_paused se deriva de active (0 = pausado, 1 = activo)
+        device_dict["is_paused"] = 0 if device_dict["active"] == 1 else 1
+        
+        return device_dict
 
     # ── Preferencias ───────────────────────────────────────────────────────
 

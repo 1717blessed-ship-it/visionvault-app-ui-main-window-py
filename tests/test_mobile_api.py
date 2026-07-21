@@ -44,6 +44,7 @@ def repo(temp_db):
         ("session_token_hash", "TEXT"),
         ("session_expires_at", "TEXT"),
         ("session_last_used_at", "TEXT"),
+        ("app_version", "TEXT DEFAULT ''"),
     ):
         if column not in existing_columns:
             conn.execute(f"ALTER TABLE mobile_devices ADD COLUMN {column} {definition}")
@@ -450,7 +451,7 @@ class TestChangeJobStageEndpoint:
         
         handler._change_job_stage(job["id"], {"id": device_id, "device_name": "Test Device"})
         
-        handler._send_error.assert_called_once_with(400, "stage field is required")
+        handler._send_error.assert_called_once_with(400, "stage field is required and cannot be empty")
     
     def test_change_stage_invalid_json(self, repo, event_bus, sample_device, sample_order):
         """JSON inválido retorna 400."""
