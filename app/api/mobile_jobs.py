@@ -52,7 +52,7 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
     def __init__(self, *args, event_repo: EventRepository, event_bus, **kwargs):
         self.event_repo = event_repo
         self.event_bus = event_bus
-        self.stage_service = ProductionStageService(event_repo.connection, event_bus)
+        self.stage_service = ProductionStageService(event_repo.conn, event_bus)
         super().__init__(*args, **kwargs)
 
     def _send_json_response(self, status_code: int, data: dict[str, Any]) -> None:

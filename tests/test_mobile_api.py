@@ -1148,3 +1148,38 @@ class TestHealthEndpoint:
         assert handler.response.status_code == 200
         data = json.loads(handler.response.body.decode("utf-8"))
         assert data["status"] == "ok"
+
+
+class TestHandlerInitRealRepo:
+    """Regresión: MobileJobsHandler.__init__ con EventRepository real."""
+
+    def test_init_does_not_raise(self, repo, event_bus):
+        """MobileJobsHandler se instancia con EventRepository real sin error."""
+        handler = MobileJobsHandler.__new__(MobileJobsHandler)
+        with __import__("unittest.mock", fromlist=["patch"]).patch(
+            "app.api.mobile_jobs.BaseHTTPRequestHandler.__init__"
+        ):
+            handler.__init__(event_repo=repo, event_bus=event_bus)
+        assert handler.event_repo is repo
+
+    def test_stage_service_receives_correct_connection(self, repo, event_bus):
+        """ProductionStageService recibe repo.conn (sqlite3.Connection)."""
+        handler = MobileJobsHandler.__new__(MobileJobsHandler)
+        with __import__("unittest.mock", fromlist=["patch"]).patch(
+            "app.api.mobile_jobs.BaseHTTPRequestHandler.__init__"
+        ):
+            handler.__init__(event_repo=repo, event_bus=event_bus)
+        from app.services.production_stage_service import ProductionStageService
+        assert isinstance(handler.stage_service, ProductionStageService)
+        assert handler.stage_service.conn is repo.conn
+
+    def test_protected_endpoint_returns_401_not_crash(self, repo, event_bus):
+        """GET /api/v1/mobile/jobs sin token devuelve 401 en vez de cerrar conexión."""
+        handler = create_handler(repo, event_bus)
+        handler.headers = {}
+        handler.path = "/api/v1/mobile/jobs"
+        handler._send_error = Mock()
+
+        handler.do_GET()
+
+        handler._send_error.assert_called_once_with(401, "Authorization header missing")
