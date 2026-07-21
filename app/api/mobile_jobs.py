@@ -94,6 +94,12 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
                 self._get_job_detail(int(job_id), device)
             else:
                 self._send_error(400, "Invalid job ID")
+        elif parsed.path == "/api/mobile/reference/stages":
+            self._get_stages()
+        elif parsed.path == "/api/mobile/reference/workflows":
+            self._get_workflows()
+        elif parsed.path == "/api/mobile/reference/materials":
+            self._get_materials()
         else:
             self._send_error(404, "Endpoint not found")
 
@@ -263,6 +269,214 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
         except Exception as e:
             logger.error("Error changing job stage: %s", e)
             self._send_error(500, f"Error changing job stage: {e}")
+
+    def _get_stages(self) -> None:
+        """Obtiene el catálogo completo de etapas."""
+        try:
+            # Catálogo de etapas de producción
+            stages = [
+                {
+                    "key": "Recibido",
+                    "label": "Recibido",
+                    "category": "inicio",
+                    "description": "Trabajo recibido, aún sin asignar",
+                    "color": "#9E9E9E",
+                },
+                {
+                    "key": "Esperando archivos",
+                    "label": "Esperando archivos",
+                    "category": "inicio",
+                    "description": "Pendiente de recibir archivos del cliente",
+                    "color": "#FF9800",
+                },
+                {
+                    "key": "Diseño",
+                    "label": "Diseño",
+                    "category": "preprensa",
+                    "description": "En proceso de diseño o armado",
+                    "color": "#2196F3",
+                },
+                {
+                    "key": "Corrección",
+                    "label": "Corrección",
+                    "category": "preprensa",
+                    "description": "En corrección o ajustes",
+                    "color": "#9C27B0",
+                },
+                {
+                    "key": "Aprobación cliente",
+                    "label": "Aprobación cliente",
+                    "category": "preprensa",
+                    "description": "Esperando aprobación del cliente",
+                    "color": "#FF9800",
+                },
+                {
+                    "key": "RIP",
+                    "label": "RIP",
+                    "category": "preprensa",
+                    "description": "Procesamiento en RIP",
+                    "color": "#00BCD4",
+                },
+                {
+                    "key": "Impresión",
+                    "label": "Impresión",
+                    "category": "produccion",
+                    "description": "En proceso de impresión",
+                    "color": "#4CAF50",
+                },
+                {
+                    "key": "Laminado",
+                    "label": "Laminado",
+                    "category": "produccion",
+                    "description": "En proceso de laminado",
+                    "color": "#00BCD4",
+                },
+                {
+                    "key": "Acabado",
+                    "label": "Acabado",
+                    "category": "produccion",
+                    "description": "En proceso de acabado (corte, armado, etc.)",
+                    "color": "#795548",
+                },
+                {
+                    "key": "Control de calidad",
+                    "label": "Control de calidad",
+                    "category": "produccion",
+                    "description": "Revisión de calidad final",
+                    "color": "#9C27B0",
+                },
+                {
+                    "key": "Finalizado",
+                    "label": "Finalizado",
+                    "category": "cierre",
+                    "description": "Trabajo finalizado, listo para entrega",
+                    "color": "#4CAF50",
+                },
+                {
+                    "key": "Entregado",
+                    "label": "Entregado",
+                    "category": "cierre",
+                    "description": "Entregado al cliente",
+                    "color": "#8BC34A",
+                },
+            ]
+
+            self._send_json_response(200, {"stages": stages})
+
+        except Exception as e:
+            logger.error("Error getting stages: %s", e)
+            self._send_error(500, f"Error getting stages: {e}")
+
+    def _get_workflows(self) -> None:
+        """Obtiene los flujos de trabajo por tipo de material."""
+        try:
+            # Workflows predefinidos
+            workflows = {
+                "default": {
+                    "name": "Flujo estándar",
+                    "stages": [
+                        "Recibido",
+                        "Diseño",
+                        "Aprobación cliente",
+                        "Impresión",
+                        "Acabado",
+                        "Finalizado",
+                    ],
+                },
+                "vinilo": {
+                    "name": "Vinilo adhesivo",
+                    "stages": [
+                        "Recibido",
+                        "Diseño",
+                        "Impresión",
+                        "Laminado",
+                        "Acabado",
+                        "Finalizado",
+                    ],
+                },
+                "lona": {
+                    "name": "Lona",
+                    "stages": [
+                        "Recibido",
+                        "Diseño",
+                        "Impresión",
+                        "Acabado",
+                        "Finalizado",
+                    ],
+                },
+                "banner": {
+                    "name": "Banner",
+                    "stages": [
+                        "Recibido",
+                        "Diseño",
+                        "Impresión",
+                        "Laminado",
+                        "Acabado",
+                        "Finalizado",
+                    ],
+                },
+                "rigido": {
+                    "name": "Material rígido",
+                    "stages": [
+                        "Recibido",
+                        "Diseño",
+                        "Impresión",
+                        "Acabado",
+                        "Control de calidad",
+                        "Finalizado",
+                    ],
+                },
+                "textil": {
+                    "name": "Textil",
+                    "stages": [
+                        "Recibido",
+                        "Diseño",
+                        "RIP",
+                        "Impresión",
+                        "Acabado",
+                        "Finalizado",
+                    ],
+                },
+            }
+
+            self._send_json_response(200, {"workflows": workflows})
+
+        except Exception as e:
+            logger.error("Error getting workflows: %s", e)
+            self._send_error(500, f"Error getting workflows: {e}")
+
+    def _get_materials(self) -> None:
+        """Obtiene el catálogo de materiales disponibles."""
+        try:
+            # Obtener materiales desde la base de datos
+            rows = self.event_repo.conn.execute(
+                """SELECT DISTINCT material 
+                   FROM order_jobs 
+                   WHERE material IS NOT NULL AND material != ''
+                   ORDER BY material"""
+            ).fetchall()
+
+            materials = [row[0] for row in rows]
+
+            # Si no hay materiales en DB, devolver lista predefinida
+            if not materials:
+                materials = [
+                    "Vinilo",
+                    "Lona",
+                    "Banner",
+                    "Microperforado",
+                    "PVC",
+                    "Acrílico",
+                    "Foam",
+                    "Tela",
+                    "Canvas",
+                ]
+
+            self._send_json_response(200, {"materials": materials})
+
+        except Exception as e:
+            logger.error("Error getting materials: %s", e)
+            self._send_error(500, f"Error getting materials: {e}")
 
     def log_message(self, format, *args):
         """Override para evitar logging default de HTTPServer."""
