@@ -131,10 +131,25 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
         """Lista jobs con filtros y paginación."""
         params = self._parse_url_params()
         
-        # Filtros
-        filter_type = params.get("filter", "")  # pending, production, ready
-        limit = min(100, max(1, int(params.get("limit", "20"))))
-        offset = max(0, int(params.get("offset", "0")))
+        # Filtros con validación
+        filter_type = params.get("filter", "")
+        valid_filters = ["", "pending", "production", "ready"]
+        if filter_type not in valid_filters:
+            self._send_error(400, f"Invalid filter value. Valid options: {', '.join(valid_filters[1:])}")
+            return
+
+        # Validación de paginación
+        try:
+            limit = min(100, max(1, int(params.get("limit", "20"))))
+        except ValueError:
+            self._send_error(400, "Invalid limit value, must be an integer")
+            return
+
+        try:
+            offset = max(0, int(params.get("offset", "0")))
+        except ValueError:
+            self._send_error(400, "Invalid offset value, must be an integer")
+            return
         
         # Construir query base
         query = """
@@ -184,6 +199,7 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
                 "total": total,
                 "limit": limit,
                 "offset": offset,
+                "filter": filter_type if filter_type else "all",
             })
             
         except Exception as e:
@@ -310,17 +326,48 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
     def _change_job_stage(self, job_id: int, device: dict[str, Any]) -> None:
         """Cambia la etapa de un job."""
         try:
+            # Validar que el job existe antes de leer el body
+            job_check = self.event_repo.conn.execute(
+                "SELECT id FROM order_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+
+            if not job_check:
+                self._send_error(404, f"Job with ID {job_id} not found")
+                return
+
             # Leer body
             content_length = int(self.headers.get("Content-Length", 0))
+            if content_length == 0:
+                self._send_error(400, "Request body is required")
+                return
+
+            if content_length > 10000:  # 10KB max
+                self._send_error(413, "Request body too large (max 10KB)")
+                return
+
             body = self.rfile.read(content_length)
             data = json.loads(body.decode("utf-8"))
             
-            new_stage = data.get("stage")
+            new_stage = data.get("stage", "").strip()
             if not new_stage:
-                self._send_error(400, "stage field is required")
+                self._send_error(400, "stage field is required and cannot be empty")
+                return
+
+            # Validar longitud de la etapa
+            if len(new_stage) > 100:
+                self._send_error(400, "stage name too long (max 100 characters)")
                 return
             
-            notes = data.get("notes", "")
+            notes = data.get("notes", "").strip()
+            if len(notes) > 500:
+                self._send_error(400, "notes too long (max 500 characters)")
+                return
+
+            operator_name = data.get("operator_name", "").strip()
+            if len(operator_name) > 100:
+                self._send_error(400, "operator_name too long (max 100 characters)")
+                return
             
             # Cambiar etapa usando el servicio
             success, message, job_data = self.stage_service.change_job_stage(
@@ -328,7 +375,7 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
                 new_stage=new_stage,
                 device_id=device["id"],
                 device_name=device["device_name"],
-                operator_name=data.get("operator_name", ""),
+                operator_name=operator_name,
                 source="mobile",
                 notes=notes,
             )
