@@ -30,7 +30,10 @@ class _HomePageState extends State<HomePage> {
   final FlutterSecureStorage _secureStorage = const FlutterSecureStorage();
   String? _sessionToken;
   String _baseUrl = 'http://localhost:8766';
+  bool _configLoaded = false;
+  String? _configError;
   static const int _pairingPort = 8765;
+  static const _unreachableHosts = {'localhost', '127.0.0.1', '0.0.0.0', ''};
 
   String get _pairingUrl {
     final uri = Uri.parse(_baseUrl);
@@ -65,11 +68,27 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _loadServerConfig() async {
-    final repository = ServerConfigRepository(DatabaseHelper());
-    final config = await repository.getConfig();
-    setState(() {
-      _baseUrl = config.baseUrl;
-    });
+    try {
+      final repository = ServerConfigRepository(DatabaseHelper());
+      final config = await repository.getConfig();
+      if (_unreachableHosts.contains(config.host)) {
+        setState(() {
+          _configLoaded = false;
+          _configError = 'Configurá la IP de la PC antes de vincular';
+        });
+        return;
+      }
+      setState(() {
+        _baseUrl = config.baseUrl;
+        _configLoaded = true;
+        _configError = null;
+      });
+    } catch (e) {
+      setState(() {
+        _configLoaded = false;
+        _configError = 'Error cargando configuración: $e';
+      });
+    }
   }
 
   Future<void> _saveSessionToken(String token) async {
@@ -170,6 +189,8 @@ class _HomePageState extends State<HomePage> {
     setState(() {
       _pairingStatus = 'Vinculando...';
     });
+
+    print('[PAIRING] Using URL: $_pairingUrl');
 
     try {
       final response = await http.post(
@@ -364,7 +385,7 @@ class _HomePageState extends State<HomePage> {
                   ),
                 ),
               );
-              _loadServerConfig();
+              await _loadServerConfig();
             },
           ),
         ],
@@ -409,10 +430,48 @@ class _HomePageState extends State<HomePage> {
                           maxLength: 6,
                         ),
                         const SizedBox(height: 8),
+                        if (_configError != null)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 8),
+                            child: Row(
+                              children: [
+                                const Icon(Icons.warning_amber, color: Colors.orange, size: 16),
+                                const SizedBox(width: 6),
+                                Expanded(
+                                  child: Text(
+                                    _configError!,
+                                    style: const TextStyle(color: Colors.orange, fontSize: 12),
+                                  ),
+                                ),
+                                TextButton(
+                                  onPressed: () async {
+                                    await Navigator.push(
+                                      context,
+                                      MaterialPageRoute(
+                                        builder: (context) => ServerConfigScreen(
+                                          repository: ServerConfigRepository(DatabaseHelper()),
+                                          onTestConnection: (baseUrl) async {
+                                            final client = SyncApiClient(baseUrl: baseUrl);
+                                            try {
+                                              return await client.testConnection();
+                                            } finally {
+                                              client.close();
+                                            }
+                                          },
+                                        ),
+                                      ),
+                                    );
+                                    await _loadServerConfig();
+                                  },
+                                  child: const Text('Abrir Configuración'),
+                                ),
+                              ],
+                            ),
+                          ),
                         ElevatedButton.icon(
-                          onPressed: _pairDevice,
+                          onPressed: _configLoaded ? _pairDevice : null,
                           icon: const Icon(Icons.link),
-                          label: const Text('Vincular'),
+                          label: Text(_configLoaded ? 'Vincular' : 'Configurar servidor primero'),
                         ),
                       ],
                     )
