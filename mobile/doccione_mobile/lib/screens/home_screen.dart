@@ -29,7 +29,13 @@ class _HomePageState extends State<HomePage> {
   final TextEditingController _pairingCodeController = TextEditingController();
   final FlutterSecureStorage _secureStorage = const FlutterSecureStorage();
   String? _sessionToken;
-  String _baseUrl = 'http://localhost:8765';
+  String _baseUrl = 'http://localhost:8766';
+  static const int _pairingPort = 8765;
+
+  String get _pairingUrl {
+    final uri = Uri.parse(_baseUrl);
+    return '${uri.scheme}://${uri.host}:$_pairingPort';
+  }
 
   @override
   void initState() {
@@ -130,7 +136,7 @@ class _HomePageState extends State<HomePage> {
   Future<void> _updateTokenOnServer(String oldToken, String newToken) async {
     try {
       final response = await http.post(
-        Uri.parse('$_baseUrl/api/device/update-token'),
+        Uri.parse('$_pairingUrl/api/device/update-token'),
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({
           'old_token': oldToken,
@@ -167,7 +173,7 @@ class _HomePageState extends State<HomePage> {
 
     try {
       final response = await http.post(
-        Uri.parse('$_baseUrl/api/pair/validate'),
+        Uri.parse('$_pairingUrl/api/pair/validate'),
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({
           'code': code,

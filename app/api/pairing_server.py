@@ -140,7 +140,7 @@ class PairingServer:
             def handler(*args, **kwargs):
                 return PairingRequestHandler(*args, repo_callback=self.repo_callback, **kwargs)
 
-            self.server = HTTPServer(("localhost", self.port), handler)
+            self.server = HTTPServer(("0.0.0.0", self.port), handler)
             self.server_thread = Thread(target=self.server.serve_forever, daemon=True)
             self.server_thread.start()
             logger.info("Servidor de emparejamiento iniciado en puerto %d", self.port)

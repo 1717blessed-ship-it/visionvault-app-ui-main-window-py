@@ -24,6 +24,7 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
   
   List<OrderWithDetails> _orders = [];
   bool _isLoading = true;
+  bool _isSyncing = false;
   String? _selectedStatus;
   String? _selectedPriority;
   bool _showArchived = false;
@@ -54,6 +55,8 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
   }
 
   Future<void> _loadOrders() async {
+    if (_isSyncing) return; // Skip if syncing
+    
     setState(() {
       _isLoading = true;
     });
@@ -85,6 +88,11 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
         );
       }
     }
+  }
+
+  Future<void> _onRefresh() async {
+    // Just reload orders - sync is handled by DashboardScreen
+    await _loadOrders();
   }
 
   void _onStatusFilterChanged(String? status) {
@@ -215,7 +223,7 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
                 : _orders.isEmpty
                     ? _buildEmptyState()
                     : RefreshIndicator(
-                        onRefresh: _loadOrders,
+                        onRefresh: _onRefresh,
                         child: ListView.builder(
                           itemCount: _orders.length,
                           itemBuilder: (context, index) {
