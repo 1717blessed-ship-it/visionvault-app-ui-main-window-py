@@ -5,7 +5,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:http/http.dart' as http;
-import '../widgets/sync_status_card.dart';
+import 'dashboard_screen.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -314,6 +314,11 @@ class _HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
+    // If paired, show dashboard; otherwise show pairing screen
+    if (_isPaired && _sessionToken != null) {
+      return DashboardScreen(sessionToken: _sessionToken);
+    }
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Doccione Mobile'),
@@ -322,11 +327,6 @@ class _HomePageState extends State<HomePage> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          // Sync Status Card
-          SyncStatusCard(
-            sessionToken: _sessionToken,
-          ),
-          const SizedBox(height: 16),
           // Vinculación de dispositivo
           Card(
             child: Padding(

@@ -14,10 +14,12 @@ import '../models/sync_result.dart';
 /// Widget that displays synchronization status and controls
 class SyncStatusCard extends StatefulWidget {
   final String? sessionToken;
+  final VoidCallback? onSyncCompleted;
 
   const SyncStatusCard({
     super.key,
     this.sessionToken,
+    this.onSyncCompleted,
   });
 
   @override
@@ -110,6 +112,8 @@ class _SyncStatusCardState extends State<SyncStatusCard> {
           if (result.isSuccess) {
             _syncStatus = 'Sincronización completada';
             _showSuccess(result);
+            // Call the callback if provided
+            widget.onSyncCompleted?.call();
           } else {
             _syncStatus = 'Error en sincronización';
             _showError(result.error ?? 'Error desconocido');

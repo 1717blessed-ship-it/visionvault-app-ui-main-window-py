@@ -1,6 +1,10 @@
 import 'package:sqflite/sqflite.dart';
 import '../models/order.dart';
+import '../models/dashboard_metrics.dart';
 import 'database_helper.dart';
+import 'sync_state_repository.dart';
+import 'jobs_repository.dart';
+import 'clients_repository.dart';
 
 /// Repository for managing orders persistence with upsert support
 class OrdersRepository {
@@ -111,5 +115,64 @@ class OrdersRepository {
   Future<void> clearOrders() async {
     final db = await _dbHelper.database;
     await db.delete('orders');
+  }
+
+  /// Get dashboard metrics with aggregated statistics
+  Future<DashboardMetrics> getDashboardMetrics(
+    SyncStateRepository syncStateRepo,
+    JobsRepository jobsRepo,
+    ClientsRepository clientsRepo,
+  ) async {
+    final db = await _dbHelper.database;
+    
+    // Get today's date in YYYY-MM-DD format
+    final today = DateTime.now();
+    final todayStr = '${today.year}-${today.month.toString().padLeft(2, '0')}-${today.day.toString().padLeft(2, '0')}';
+    
+    // Query orders statistics
+    final result = await db.rawQuery('''
+      SELECT 
+        COUNT(CASE WHEN DATE(order_date) = ? THEN 1 END) as orders_today,
+        COUNT(CASE WHEN status = 'production' THEN 1 END) as orders_production,
+        COUNT(CASE WHEN status = 'pending' THEN 1 END) as orders_pending,
+        COUNT(CASE WHEN status = 'completed' THEN 1 END) as orders_completed
+      FROM orders
+    ''', [todayStr]);
+    
+    // Get counts from other repositories
+    final totalJobs = await jobsRepo.countJobs();
+    final totalClients = await clientsRepo.countClients();
+    
+    // Get sync state
+    final syncState = await syncStateRepo.getSyncState();
+    
+    final map = result.first;
+    return DashboardMetrics(
+      ordersToday: (map['orders_today'] as int?) ?? 0,
+      ordersInProduction: (map['orders_production'] as int?) ?? 0,
+      ordersPending: (map['orders_pending'] as int?) ?? 0,
+      ordersCompleted: (map['orders_completed'] as int?) ?? 0,
+      totalJobs: totalJobs,
+      totalClients: totalClients,
+      lastSyncAt: syncState.lastSyncAt != null 
+          ? DateTime.tryParse(syncState.lastSyncAt!)
+          : null,
+      lastSyncError: syncState.lastSyncError,
+    );
+  }
+
+  /// Get orders by date
+  Future<List<Order>> getOrdersByDate(DateTime date) async {
+    final db = await _dbHelper.database;
+    final dateStr = '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
+    
+    final List<Map<String, dynamic>> maps = await db.query(
+      'orders',
+      where: 'DATE(order_date) = ?',
+      whereArgs: [dateStr],
+      orderBy: 'order_date DESC',
+    );
+
+    return maps.map((map) => Order.fromMap(map)).toList();
   }
 }
