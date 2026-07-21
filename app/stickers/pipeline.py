@@ -1821,7 +1821,15 @@ class StickerProcessor:
                 "background_is_white": False,
                 "border_distinguishable": False,
                 "white_band_ratio": 0.0,
+                "white_in_ring_ratio": 0.0,
                 "bg_color": (0, 0, 0),
+                "perimeter_median_rgb": (0, 0, 0),
+                "perimeter_luminance": 0.0,
+                "perimeter_saturation": 0.0,
+                "background_distance_threshold": 35.0,
+                "has_design": False,
+                "selected_mode": BorderMode.NO_BORDER_REQUIRED,
+                "mode_reason": "image has transparency",
             }
 
         perimeter = np.concatenate([
@@ -1834,6 +1842,15 @@ class StickerProcessor:
                   + 0.587 * bg_color[1]
                   + 0.114 * bg_color[2])
         background_is_white = bg_lum >= 248
+
+        pf = perimeter.astype(np.float32) / 255.0
+        cmax = np.maximum(np.maximum(pf[:, 0], pf[:, 1]), pf[:, 2])
+        cmin = np.minimum(np.minimum(pf[:, 0], pf[:, 1]), pf[:, 2])
+        delta = cmax - cmin
+        sat = np.where(cmax == 0, 0.0, delta / cmax)
+        perimeter_saturation = float(np.mean(sat))
+
+        bg_dist_threshold = 35.0
 
         try:
             import cv2
@@ -1860,7 +1877,15 @@ class StickerProcessor:
                     "background_is_white": background_is_white,
                     "border_distinguishable": False,
                     "white_band_ratio": 0.0,
+                    "white_in_ring_ratio": 0.0,
                     "bg_color": bg_color,
+                    "perimeter_median_rgb": bg_color,
+                    "perimeter_luminance": bg_lum,
+                    "perimeter_saturation": perimeter_saturation,
+                    "background_distance_threshold": bg_dist_threshold,
+                    "has_design": False,
+                    "selected_mode": mode,
+                    "mode_reason": "no design detected",
                 }
 
             dilate_r = 15
@@ -1877,7 +1902,15 @@ class StickerProcessor:
                     "background_is_white": background_is_white,
                     "border_distinguishable": False,
                     "white_band_ratio": 0.0,
+                    "white_in_ring_ratio": 0.0,
                     "bg_color": bg_color,
+                    "perimeter_median_rgb": bg_color,
+                    "perimeter_luminance": bg_lum,
+                    "perimeter_saturation": perimeter_saturation,
+                    "background_distance_threshold": bg_dist_threshold,
+                    "has_design": has_design,
+                    "selected_mode": BorderMode.GENERATE_WHITE_BORDER,
+                    "mode_reason": "no ring around design",
                 }
 
             white_in_ring = float((is_white & ring).sum()
@@ -1890,19 +1923,41 @@ class StickerProcessor:
                 and not background_is_white
             )
 
-            if background_is_white and has_design:
+            if background_is_white and white_in_ring >= 0.55:
                 mode = BorderMode.AMBIGUOUS_WHITE_ON_WHITE
-            elif border_distinguishable:
+                mode_reason = (
+                    f"background is white and white ring is prominent"
+                    f" (ratio={white_in_ring:.2f})")
+            elif not background_is_white and white_in_ring >= 0.55:
                 mode = BorderMode.PRESERVE_EXISTING_BORDER
+                mode_reason = (
+                    f"background is not white and white ring is prominent"
+                    f" (ratio={white_in_ring:.2f})")
             else:
                 mode = BorderMode.GENERATE_WHITE_BORDER
+                if not has_design:
+                    mode_reason = "no design detected"
+                elif white_in_ring < 0.55:
+                    mode_reason = (
+                        f"white ring not prominent enough"
+                        f" (ratio={white_in_ring:.2f})")
+                else:
+                    mode_reason = "no distinguishable white border"
 
             return {
                 "mode": mode,
                 "background_is_white": background_is_white,
                 "border_distinguishable": border_distinguishable,
                 "white_band_ratio": white_in_ring,
+                "white_in_ring_ratio": white_in_ring,
                 "bg_color": bg_color,
+                "perimeter_median_rgb": bg_color,
+                "perimeter_luminance": bg_lum,
+                "perimeter_saturation": perimeter_saturation,
+                "background_distance_threshold": bg_dist_threshold,
+                "has_design": has_design,
+                "selected_mode": mode,
+                "mode_reason": mode_reason,
             }
 
         except Exception:
@@ -1915,7 +1970,15 @@ class StickerProcessor:
                 "background_is_white": background_is_white,
                 "border_distinguishable": False,
                 "white_band_ratio": 0.0,
+                "white_in_ring_ratio": 0.0,
                 "bg_color": bg_color,
+                "perimeter_median_rgb": bg_color,
+                "perimeter_luminance": bg_lum if 'bg_lum' in dir() else 0.0,
+                "perimeter_saturation": perimeter_saturation if 'perimeter_saturation' in dir() else 0.0,
+                "background_distance_threshold": 35.0,
+                "has_design": False,
+                "selected_mode": mode,
+                "mode_reason": "error in analysis",
             }
 
     @staticmethod
