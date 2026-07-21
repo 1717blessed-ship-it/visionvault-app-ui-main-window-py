@@ -1,0 +1,50 @@
+{
+  "control_estetoscopio": {
+    "mode": "ambiguo_blanco_sobre_blanco",
+    "elapsed_s": 2.67,
+    "components": 4,
+    "main_area": "86327",
+    "coverage": 1.0,
+    "excess": 0.0,
+    "missing": 0.0,
+    "quality": "Revisar",
+    "output_clean": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\final_validation\\control_estetoscopio_clean.png",
+    "output_mask": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\final_validation\\control_estetoscopio_mask.png"
+  },
+  "hoja_clara": {
+    "mode": "ambiguo_blanco_sobre_blanco",
+    "elapsed_s": 6.21,
+    "components": 1,
+    "main_area": "305513",
+    "coverage": 1.0,
+    "excess": 0.0,
+    "missing": 0.0,
+    "quality": "Listo",
+    "output_clean": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\final_validation\\hoja_clara_clean.png",
+    "output_mask": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\final_validation\\hoja_clara_mask.png"
+  },
+  "estetoscopio_rosa": {
+    "mode": "ambiguo_blanco_sobre_blanco",
+    "elapsed_s": 2.92,
+    "components": 1,
+    "main_area": "19562",
+    "coverage": 1.0,
+    "excess": 0.0,
+    "missing": 0.0,
+    "quality": "Revisar",
+    "output_clean": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\final_validation\\estetoscopio_rosa_clean.png",
+    "output_mask": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\final_validation\\estetoscopio_rosa_mask.png"
+  },
+  "corazon_anatomico": {
+    "mode": "ambiguo_blanco_sobre_blanco",
+    "elapsed_s": 9.95,
+    "components": 1,
+    "main_area": "242309",
+    "coverage": 1.0,
+    "excess": 0.0,
+    "missing": 0.0,
+    "quality": "Listo",
+    "output_clean": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\final_validation\\corazon_anatomico_clean.png",
+    "output_mask": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\final_validation\\corazon_anatomico_mask.png"
+  }
+}

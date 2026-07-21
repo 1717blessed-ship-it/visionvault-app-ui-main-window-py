@@ -1821,7 +1821,15 @@ class StickerProcessor:
                 "background_is_white": False,
                 "border_distinguishable": False,
                 "white_band_ratio": 0.0,
+                "white_in_ring_ratio": 0.0,
                 "bg_color": (0, 0, 0),
+                "perimeter_median_rgb": (0, 0, 0),
+                "perimeter_luminance": 0.0,
+                "perimeter_saturation": 0.0,
+                "background_distance_threshold": 35.0,
+                "has_design": False,
+                "selected_mode": BorderMode.NO_BORDER_REQUIRED,
+                "mode_reason": "image has transparency",
             }
 
         perimeter = np.concatenate([
@@ -1834,6 +1842,15 @@ class StickerProcessor:
                   + 0.587 * bg_color[1]
                   + 0.114 * bg_color[2])
         background_is_white = bg_lum >= 248
+
+        pf = perimeter.astype(np.float32) / 255.0
+        cmax = np.maximum(np.maximum(pf[:, 0], pf[:, 1]), pf[:, 2])
+        cmin = np.minimum(np.minimum(pf[:, 0], pf[:, 1]), pf[:, 2])
+        delta = cmax - cmin
+        sat = np.where(cmax == 0, 0.0, delta / cmax)
+        perimeter_saturation = float(np.mean(sat))
+
+        bg_dist_threshold = 35.0
 
         try:
             import cv2
@@ -1860,7 +1877,15 @@ class StickerProcessor:
                     "background_is_white": background_is_white,
                     "border_distinguishable": False,
                     "white_band_ratio": 0.0,
+                    "white_in_ring_ratio": 0.0,
                     "bg_color": bg_color,
+                    "perimeter_median_rgb": bg_color,
+                    "perimeter_luminance": bg_lum,
+                    "perimeter_saturation": perimeter_saturation,
+                    "background_distance_threshold": bg_dist_threshold,
+                    "has_design": False,
+                    "selected_mode": mode,
+                    "mode_reason": "no design detected",
                 }
 
             dilate_r = 15
@@ -1877,7 +1902,15 @@ class StickerProcessor:
                     "background_is_white": background_is_white,
                     "border_distinguishable": False,
                     "white_band_ratio": 0.0,
+                    "white_in_ring_ratio": 0.0,
                     "bg_color": bg_color,
+                    "perimeter_median_rgb": bg_color,
+                    "perimeter_luminance": bg_lum,
+                    "perimeter_saturation": perimeter_saturation,
+                    "background_distance_threshold": bg_dist_threshold,
+                    "has_design": has_design,
+                    "selected_mode": BorderMode.GENERATE_WHITE_BORDER,
+                    "mode_reason": "no ring around design",
                 }
 
             white_in_ring = float((is_white & ring).sum()
@@ -1890,19 +1923,41 @@ class StickerProcessor:
                 and not background_is_white
             )
 
-            if background_is_white and has_design:
+            if background_is_white and white_in_ring >= 0.55:
                 mode = BorderMode.AMBIGUOUS_WHITE_ON_WHITE
-            elif border_distinguishable:
+                mode_reason = (
+                    f"background is white and white ring is prominent"
+                    f" (ratio={white_in_ring:.2f})")
+            elif not background_is_white and white_in_ring >= 0.55:
                 mode = BorderMode.PRESERVE_EXISTING_BORDER
+                mode_reason = (
+                    f"background is not white and white ring is prominent"
+                    f" (ratio={white_in_ring:.2f})")
             else:
                 mode = BorderMode.GENERATE_WHITE_BORDER
+                if not has_design:
+                    mode_reason = "no design detected"
+                elif white_in_ring < 0.55:
+                    mode_reason = (
+                        f"white ring not prominent enough"
+                        f" (ratio={white_in_ring:.2f})")
+                else:
+                    mode_reason = "no distinguishable white border"
 
             return {
                 "mode": mode,
                 "background_is_white": background_is_white,
                 "border_distinguishable": border_distinguishable,
                 "white_band_ratio": white_in_ring,
+                "white_in_ring_ratio": white_in_ring,
                 "bg_color": bg_color,
+                "perimeter_median_rgb": bg_color,
+                "perimeter_luminance": bg_lum,
+                "perimeter_saturation": perimeter_saturation,
+                "background_distance_threshold": bg_dist_threshold,
+                "has_design": has_design,
+                "selected_mode": mode,
+                "mode_reason": mode_reason,
             }
 
         except Exception:
@@ -1915,7 +1970,15 @@ class StickerProcessor:
                 "background_is_white": background_is_white,
                 "border_distinguishable": False,
                 "white_band_ratio": 0.0,
+                "white_in_ring_ratio": 0.0,
                 "bg_color": bg_color,
+                "perimeter_median_rgb": bg_color,
+                "perimeter_luminance": bg_lum if 'bg_lum' in dir() else 0.0,
+                "perimeter_saturation": perimeter_saturation if 'perimeter_saturation' in dir() else 0.0,
+                "background_distance_threshold": 35.0,
+                "has_design": False,
+                "selected_mode": mode,
+                "mode_reason": "error in analysis",
             }
 
     @staticmethod
@@ -2289,6 +2352,220 @@ class StickerProcessor:
             return mask, metadata
 
     # ──────────────────────────────────────────────────────────────────────────
+    # Etapa 2B — Eliminación de ruido gris aislado
+    # ──────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _remove_grey_noise(alpha_img, rgb_np):
+        """Elimina componentes grises aislados de baja textura.
+
+        Extremadamente conservador: solo elimina componentes que cumplen
+        TODAS las condiciones de ruido gris. Preserva componentes con
+        saturación, textura o líneas oscuras.
+
+        Returns: (alpha_img, removal_log)
+        """
+        import numpy as np
+        import cv2
+        from PIL import Image as _PilImage
+        from scipy import ndimage
+
+        alpha_np = np.array(alpha_img, dtype=np.uint8)
+        binary = alpha_np > 127
+
+        labeled, n_labels = ndimage.label(binary.astype(np.uint8))
+        if n_labels <= 1:
+            return alpha_img, []
+
+        comp_sizes = []
+        for i in range(1, n_labels + 1):
+            comp_sizes.append((i, int((labeled == i).sum())))
+        comp_sizes.sort(key=lambda x: x[1], reverse=True)
+        main_label = comp_sizes[0][0]
+        main_area = comp_sizes[0][1]
+
+        grey = np.mean(rgb_np.astype(np.float32), axis=2)
+        r_ch = rgb_np[:, :, 0].astype(np.float32)
+        g_ch = rgb_np[:, :, 1].astype(np.float32)
+        b_ch = rgb_np[:, :, 2].astype(np.float32)
+        cmax = np.maximum(np.maximum(r_ch, g_ch), b_ch) / 255.0
+        cmin = np.minimum(np.minimum(r_ch, g_ch), b_ch) / 255.0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            saturation = np.where(cmax == 0, 0.0, (cmax - cmin) / cmax)
+
+        grey_u8 = np.clip(grey, 0, 255).astype(np.uint8)
+        blurred = cv2.blur(grey_u8.astype(np.float32), (7, 7))
+        local_var = cv2.blur(
+            (grey_u8.astype(np.float32) - blurred) ** 2, (7, 7))
+        local_std = np.sqrt(np.maximum(local_var, 0))
+
+        sobelx = cv2.Sobel(grey_u8, cv2.CV_32F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(grey_u8, cv2.CV_32F, 0, 1, ksize=3)
+        grad = np.sqrt(sobelx ** 2 + sobely ** 2)
+
+        removal_log = []
+        result = alpha_np.copy()
+
+        for comp_label, comp_area in comp_sizes:
+            if comp_label == main_label:
+                continue
+
+            area_ratio = comp_area / max(main_area, 1)
+            if area_ratio >= 0.01:
+                continue
+
+            mask = labeled == comp_label
+            comp_grey = grey[mask]
+            comp_sat = saturation[mask]
+            n_pix = max(comp_area, 1)
+            comp_texture = float((local_std[mask] > 15).sum()) / n_pix
+            comp_dark = float(
+                ((grey[mask] < 80) & (grad[mask] > 20)).sum()) / n_pix
+            mean_lum = float(comp_grey.mean())
+            mean_sat = float(comp_sat.mean())
+
+            should_remove = (
+                area_ratio < 0.01
+                and mean_sat < 0.10
+                and 170 <= mean_lum <= 220
+                and comp_texture < 0.20
+                and comp_dark < 0.05
+            )
+
+            entry = {
+                "area": comp_area,
+                "area_ratio": round(area_ratio, 6),
+                "mean_luminance": round(mean_lum, 1),
+                "mean_saturation": round(mean_sat, 4),
+                "texture_ratio": round(comp_texture, 4),
+                "dark_line_ratio": round(comp_dark, 4),
+                "removed": should_remove,
+            }
+
+            if should_remove:
+                result[mask] = 0
+                entry["reason"] = (
+                    "grey noise: area_ratio=%.4f, "
+                    "sat=%.3f, lum=%.0f, tex=%.3f, dark=%.3f"
+                    % (area_ratio, mean_sat, mean_lum,
+                       comp_texture, comp_dark))
+            else:
+                reasons = []
+                if mean_sat >= 0.10:
+                    reasons.append("sat=%.3f>=0.10" % mean_sat)
+                if comp_texture >= 0.20:
+                    reasons.append("tex=%.3f>=0.20" % comp_texture)
+                if comp_dark >= 0.05:
+                    reasons.append("dark=%.3f>=0.05" % comp_dark)
+                if mean_lum < 170 or mean_lum > 220:
+                    reasons.append("lum=%.0f outside [170,220]" % mean_lum)
+                entry["reason"] = "kept: %s" % ", ".join(reasons)
+
+            removal_log.append(entry)
+
+        result_img = _PilImage.fromarray(result, "L")
+        removed_count = sum(1 for e in removal_log if e["removed"])
+        logger.info(
+            "Etapa 2B: %d/%d components removed as grey noise",
+            removed_count, len(removal_log))
+        return result_img, removal_log
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Etapa 2A — Reconstrucción de base blanca desplazada
+    # ──────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _measure_white_base(rgb_np, alpha_np):
+        """Mide cobertura, exceso y faltante de la base blanca.
+
+        Returns dict con coverage_ratio, excess_ratio, missing_ratio.
+        """
+        import cv2
+
+        subject_mask = alpha_np > 127
+        white_mask = (
+            (rgb_np[:, :, 0] > 235)
+            & (rgb_np[:, :, 1] > 235)
+            & (rgb_np[:, :, 2] > 235)
+        )
+        expected = white_mask & subject_mask
+        actual_white = white_mask & (alpha_np > 127)
+
+        expected_area = int(expected.sum())
+        intersection = int((expected & actual_white).sum())
+        excess = int((actual_white & ~expected).sum())
+        missing = int((expected & ~actual_white).sum())
+
+        return {
+            "coverage_ratio": round(intersection / max(expected_area, 1), 4),
+            "excess_ratio": round(excess / max(expected_area, 1), 4),
+            "missing_ratio": round(missing / max(expected_area, 1), 4),
+            "expected_base_area": expected_area,
+            "excess_white_area": excess,
+            "missing_white_area": missing,
+        }
+
+    @staticmethod
+    def _rebuild_displaced_white_base(rgb_np, raw_alpha, target_radius,
+                                       tolerance=10):
+        """Reconstruye la base blanca cuando está desplazada.
+
+        Crea una máscara de diseño real desde el RGB original, genera una
+        base blanca nueva mediante distancia al diseño, y combina con el
+        blanco existente que esté próximo.
+
+        No usa convexHull ni cierre morfológico grande.
+
+        Returns: Image.alpha (L mode) con la máscara reconstruida.
+        """
+        import cv2
+        from PIL import Image
+
+        h, w = rgb_np.shape[:2]
+
+        r_ch = rgb_np[:, :, 0].astype(np.float32)
+        g_ch = rgb_np[:, :, 1].astype(np.float32)
+        b_ch = rgb_np[:, :, 2].astype(np.float32)
+        cmax = np.maximum(np.maximum(r_ch, g_ch), b_ch) / 255.0
+        cmin = np.minimum(np.minimum(r_ch, g_ch), b_ch) / 255.0
+        saturation = np.where(cmax == 0, 0.0, (cmax - cmin) / cmax)
+        luminance = 0.299 * r_ch + 0.587 * g_ch + 0.114 * b_ch
+
+        sat_thresh = 0.12
+        dark_thresh = 180
+        design_seed = (saturation > sat_thresh) | (luminance < dark_thresh)
+
+        existing_white = raw_alpha.point(lambda v: 255 if v > 127 else 0)
+        existing_white_np = np.array(existing_white) > 0
+        white_mask = (
+            (rgb_np[:, :, 0] > 235)
+            & (rgb_np[:, :, 1] > 235)
+            & (rgb_np[:, :, 2] > 235)
+        )
+        existing_white_area = existing_white_np & white_mask
+
+        inv_design = (~design_seed).astype(np.uint8)
+        dist_to_design = cv2.distanceTransform(inv_design, cv2.DIST_L2, 5)
+
+        generated_base = dist_to_design <= target_radius
+
+        valid_existing = existing_white_area & (
+            dist_to_design <= target_radius + tolerance
+        )
+
+        final_subject = design_seed | generated_base | valid_existing
+
+        labeled, n_labels = cv2.connectedComponents(
+            final_subject.astype(np.uint8))
+        if n_labels > 1:
+            sizes = [(labeled == i).sum() for i in range(1, n_labels)]
+            main_label = np.argmax(sizes) + 1
+            final_subject = labeled == main_label
+
+        result_alpha = np.where(final_subject, 255, 0).astype(np.uint8)
+        return Image.fromarray(result_alpha, "L")
+
+    # ──────────────────────────────────────────────────────────────────────────
     # TAREA 8 — process(): orquestador principal
     # ──────────────────────────────────────────────────────────────────────────
 
@@ -2436,6 +2713,30 @@ class StickerProcessor:
             or border_mode == BorderMode.AMBIGUOUS_WHITE_ON_WHITE
         )
 
+        # ── Etapa 2A: reconstruir base blanca desplazada ──────────────────
+        rebuild_white_base = False
+        if border_mode == BorderMode.AMBIGUOUS_WHITE_ON_WHITE:
+            import numpy as np
+            _rgb = np.array(rgba.convert("RGB"), dtype=np.uint8)
+            _alpha = np.array(raw_alpha, dtype=np.uint8)
+            _wb = self._measure_white_base(_rgb, _alpha)
+            if (_wb["coverage_ratio"] < 0.95
+                    and (_wb["missing_ratio"] > 0.05
+                         or _wb["excess_ratio"] > 0.10)):
+                rebuild_white_base = True
+                target_r = self.profile.final_white_px
+                raw_alpha = self._rebuild_displaced_white_base(
+                    _rgb, _alpha, target_r)
+                prepared_rgba.putalpha(raw_alpha)
+                logger.info(
+                    "Etapa 2A: base blanca reconstruida para %s "
+                    "(coverage=%.2f, missing=%.2f, excess=%.2f)",
+                    source_path.name,
+                    _wb["coverage_ratio"],
+                    _wb["missing_ratio"],
+                    _wb["excess_ratio"],
+                )
+
         if skip_postprocessing:
             refined_alpha = raw_alpha
             postprocess_meta = {
@@ -2450,6 +2751,13 @@ class StickerProcessor:
                 raw_alpha, self.profile.dpi,
                 fill_holes=source_path.suffix.lower() == ".png",
             )
+
+        # ── Etapa 2B: eliminar ruido gris aislado ────────────────────────
+        grey_noise_log = []
+        if border_mode == BorderMode.AMBIGUOUS_WHITE_ON_WHITE:
+            _rgb2 = np.array(rgba.convert("RGB"), dtype=np.uint8)
+            refined_alpha, grey_noise_log = self._remove_grey_noise(
+                refined_alpha, _rgb2)
 
         # Una selección completa representa deliberadamente el rectángulo
         # elegido: no se le aplican márgenes transparentes ni limpieza de borde.
