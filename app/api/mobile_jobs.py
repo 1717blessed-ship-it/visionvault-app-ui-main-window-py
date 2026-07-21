@@ -100,6 +100,8 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
             self._get_workflows()
         elif parsed.path == "/api/mobile/reference/materials":
             self._get_materials()
+        elif parsed.path == "/api/mobile/device/status":
+            self._get_device_status(device)
         else:
             self._send_error(404, "Endpoint not found")
 
@@ -477,6 +479,53 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
         except Exception as e:
             logger.error("Error getting materials: %s", e)
             self._send_error(500, f"Error getting materials: {e}")
+
+    def _get_device_status(self, device: dict[str, Any]) -> None:
+        """Obtiene el estado actual del dispositivo."""
+        try:
+            # Obtener preferencias de notificaciones
+            prefs = self.event_repo.get_device_prefs(device["id"])
+
+            # Calcular estadísticas de uso
+            stats = self.event_repo.conn.execute(
+                """SELECT COUNT(*) as total_changes
+                   FROM production_stage_history
+                   WHERE device_id = ?""",
+                (device["id"],),
+            ).fetchone()
+
+            total_changes = stats[0] if stats else 0
+
+            # Última actividad
+            last_activity = self.event_repo.conn.execute(
+                """SELECT MAX(changed_at) as last_seen
+                   FROM production_stage_history
+                   WHERE device_id = ?""",
+                (device["id"],),
+            ).fetchone()
+
+            last_seen = last_activity[0] if last_activity and last_activity[0] else device.get("registered_at")
+
+            device_status = {
+                "device_id": device["id"],
+                "device_name": device["device_name"],
+                "platform": device["platform"],
+                "app_version": device.get("app_version", ""),
+                "registered_at": device["registered_at"],
+                "last_seen": last_seen,
+                "is_paused": device.get("is_paused", 0) == 1,
+                "notification_prefs": prefs,
+                "stats": {
+                    "total_stage_changes": total_changes,
+                },
+                "server_version": "1.0.0",  # Versión de la API
+            }
+
+            self._send_json_response(200, device_status)
+
+        except Exception as e:
+            logger.error("Error getting device status: %s", e)
+            self._send_error(500, f"Error getting device status: {e}")
 
     def log_message(self, format, *args):
         """Override para evitar logging default de HTTPServer."""
