@@ -14,11 +14,15 @@ import json
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any
+from typing import Any, Final
 from urllib.parse import parse_qs, urlparse
 
 from app.events.event_repository import EventRepository
 from app.services.production_stage_service import ProductionStageService
+from app.services.stage_catalog_service import (
+    get_all_stages_for_mobile,
+    get_workflows_for_mobile,
+)
 from app.workflow.timeline import (
     get_current_stage,
     get_stage_progress,
@@ -27,6 +31,17 @@ from app.workflow.timeline import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Whitelist de tipos de eventos permitidos para preferencias de notificaciones
+ALLOWED_NOTIFICATION_EVENT_TYPES: Final[frozenset[str]] = frozenset({
+    "job_stage_changed",
+    "job_created",
+    "job_assigned",
+    "order_updated",
+    "order_priority_changed",
+    "urgent_notification",
+})
 
 
 class MobileJobsHandler(BaseHTTPRequestHandler):
@@ -86,24 +101,34 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
         if not device:
             return
         
+        # Rutas legacy (mantener compatibilidad)
         if parsed.path == "/api/mobile/jobs":
             self._list_jobs(device)
-        elif parsed.path.startswith("/api/mobile/jobs/"):
+        elif parsed.path.startswith("/api/mobile/jobs/") and not parsed.path.endswith("/search"):
             job_id = parsed.path.split("/")[-1]
             if job_id.isdigit():
                 self._get_job_detail(int(job_id), device)
             else:
                 self._send_error(400, "Invalid job ID")
-        elif parsed.path == "/api/mobile/reference/stages":
-            self._get_stages()
-        elif parsed.path == "/api/mobile/reference/workflows":
-            self._get_workflows()
-        elif parsed.path == "/api/mobile/reference/materials":
-            self._get_materials()
-        elif parsed.path == "/api/mobile/device/status":
-            self._get_device_status(device)
-        elif parsed.path == "/api/mobile/jobs/search":
+        # Rutas v1
+        elif parsed.path == "/api/v1/mobile/jobs":
+            self._list_jobs(device)
+        elif parsed.path == "/api/v1/mobile/jobs/search":
             self._search_jobs(device)
+        elif parsed.path.startswith("/api/v1/mobile/jobs/"):
+            job_id = parsed.path.split("/")[-1]
+            if job_id.isdigit():
+                self._get_job_detail(int(job_id), device)
+            else:
+                self._send_error(400, "Invalid job ID")
+        elif parsed.path == "/api/v1/mobile/reference/stages":
+            self._get_stages()
+        elif parsed.path == "/api/v1/mobile/reference/workflows":
+            self._get_workflows()
+        elif parsed.path == "/api/v1/mobile/reference/materials":
+            self._get_materials()
+        elif parsed.path == "/api/v1/mobile/device/status":
+            self._get_device_status(device)
         else:
             self._send_error(404, "Endpoint not found")
 
@@ -116,13 +141,21 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
         if not device:
             return
         
+        # Rutas legacy
         if parsed.path.startswith("/api/mobile/jobs/") and parsed.path.endswith("/stage"):
             job_id = parsed.path.split("/")[-2]
             if job_id.isdigit():
                 self._change_job_stage(int(job_id), device)
             else:
                 self._send_error(400, "Invalid job ID")
-        elif parsed.path == "/api/mobile/device/preferences":
+        # Rutas v1
+        elif parsed.path.startswith("/api/v1/mobile/jobs/") and parsed.path.endswith("/stage"):
+            job_id = parsed.path.split("/")[-2]
+            if job_id.isdigit():
+                self._change_job_stage(int(job_id), device)
+            else:
+                self._send_error(400, "Invalid job ID")
+        elif parsed.path == "/api/v1/mobile/device/preferences":
             self._update_device_preferences(device)
         else:
             self._send_error(404, "Endpoint not found")
@@ -213,6 +246,10 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
         query_text = params.get("q", "").strip()
         if not query_text:
             self._send_error(400, "Query parameter 'q' is required")
+            return
+
+        if len(query_text) > 100:
+            self._send_error(400, "Search query too long (max 100 characters)")
             return
 
         limit = min(50, max(1, int(params.get("limit", "20"))))
@@ -396,176 +433,19 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
             self._send_error(500, f"Error changing job stage: {e}")
 
     def _get_stages(self) -> None:
-        """Obtiene el catálogo completo de etapas."""
+        """Obtiene el catálogo completo de etapas desde fuente oficial."""
         try:
-            # Catálogo de etapas de producción
-            stages = [
-                {
-                    "key": "Recibido",
-                    "label": "Recibido",
-                    "category": "inicio",
-                    "description": "Trabajo recibido, aún sin asignar",
-                    "color": "#9E9E9E",
-                },
-                {
-                    "key": "Esperando archivos",
-                    "label": "Esperando archivos",
-                    "category": "inicio",
-                    "description": "Pendiente de recibir archivos del cliente",
-                    "color": "#FF9800",
-                },
-                {
-                    "key": "Diseño",
-                    "label": "Diseño",
-                    "category": "preprensa",
-                    "description": "En proceso de diseño o armado",
-                    "color": "#2196F3",
-                },
-                {
-                    "key": "Corrección",
-                    "label": "Corrección",
-                    "category": "preprensa",
-                    "description": "En corrección o ajustes",
-                    "color": "#9C27B0",
-                },
-                {
-                    "key": "Aprobación cliente",
-                    "label": "Aprobación cliente",
-                    "category": "preprensa",
-                    "description": "Esperando aprobación del cliente",
-                    "color": "#FF9800",
-                },
-                {
-                    "key": "RIP",
-                    "label": "RIP",
-                    "category": "preprensa",
-                    "description": "Procesamiento en RIP",
-                    "color": "#00BCD4",
-                },
-                {
-                    "key": "Impresión",
-                    "label": "Impresión",
-                    "category": "produccion",
-                    "description": "En proceso de impresión",
-                    "color": "#4CAF50",
-                },
-                {
-                    "key": "Laminado",
-                    "label": "Laminado",
-                    "category": "produccion",
-                    "description": "En proceso de laminado",
-                    "color": "#00BCD4",
-                },
-                {
-                    "key": "Acabado",
-                    "label": "Acabado",
-                    "category": "produccion",
-                    "description": "En proceso de acabado (corte, armado, etc.)",
-                    "color": "#795548",
-                },
-                {
-                    "key": "Control de calidad",
-                    "label": "Control de calidad",
-                    "category": "produccion",
-                    "description": "Revisión de calidad final",
-                    "color": "#9C27B0",
-                },
-                {
-                    "key": "Finalizado",
-                    "label": "Finalizado",
-                    "category": "cierre",
-                    "description": "Trabajo finalizado, listo para entrega",
-                    "color": "#4CAF50",
-                },
-                {
-                    "key": "Entregado",
-                    "label": "Entregado",
-                    "category": "cierre",
-                    "description": "Entregado al cliente",
-                    "color": "#8BC34A",
-                },
-            ]
-
+            stages = get_all_stages_for_mobile()
             self._send_json_response(200, {"stages": stages})
-
         except Exception as e:
             logger.error("Error getting stages: %s", e)
             self._send_error(500, f"Error getting stages: {e}")
 
     def _get_workflows(self) -> None:
-        """Obtiene los flujos de trabajo por tipo de material."""
+        """Obtiene los flujos de trabajo desde fuente oficial."""
         try:
-            # Workflows predefinidos
-            workflows = {
-                "default": {
-                    "name": "Flujo estándar",
-                    "stages": [
-                        "Recibido",
-                        "Diseño",
-                        "Aprobación cliente",
-                        "Impresión",
-                        "Acabado",
-                        "Finalizado",
-                    ],
-                },
-                "vinilo": {
-                    "name": "Vinilo adhesivo",
-                    "stages": [
-                        "Recibido",
-                        "Diseño",
-                        "Impresión",
-                        "Laminado",
-                        "Acabado",
-                        "Finalizado",
-                    ],
-                },
-                "lona": {
-                    "name": "Lona",
-                    "stages": [
-                        "Recibido",
-                        "Diseño",
-                        "Impresión",
-                        "Acabado",
-                        "Finalizado",
-                    ],
-                },
-                "banner": {
-                    "name": "Banner",
-                    "stages": [
-                        "Recibido",
-                        "Diseño",
-                        "Impresión",
-                        "Laminado",
-                        "Acabado",
-                        "Finalizado",
-                    ],
-                },
-                "rigido": {
-                    "name": "Material rígido",
-                    "stages": [
-                        "Recibido",
-                        "Diseño",
-                        "Impresión",
-                        "Acabado",
-                        "Control de calidad",
-                        "Finalizado",
-                    ],
-                },
-                "textil": {
-                    "name": "Textil",
-                    "stages": [
-                        "Recibido",
-                        "Diseño",
-                        "RIP",
-                        "Impresión",
-                        "Acabado",
-                        "Finalizado",
-                    ],
-                },
-            }
-
+            workflows = get_workflows_for_mobile()
             self._send_json_response(200, {"workflows": workflows})
-
         except Exception as e:
             logger.error("Error getting workflows: %s", e)
             self._send_error(500, f"Error getting workflows: {e}")
@@ -615,6 +495,12 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
             if not isinstance(preferences, dict):
                 self._send_error(400, "preferences field must be a dictionary")
                 return
+
+            # Validar event_types contra whitelist
+            for event_type in preferences.keys():
+                if event_type not in ALLOWED_NOTIFICATION_EVENT_TYPES:
+                    self._send_error(400, f"Unknown event type: '{event_type}'")
+                    return
 
             # Actualizar cada preferencia
             updated_count = 0
