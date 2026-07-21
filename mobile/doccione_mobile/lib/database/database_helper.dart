@@ -4,7 +4,7 @@ import 'package:path_provider/path_provider.dart';
 
 /// Helper class for SQLite database operations with versioning support
 class DatabaseHelper {
-  static const int _databaseVersion = 1;
+  static const int _databaseVersion = 2;
   static const String _databaseName = 'doccione_mobile.db';
 
   static DatabaseHelper? _instance;
@@ -118,14 +118,49 @@ class DatabaseHelper {
     // Create clients indices
     await db.execute('CREATE INDEX idx_clients_name ON clients(name)');
     await db.execute('CREATE INDEX idx_clients_updated ON clients(updated_at DESC)');
+
+    // Create server_config table (singleton)
+    await db.execute('''
+      CREATE TABLE server_config (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        host TEXT NOT NULL DEFAULT 'localhost',
+        port INTEGER NOT NULL DEFAULT 8765,
+        scheme TEXT NOT NULL DEFAULT 'http'
+      )
+    ''');
+
+    // Initialize server_config with default values
+    await db.insert('server_config', {
+      'id': 1,
+      'host': 'localhost',
+      'port': 8765,
+      'scheme': 'http',
+    });
   }
 
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
-    // Future migration logic will go here
-    // Example:
-    // if (oldVersion < 2) {
-    //   await db.execute('ALTER TABLE jobs ADD COLUMN new_field TEXT');
-    // }
+    if (oldVersion < 2) {
+      // Create server_config table for existing databases
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS server_config (
+          id INTEGER PRIMARY KEY CHECK (id = 1),
+          host TEXT NOT NULL DEFAULT 'localhost',
+          port INTEGER NOT NULL DEFAULT 8765,
+          scheme TEXT NOT NULL DEFAULT 'http'
+        )
+      ''');
+
+      // Insert default values if table is empty
+      final existing = await db.query('server_config', where: 'id = 1');
+      if (existing.isEmpty) {
+        await db.insert('server_config', {
+          'id': 1,
+          'host': 'localhost',
+          'port': 8765,
+          'scheme': 'http',
+        });
+      }
+    }
   }
 
   /// Close the database connection
