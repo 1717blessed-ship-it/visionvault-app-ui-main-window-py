@@ -6,6 +6,9 @@ import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:http/http.dart' as http;
 import 'dashboard_screen.dart';
+import 'server_config_screen.dart';
+import '../database/database_helper.dart';
+import '../database/server_config_repository.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -323,6 +326,22 @@ class _HomePageState extends State<HomePage> {
       appBar: AppBar(
         title: const Text('Doccione Mobile'),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings),
+            tooltip: 'Configuración del servidor',
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => ServerConfigScreen(
+                    repository: ServerConfigRepository(DatabaseHelper()),
+                  ),
+                ),
+              );
+            },
+          ),
+        ],
       ),
       body: ListView(
         padding: const EdgeInsets.all(16),
