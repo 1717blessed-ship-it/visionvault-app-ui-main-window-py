@@ -708,6 +708,7 @@ class ImageDatabase:
         self._migrate_order_jobs()
         self._migrate_mobile_devices()
         self._migrate_pairing_codes()
+        self._migrate_sync_indexes()
         self.install_doccione_price_catalog()
         self.connection.commit()
 
@@ -974,6 +975,18 @@ class ImageDatabase:
             # Reemplazar tabla antigua
             self.connection.execute("DROP TABLE pairing_codes")
             self.connection.execute("ALTER TABLE pairing_codes_new RENAME TO pairing_codes")
+
+    def _migrate_sync_indexes(self) -> None:
+        """Agrega índices compuestos (updated_at, id) para sincronización incremental."""
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_updated_id ON orders(updated_at, id)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_order_jobs_updated_id ON order_jobs(updated_at, id)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_clients_updated_id ON clients(updated_at, id)"
+        )
 
     def _ensure_client(self, name: str, whatsapp: str, now: str | None = None) -> int:
         from datetime import datetime
