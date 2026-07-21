@@ -107,26 +107,28 @@ Mejoras aplicadas a endpoints existentes:
 - `POST /api/pair/validate` (pairing_server.py)
 - `POST /api/device/update-token` (pairing_server.py)
 
-### Jobs
-- `GET /api/mobile/jobs` (lista con filtros y paginación)
-- `GET /api/mobile/jobs/search` (búsqueda por texto) ✨ NUEVO
-- `GET /api/mobile/jobs/{id}` (detalle de un job)
-- `POST /api/mobile/jobs/{id}/stage` (cambiar etapa)
+### Jobs (v1)
+- `GET /api/v1/mobile/jobs` (lista con filtros y paginación)
+- `GET /api/v1/mobile/jobs/{id}` (detalle de un job)
+- `GET /api/v1/mobile/jobs/search` (búsqueda por texto) ✨ NUEVO
+- `POST /api/v1/mobile/jobs/{id}/stage` (cambiar etapa)
 
-### Referencia
-- `GET /api/mobile/reference/stages` ✨ NUEVO
-- `GET /api/mobile/reference/workflows` ✨ NUEVO
-- `GET /api/mobile/reference/materials` ✨ NUEVO
+### Referencia (v1)
+- `GET /api/v1/mobile/reference/stages` ✨ NUEVO
+- `GET /api/v1/mobile/reference/workflows` ✨ NUEVO
+- `GET /api/v1/mobile/reference/materials` ✨ NUEVO
 
-### Dispositivo
-- `GET /api/mobile/device/status` ✨ NUEVO
-- `POST /api/mobile/device/preferences` ✨ NUEVO
+### Dispositivo (v1)
+- `GET /api/v1/mobile/device/status` ✨ NUEVO
+- `POST /api/v1/mobile/device/preferences` ✨ NUEVO
+
+**Total endpoints v1:** 9
 
 ---
 
 ## Próximos Pasos
 
-**Fase 2:** Sincronización en tiempo real y notificaciones push
+**Fase 2:** Sincronización incremental de solo lectura (GET /api/v1/mobile/sync/pull)
 **Fase 3:** Gestión de imágenes y multimedia
 **Fase 4:** Reportes y estadísticas para operadores
 
@@ -164,5 +166,5 @@ curl -X POST -H "Authorization: Bearer <token>" -H "Content-Type: application/js
 ---
 
 **Estado:** ✅ Fase 1 completada sin errores  
-**Último commit:** `3c09281`  
+**Último commit:** `e6c3f7c`  
 **Rama activa:** `codex/mobile-api-v1`
