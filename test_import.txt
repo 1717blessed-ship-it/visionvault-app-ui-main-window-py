@@ -1,0 +1,32 @@
+PRUEBA DE IMPORTACIÓN DEL MÓDULO EDITOR
+============================================================
+
+1. Importando módulo...
+   ✓ Importación exitosa
+
+2. Verificando método process_queue...
+   ✓ Método process_queue existe
+
+3. Métodos disponibles:
+   - add_paths
+   - after
+   - after_cancel
+   - after_idle
+   - after_info
+   - anchor
+   - approve_current
+   - aspect
+   - attributes
+   - bbox
+   - bell
+   - bind
+   - bind_all
+   - bind_class
+   - bindtags
+   - busy
+   - busy_cget
+   - busy_config
+   - busy_configure
+   - busy_current
+
+✓ ÉXITO: El módulo se importó correctamente

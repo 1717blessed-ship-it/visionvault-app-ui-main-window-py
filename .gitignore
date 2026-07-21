@@ -1,0 +1,64 @@
+# Firebase local configuration and credentials
+secrets/
+firebase-service-account.json
+**/firebase-service-account.json
+google-services.json
+**/google-services.json
+
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.cache/
+.mypy_cache/
+.ruff_cache/
+
+# Databases and local backups
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.bak
+*.backup
+
+# Logs and temporary files
+*.log
+tmp_*.py
+test_output.log
+test_white_border_output.png
+persistence_actions.log
+mapeo_stick_new_*.csv
+debug_open_studio.txt
+debug_processing.txt
+force_test_output.txt
+visionvault_db_inspect.json
+
+# Generated outputs
+outputs/
+work/
+validation_output*/
+final_validation/
+diagnosis_etapa1/
+
+# Builds and distributions
+build/
+dist/
+**/build/
+mobile/doccione_mobile/build/
+*.apk
+*.aab
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Runtime vendored deps (permission-restricted)
+app/runtime/

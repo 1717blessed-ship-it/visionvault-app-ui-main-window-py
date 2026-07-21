@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Lanzador Presupuesto Doccione</title>
+  <style>body{background:#111;color:#eee;font-family:Arial;display:flex;align-items:center;justify-content:center;height:100vh}button{padding:12px 18px;border-radius:6px;background:#b02b4b;color:#fff;border:none;cursor:pointer;font-size:16px}</style>
+</head>
+<body>
+  <div>
+    <button id="open">Abrir Generador de Presupuesto</button>
+    <p style="font-size:12px;margin-top:8px;opacity:.8">También puedes usar `open_presupuesto.bat` para abrirlo desde Windows.</p>
+  </div>
+<script>
+document.getElementById('open').addEventListener('click', ()=>{
+  const url = 'presupuesto_ui.html';
+  window.open(url, '_blank', 'noopener');
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,1 @@
+"""Renombrado seguro de archivos."""

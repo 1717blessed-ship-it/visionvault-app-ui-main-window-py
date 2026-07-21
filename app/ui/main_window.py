@@ -57,6 +57,8 @@ from app.events.event_types import (
 )
 from app.notifications.notification_service import NotificationService
 from app.notifications.firebase_sender import initialize_firebase
+from app.api.pairing_server import PairingServer
+from app.api.mobile_jobs import MobileJobsServer
 from app.stickers.editor import StickerStudio
 from app.performance import record_performance
 from app.workflow.priority import calculate_priority, get_priority_color, get_priority_emoji
@@ -219,6 +221,19 @@ class VisionVaultApp(DndRoot):
         self._event_repo.create_tables()
         self._event_bus = EventBus(self._event_repo)
         self._notification_service = NotificationService(self._event_repo)
+        # --- Servidor de emparejamiento de dispositivos ---
+        self._pairing_server = PairingServer(
+            port=8765,
+            repo_callback=lambda: self._event_repo,
+        )
+        self._pairing_server.start()
+        # --- Servidor de API de jobs móviles ---
+        self._mobile_jobs_server = MobileJobsServer(
+            event_repo=self._event_repo,
+            event_bus=self._event_bus,
+            port=8766,
+        )
+        self._mobile_jobs_server.start()
         # Intentar inicializar Firebase (no bloqueante si no está configurado)
         try:
             firebase_ok = initialize_firebase()
@@ -2397,6 +2412,13 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         footer.pack(fill="x", padx=12, pady=(0, 12))
         ttk.Button(footer, text="Cerrar", command=dialog.destroy, style="Secondary.TButton").pack(side="right")
         stats = self._event_repo.outbox_stats()
+        pending = stats.get("pending", 0)
+        sent = stats.get("sent", 0)
+        dead = stats.get("dead", 0)
+        processing = stats.get("processing", 0)
+        stats_text = f"Cola: {pending} pend · {processing} proc · {sent} enviados · {dead} muertos"
+        tk.Label(footer, text=stats_text, background=COLORS.background, foreground=COLORS.muted,
+                 font=(UI_FONT, 8)).pack(side="right", padx=(0, 12))
         ttk.Button(footer, text="Enviar prueba",
                    command=lambda: self._send_test_from_center(dialog),
                    style="Primary.TButton").pack(side="left")
@@ -2458,7 +2480,8 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         bar.pack(fill="x", padx=10, pady=(10, 6))
         tk.Label(bar, text=f"{len(devices)} dispositivo(s) vinculado(s)",
                  background=COLORS.panel, foreground=COLORS.text, font=(UI_FONT, 10)).pack(side="left")
-        ttk.Button(bar, text="Vincular nuevo", style="Primary.TButton").pack(side="right")
+        ttk.Button(bar, text="Vincular nuevo", command=lambda: self._pair_device_dialog(parent),
+                   style="Primary.TButton").pack(side="right")
 
         # Lista de dispositivos
         if not devices:
@@ -2486,9 +2509,73 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
 
             actions = tk.Frame(row, background=COLORS.panel_elevated)
             actions.pack(side="right", padx=10)
+            
+            # Botón de prueba
+            ttk.Button(actions, text="Prueba",
+                       command=lambda token=device["push_token"]: self._send_test_notification(token),
+                       style="Secondary.TButton").pack(pady=(0, 2))
+            
+            # Botón de renombrar
+            ttk.Button(actions, text="Renombrar",
+                       command=lambda did=device["id"], name=device.get("device_name", ""), w=parent: self._rename_device(did, name, w),
+                       style="Secondary.TButton").pack(pady=(0, 2))
+            
+            # Botón de pausar/reactivar
+            if device.get("active", 1) == 1:
+                ttk.Button(actions, text="Pausar",
+                           command=lambda did=device["id"], w=parent: self._pause_device(did, w),
+                           style="Secondary.TButton").pack(pady=(0, 2))
+            else:
+                ttk.Button(actions, text="Reactivar",
+                           command=lambda did=device["id"], w=parent: self._resume_device(did, w),
+                           style="Secondary.TButton").pack(pady=(0, 2))
+            
+            # Botón de desvincular
             ttk.Button(actions, text="Desvincular",
                        command=lambda did=device["id"], w=parent: self._deactivate_device(did, w),
                        style="Danger.TButton").pack()
+
+    def _send_test_notification(self, token: str):
+        """Envía una notificación de prueba al dispositivo."""
+        ok = self._notification_service.send_test_notification(
+            token,
+            "🔔 Prueba de Doccione",
+            "Si ves esto, las notificaciones están funcionando correctamente.",
+        )
+        if ok:
+            self.status.set("Notificación de prueba enviada.")
+            Toast(self, "Notificación enviada", tone="success")
+        else:
+            self.status.set("Error al enviar notificación de prueba.")
+            Toast(self, "Error al enviar", tone="error")
+
+    def _rename_device(self, device_id: int, current_name: str, panel):
+        """Renombra un dispositivo."""
+        new_name = simpledialog.askstring("Renombrar dispositivo", "Nuevo nombre:",
+                                          initialvalue=current_name, parent=self)
+        if new_name and new_name != current_name:
+            self._event_repo.rename_device(device_id, new_name)
+            self.status.set("Dispositivo renombrado.")
+            for w in panel.winfo_children():
+                w.destroy()
+            self._build_devices_panel(panel)
+
+    def _pause_device(self, device_id: int, panel):
+        """Pausa temporalmente un dispositivo."""
+        if messagebox.askyesno("Pausar dispositivo", "¿Pausar este dispositivo? No recibirá notificaciones.", parent=self):
+            self._event_repo.pause_device(device_id)
+            self.status.set("Dispositivo pausado.")
+            for w in panel.winfo_children():
+                w.destroy()
+            self._build_devices_panel(panel)
+
+    def _resume_device(self, device_id: int, panel):
+        """Reactiva un dispositivo pausado."""
+        self._event_repo.resume_device(device_id)
+        self.status.set("Dispositivo reactivado.")
+        for w in panel.winfo_children():
+            w.destroy()
+            self._build_devices_panel(panel)
 
     def _deactivate_device(self, device_id, panel):
         """Desvincula un dispositivo y refresca el panel."""
@@ -2500,6 +2587,83 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         for w in panel.winfo_children():
             w.destroy()
         self._build_devices_panel(panel)
+
+    def _pair_device_dialog(self, parent):
+        """Abre un diálogo de emparejamiento con código temporal de 6 dígitos.
+
+        Flujo seguro:
+        1. PC genera código temporal (6 dígitos, válido 5 min, uso único, almacenado como hash).
+        2. Celular ingresa el código manualmente en Doccione Mobile.
+        3. Celular envía código + token FCM a la PC vía HTTP.
+        4. PC valida el código y registra el dispositivo automáticamente.
+        """
+        import json as _json
+
+        # Generar código en la base de datos
+        code = self._event_repo.create_pairing_code()
+        installation_id = "studio-principal"
+
+        dialog = tk.Toplevel(parent)
+        dialog.title("Vincular celular")
+        dialog.configure(background=COLORS.background)
+        dialog.transient(parent)
+        dialog.grab_set()
+        dialog.geometry("420x380")
+        dialog.resizable(False, False)
+
+        header = tk.Frame(dialog, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
+        header.pack(fill="x", padx=12, pady=(12, 0))
+        tk.Label(header, text="VINCULAR CELULAR", background=COLORS.panel, foreground=COLORS.text,
+                 font=(IDENTITY_FONT, 14, "bold")).pack(side="left", padx=14, pady=10)
+        tk.Label(header, text="Código de un solo uso · Válido 5 minutos",
+                 background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 9)).pack(side="left", padx=(0, 14), pady=10)
+
+        body = tk.Frame(dialog, background=COLORS.background)
+        body.pack(fill="both", expand=True, padx=20, pady=16)
+
+        # Código
+        tk.Label(body, text="Código de vinculación", background=COLORS.background,
+                 foreground=COLORS.text, font=(UI_FONT, 10, "bold")).pack(anchor="w")
+        tk.Label(body, text="Ingresá este código en Doccione Mobile para vincular el dispositivo.",
+                 background=COLORS.background, foreground=COLORS.muted, font=(UI_FONT, 9)).pack(anchor="w", pady=(0, 8))
+
+        code_frame = tk.Frame(body, background=COLORS.panel_elevated, highlightthickness=2, highlightbackground=COLORS.wine_active)
+        code_frame.pack(fill="x", pady=(0, 12))
+        tk.Label(code_frame, text=code, background=COLORS.panel_elevated, foreground=COLORS.wine_active,
+                 font=("Consolas", 34, "bold")).pack(pady=16)
+
+        # Instrucciones
+        info_frame = tk.Frame(body, background=COLORS.panel_elevated, highlightthickness=1, highlightbackground=COLORS.border)
+        info_frame.pack(fill="x", pady=(0, 12))
+        tk.Label(info_frame, text="Instrucciones:", background=COLORS.panel_elevated,
+                 foreground=COLORS.text, font=(UI_FONT, 9, "bold")).pack(anchor="w", padx=8, pady=(6, 4))
+        tk.Label(info_frame, text="1. Abre Doccione Mobile en tu celular", background=COLORS.panel_elevated,
+                 foreground=COLORS.text, font=(UI_FONT, 9)).pack(anchor="w", padx=8)
+        tk.Label(info_frame, text="2. Ingresa el código de 6 dígitos", background=COLORS.panel_elevated,
+                 foreground=COLORS.text, font=(UI_FONT, 9)).pack(anchor="w", padx=8)
+        tk.Label(info_frame, text="3. El dispositivo se vinculará automáticamente", background=COLORS.panel_elevated,
+                 foreground=COLORS.text, font=(UI_FONT, 9)).pack(anchor="w", padx=8, pady=(0, 6))
+
+        # Botones
+        btn_row = tk.Frame(body, background=COLORS.background)
+        btn_row.pack(fill="x")
+
+        def refresh_code():
+            nonlocal code
+            code = self._event_repo.create_pairing_code()
+            for widget in code_frame.winfo_children():
+                widget.destroy()
+            tk.Label(code_frame, text=code, background=COLORS.panel_elevated, foreground=COLORS.wine_active,
+                     font=("Consolas", 34, "bold")).pack(pady=16)
+
+        def close_dialog():
+            dialog.destroy()
+            for w in parent.winfo_children():
+                w.destroy()
+            self._build_devices_panel(parent)
+
+        ttk.Button(btn_row, text="Generar nuevo código", command=refresh_code, style="Secondary.TButton").pack(side="left")
+        ttk.Button(btn_row, text="Cerrar", command=close_dialog, style="Secondary.TButton").pack(side="left", padx=(8, 0))
 
     def _build_notification_settings(self, parent):
         """Configuración global de notificaciones."""
@@ -2540,7 +2704,12 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         tk.Label(info_inner, text="Firebase Cloud Messaging", background=COLORS.panel_elevated,
                  foreground=COLORS.text, font=(UI_FONT, 11, "bold")).pack(anchor="w")
         stats = self._event_repo.outbox_stats()
-        status_text = f"Cola: {stats['pending']} pendiente(s) · {stats['sent']} enviado(s) · {stats['dead']} fallido(s)"
+        status_text = (
+            f"Cola: {stats['pending']} pendiente(s) · "
+            f"{stats.get('processing', 0)} procesando · "
+            f"{stats['sent']} enviado(s) · "
+            f"{stats['dead']} fallido(s)"
+        )
         tk.Label(info_inner, text=status_text, background=COLORS.panel_elevated,
                  foreground=COLORS.muted, font=(UI_FONT, 9)).pack(anchor="w", pady=(4, 0))
 
@@ -6667,23 +6836,72 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         detail_canvas.bind("<MouseWheel>", _on_detail_mousewheel)
         detail_inner.bind("<MouseWheel>", _on_detail_mousewheel)
 
-        # --- Preview grande ---
-        preview_frame = tk.Frame(detail_inner, background=COLORS.canvas, highlightthickness=1, highlightbackground=COLORS.border)
-        preview_frame.pack(fill="x", padx=10, pady=(10, 6))
-        self._prod_detail_preview_label = tk.Label(preview_frame, text="Sin selección", background=COLORS.canvas,
-                                                   foreground=COLORS.muted, font=(UI_FONT, 10), anchor="center")
+        # --- Preview con tabs: Impresión / Cliente ---
+        self._preview_mode = tk.StringVar(value="print")
+        preview_nb = ttk.Notebook(detail_inner)
+        preview_nb.pack(fill="x", padx=10, pady=(10, 2))
+
+        # --- Tab Impresión ---
+        print_tab = tk.Frame(preview_nb, background=COLORS.canvas)
+        preview_nb.add(print_tab, text=" Impresión ")
+        self._prod_detail_preview_label = tk.Label(print_tab, text="Seleccioná una plancha\npara ver sus datos",
+                                                    background=COLORS.canvas, foreground=COLORS.muted,
+                                                    font=(UI_FONT, 10), anchor="center")
         self._prod_detail_preview_label.pack(fill="both", expand=True, padx=2, pady=2, ipady=30)
         self._prod_detail_preview_photo = None
         self._prod_detail_preview_zoom = tk.DoubleVar(value=1.0)
-        preview_controls = tk.Frame(detail_inner, background=COLORS.panel)
-        preview_controls.pack(fill="x", padx=10)
-        ttk.Label(preview_controls, text="Zoom:", background=COLORS.panel, foreground=COLORS.muted,
+        preview_controls = tk.Frame(print_tab, background=COLORS.canvas)
+        preview_controls.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(preview_controls, text="Zoom:", background=COLORS.canvas, foreground=COLORS.muted,
                   font=(UI_FONT, 9)).pack(side="left")
         zoom_slider = ttk.Scale(preview_controls, from_=0.3, to=3.0, variable=self._prod_detail_preview_zoom,
                                 orient="horizontal", command=lambda _: self._update_production_detail_preview())
         zoom_slider.pack(side="left", fill="x", expand=True, padx=(4, 4))
         ttk.Button(preview_controls, text="Abrir PNG", command=self._production_view_png,
                   style="Secondary.TButton").pack(side="right")
+
+        # --- Tab Cliente ---
+        client_tab = tk.Frame(preview_nb, background=COLORS.canvas)
+        preview_nb.add(client_tab, text=" Cliente ")
+        self._preview_nb = preview_nb
+
+        # Fondo selector
+        bg_frame = tk.Frame(client_tab, background=COLORS.panel)
+        bg_frame.pack(fill="x", padx=6, pady=(6, 2))
+        ttk.Label(bg_frame, text="Fondo:", background=COLORS.panel, foreground=COLORS.muted,
+                  font=(UI_FONT, 9)).pack(side="left", padx=(0, 4))
+        self._client_bg_type = tk.StringVar(value="white")
+        bg_options = [("Blanco", "white"), ("Gris claro", "gray"), ("Marca", "brand"), ("Imagen", "custom")]
+        for label, value in bg_options:
+            ttk.Radiobutton(bg_frame, text=label, variable=self._client_bg_type, value=value,
+                           command=self._on_client_bg_change).pack(side="left", padx=(2, 0))
+        self._client_bg_custom_path = tk.StringVar(value="")
+        ttk.Button(bg_frame, text="Elegir imagen…", command=self._pick_custom_bg,
+                  style="Secondary.TButton").pack(side="left", padx=(6, 0))
+        self._client_custom_bg_label = tk.Label(bg_frame, text="", background=COLORS.panel,
+                                                 foreground=COLORS.muted, font=(UI_FONT, 8))
+        self._client_custom_bg_label.pack(side="left", padx=(4, 0))
+
+        # Preview del cliente
+        self._client_preview_label = tk.Label(client_tab, text="Generá la vista\npara el cliente",
+                                               background=COLORS.canvas, foreground=COLORS.muted,
+                                               font=(UI_FONT, 10), anchor="center")
+        self._client_preview_label.pack(fill="both", expand=True, padx=6, pady=6, ipady=30)
+        self._client_preview_photo = None
+
+        # Botones de acción cliente
+        client_actions = tk.Frame(client_tab, background=COLORS.canvas)
+        client_actions.pack(fill="x", padx=6, pady=(0, 6))
+        self._btn_generate_client = ttk.Button(client_actions, text="Generar vista cliente",
+                                               command=self._generate_client_preview, style="Primary.TButton")
+        self._btn_generate_client.pack(side="left")
+        self._btn_export_client = ttk.Button(client_actions, text="Exportar vista cliente",
+                                              command=self._export_client_preview, style="Secondary.TButton")
+        self._btn_export_client.pack(side="left", padx=(6, 0))
+        self._client_status_label = tk.Label(client_actions, text="", background=COLORS.canvas,
+                                              foreground=COLORS.muted, font=(UI_FONT, 8))
+        self._client_status_label.pack(side="right")
+
         ttk.Label(detail_inner, text="Proporción real A4 · tamaño físico según calibración del monitor",
                   background=COLORS.panel, foreground=COLORS.disabled,
                   font=(UI_FONT, 8)).pack(fill="x", padx=10, pady=(1, 0))
@@ -6901,6 +7119,14 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 result = print_png_strip(job["printer_name"], job["final_png_path"], job["copies"], f"Doccione · Plancha {job['plancha_id']}")
                 def finish():
                     self.database.update_print_job(job["id"], "En cola" if result.success else "Error de impresión", result.message, result.spool_job_id if result.success else None)
+                    # Publicar evento de error de producción
+                    if not result.success:
+                        try:
+                            order_id = job.get("order_id")
+                            if order_id:
+                                self._event_bus.publish_production_error(order_id, f"Plancha #{job['plancha_id']}: {result.message}")
+                        except Exception:
+                            pass
                     refresh_queue()
                 self.after(0, finish)
 
@@ -6913,6 +7139,13 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 return
             if messagebox.askyesno("Confirmar impresión", "¿La plancha terminó de imprimirse correctamente?", parent=dialog):
                 self.database.update_print_job(job["id"], "Impresa", "Confirmada desde Producción.")
+                # Publicar evento de producción completada
+                try:
+                    order_id = job.get("order_id")
+                    if order_id:
+                        self._event_bus.publish_production_completed(order_id, f"Plancha #{job['plancha_id']}")
+                except Exception:
+                    pass
                 refresh_queue()
 
         actions = ttk.Frame(content)
@@ -7212,9 +7445,33 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 if key == "errors" and error_count > 0:
                     lbl.config(foreground=COLORS.error)
 
-        # --- Preview ---
+        # --- Preview impresión ---
         preview_path = plancha.get("final_png_path") or plancha.get("preview_path") or ""
         self._update_production_detail_preview(path=preview_path if preview_path and Path(preview_path).exists() else "")
+
+        # --- Preview cliente ---
+        client_cfg = self.database.client_preview_config(pid)
+        client_path = client_cfg.get("path") or ""
+        if client_path and Path(client_path).exists():
+            self._show_client_preview(client_path)
+            saved_bg = client_cfg.get("bg_type") or "white"
+            self._client_bg_type.set(saved_bg)
+            if saved_bg == "custom":
+                self._client_bg_custom_path.set(client_cfg.get("bg_value") or "")
+                self._client_custom_bg_label.config(
+                    text=Path(client_cfg.get("bg_value") or "").name if client_cfg.get("bg_value") else "")
+            else:
+                self._client_bg_custom_path.set("")
+                self._client_custom_bg_label.config(text="")
+            updated = client_cfg.get("updated_at") or ""
+            self._client_status_label.config(text=f"Guardado {updated}" if updated else "")
+        else:
+            self._client_preview_label.config(image="", text="Generá la vista\npara el cliente")
+            self._client_preview_photo = None
+            self._client_status_label.config(text="")
+            self._client_bg_type.set("white")
+            self._client_bg_custom_path.set("")
+            self._client_custom_bg_label.config(text="")
 
         # --- Estado de botones de acción ---
         has_final_png = bool((plancha.get("final_png_path") or "").strip())
@@ -7231,6 +7488,14 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                                                 foreground=COLORS.muted)
         self._prod_detail_preview_photo = None
         self._production_detail_current_preview_path = ""
+        # Limpiar vista cliente
+        self._client_preview_label.config(image="", text="Generá la vista\npara el cliente")
+        self._client_preview_photo = None
+        self._client_bg_type.set("white")
+        self._client_bg_custom_path.set("")
+        self._client_custom_bg_label.config(text="")
+        self._client_status_label.config(text="")
+        self._preview_mode.set("print")
         for lbl in self._prod_detail_order_labels.values():
             lbl.config(text="—")
         for lbl in self._prod_detail_prod_labels.values():
@@ -7263,6 +7528,129 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 self._prod_detail_preview_label.config(image=photo, text="")
         except Exception:
             self._prod_detail_preview_label.config(image="", text="Error al cargar")
+
+    # --- Vista previa para cliente ---
+
+    _CLIENT_BG_COLORS = {
+        "white": (255, 255, 255),
+        "gray": (230, 230, 230),
+        "brand": (0x1B, 0x1B, 0x1E),  # COLORS.panel oscuro
+    }
+
+    def _pick_custom_bg(self):
+        """Elegir una imagen de fondo personalizada."""
+        path = filedialog.askopenfilename(
+            title="Elegir imagen de fondo",
+            filetypes=[("Imágenes", "*.png *.jpg *.jpeg *.bmp *.webp"), ("Todos", "*.*")],
+            parent=self,
+        )
+        if path:
+            self._client_bg_custom_path.set(path)
+            self._client_custom_bg_label.config(text=Path(path).name)
+
+    def _on_client_bg_change(self):
+        """Cuando cambia el tipo de fondo, actualizar el label informativo."""
+        bg = self._client_bg_type.get()
+        if bg == "custom":
+            self._client_custom_bg_label.config(
+                text=Path(self._client_bg_custom_path.get()).name if self._client_bg_custom_path.get() else "Sin imagen"
+            )
+        else:
+            self._client_custom_bg_label.config(text="")
+
+    def _generate_client_preview(self):
+        """Generar la vista previa para cliente compositando el PNG final sobre un fondo."""
+        plancha = self._selected_production_plancha()
+        if not plancha:
+            return
+        pid = int(plancha["id"])
+        final_png = (plancha.get("final_png_path") or "").strip()
+        if not final_png or not Path(final_png).exists():
+            messagebox.showinfo("Vista cliente", "No se encontró el PNG final de la plancha.", parent=self)
+            return
+        try:
+            from PIL import Image, ImageTk, ImageOps
+        except ImportError:
+            messagebox.showerror("Vista cliente", "Se requiere Pillow para generar la vista cliente.", parent=self)
+            return
+        bg_type = self._client_bg_type.get()
+        try:
+            with Image.open(final_png) as fg:
+                fg = fg.convert("RGBA")
+                fg_w, fg_h = fg.size
+                # Crear fondo del mismo tamaño que el PNG
+                if bg_type == "custom":
+                    bg_path = self._client_bg_custom_path.get()
+                    if not bg_path or not Path(bg_path).exists():
+                        messagebox.showwarning("Vista cliente", "Elegí una imagen de fondo válida.", parent=self)
+                        return
+                    with Image.open(bg_path) as bg_img:
+                        bg_img = bg_img.convert("RGBA")
+                        bg_img = ImageOps.fit(bg_img, (fg_w, fg_h), Image.Resampling.LANCZOS)
+                        bg_img.paste(fg, (0, 0), fg)
+                        result = bg_img
+                else:
+                    color = self._CLIENT_BG_COLORS.get(bg_type, (255, 255, 255))
+                    result = Image.new("RGBA", (fg_w, fg_h), (*color, 255))
+                    result.paste(fg, (0, 0), fg)
+                # Guardar como archivo derivado (nunca tocar final_png_path)
+                output_dir = Path(final_png).parent
+                output_path = output_dir / f"client_preview_{pid}.png"
+                result.convert("RGB").save(str(output_path), "PNG")
+                self.database.save_client_preview(pid, str(output_path), bg_type,
+                                                  self._client_bg_custom_path.get() if bg_type == "custom" else "")
+                # Mostrar en el tab cliente
+                self._show_client_preview(str(output_path))
+                self.status.set(f"Vista cliente generada para plancha #{pid}")
+        except Exception as error:
+            messagebox.showerror("Vista cliente", f"Error al generar la vista:\n{error}", parent=self)
+
+    def _show_client_preview(self, path: str):
+        """Mostrar la imagen del cliente en el tab de cliente."""
+        try:
+            from PIL import Image, ImageTk
+            with Image.open(path) as img:
+                img = img.convert("RGB")
+                zoom = self._prod_detail_preview_zoom.get()
+                base_w = 240
+                w = int(base_w * zoom)
+                h = int(w * (297 / 210))
+                img = img.resize((w, h), Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(img)
+                self._client_preview_photo = photo
+                self._client_preview_label.config(image=photo, text="")
+                self._client_status_label.config(text=f"Generado: {Path(path).name}")
+        except Exception:
+            self._client_preview_label.config(image="", text="Error al cargar")
+
+    def _export_client_preview(self):
+        """Exportar la vista cliente a una ubicación elegida por el usuario."""
+        plancha = self._selected_production_plancha()
+        if not plancha:
+            return
+        pid = int(plancha["id"])
+        config = self.database.client_preview_config(pid)
+        src_path = config.get("path") or ""
+        if not src_path or not Path(src_path).exists():
+            messagebox.showinfo("Exportar", "Primero generá la vista cliente.", parent=self)
+            return
+        ext = Path(src_path).suffix or ".png"
+        default_name = Path(src_path).name
+        dest = filedialog.asksaveasfilename(
+            title="Exportar vista cliente",
+            initialfile=default_name,
+            defaultextension=ext,
+            filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg"), ("Todos", "*.*")],
+            parent=self,
+        )
+        if not dest:
+            return
+        try:
+            import shutil
+            shutil.copy2(src_path, dest)
+            self.status.set(f"Vista cliente exportada: {Path(dest).name}")
+        except Exception as error:
+            messagebox.showerror("Exportar", f"Error al exportar:\n{error}", parent=self)
 
     def _production_register_error(self):
         """Registrar un error de impresión manualmente con motivo predefinido."""
@@ -8518,6 +8906,15 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         # Detener el worker de notificaciones antes de cerrar
         try:
             self._notification_service.stop_worker()
+        except Exception:
+            pass
+        # Detener servidores HTTP
+        try:
+            self._pairing_server.stop()
+        except Exception:
+            pass
+        try:
+            self._mobile_jobs_server.stop()
         except Exception:
             pass
         # Una ficha puede tener hasta 700 ms de cambios en cola. Antes de

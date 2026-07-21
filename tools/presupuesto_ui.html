@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Presupuesto Doccione - Generador</title>
+  <style>
+    body{background:#111;color:#eee;font-family:Arial;padding:18px}
+    .card{background:#1b1b1b;padding:16px;border-radius:8px;max-width:900px;margin:auto}
+    input,button{padding:8px;margin:6px 0}
+    pre{background:#0f0f0f;padding:12px;border-radius:6px;overflow:auto}
+    .row{display:flex;gap:8px;flex-wrap:wrap}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Presupuesto Doccione — Generador</h2>
+    <p>Carga archivos CSV: <strong>precios.csv</strong> y <strong>pedido.csv</strong></p>
+    <div class="row">
+      <label>Precios (CSV)<input id="filePrices" type="file" accept=".csv"></label>
+      <label>Pedido (CSV)<input id="fileOrder" type="file" accept=".csv"></label>
+    </div>
+    <div class="row">
+      <input id="senia" placeholder="Seña (ej. $100)" />
+      <select id="entrega"><option>Retiro</option><option>Envío</option></select>
+      <button id="generate">Generar presupuesto</button>
+      <button id="copy">Copiar al portapapeles</button>
+      <button id="sendToParent">Enviar al formulario</button>
+    </div>
+    <h3>Mensaje generado</h3>
+    <pre id="output">Aquí aparecerá el presupuesto.</pre>
+  </div>
+
+<script>
+function parseCSV(text){
+  const lines = text.split(/\r?\n/).filter(Boolean);
+  const [header,...rows] = lines;
+  const cols = header.split(',').map(h=>h.trim().toLowerCase());
+  return rows.map(r=>{
+    const parts = r.split(',');
+    const obj = {};
+    for(let i=0;i<cols.length;i++) obj[cols[i]] = (parts[i]||'').trim();
+    return obj;
+  });
+}
+function money(n){return '$'+Number(n).toFixed(2)}
+
+async function readFileAsText(input){
+  if(!input.files[0]) return null;
+  return await input.files[0].text();
+}
+
+document.getElementById('generate').addEventListener('click', async ()=>{
+  const ptxt = await readFileAsText(document.getElementById('filePrices'));
+  const otxt = await readFileAsText(document.getElementById('fileOrder'));
+  if(!ptxt || !otxt){ alert('Carga ambos archivos CSV.'); return; }
+  const prices = parseCSV(ptxt);
+  const order = parseCSV(otxt);
+  // build price map
+  const map = new Map();
+  prices.forEach(r=>{
+    const key = ((r.producto||'')+ '||' + (r.tamaño||r.tamanio||'') + '||' + (r.material||'')).toLowerCase();
+    map.set(key, parseFloat((r.precio||'0').replace('$','')));
+    // also set by producto only
+    const key2 = ((r.producto||'')+ '||' + '' + '||' + '').toLowerCase();
+    if(!map.has(key2)) map.set(key2, parseFloat((r.precio||'0').replace('$','')));
+  });
+
+  let total = 0;
+  const lines = [];
+  order.forEach(it=>{
+    const producto = it.producto||it.name||'';
+    const tamanio = it.tamaño||it.tamanio||it.size||'';
+    const material = it.material||'';
+    const cantidad = parseInt(it.cantidad||it.qty||'1')||1;
+    const key = (producto + '||' + tamanio + '||' + material).toLowerCase();
+    let precio = map.has(key) ? map.get(key) : (map.get((producto+'||||').toLowerCase())||0);
+    const subtotal = precio * cantidad;
+    total += subtotal;
+    lines.push({producto,cantidad,tamanio,material,precio,subtotal});
+  });
+
+  // build message
+  let out = '📋 Presupuesto Doccione\n\n• Productos:\n';
+  lines.forEach(l=>{
+    out += `  - ${l.producto} — Cantidad: ${l.cantidad}, Tamaño: ${l.tamanio||'-'}, Material: ${l.material||'-'}, Precio unitario: ${money(l.precio)}, Subtotal: ${money(l.subtotal)}\n`;
+  });
+  out += `\n• Precios totales: ${money(total)}\n\n`;
+  out += `⏳ Tiempo de entrega: 3-5 días hábiles (estimado)\n`;
+  out += `💳 Seña: ${document.getElementById('senia').value || '0'}\n`;
+  out += `📦 Entrega: ${document.getElementById('entrega').value}\n\n`;
+  out += '¡Gracias por elegir Doccione! Cualquier modificación en medidas, cantidad o material actualiza el presupuesto.';
+
+  document.getElementById('output').textContent = out;
+});
+
+  document.getElementById('copy').addEventListener('click', async ()=>{
+  const txt = document.getElementById('output').textContent;
+  try{ await navigator.clipboard.writeText(txt); alert('Copiado al portapapeles'); }catch(e){ alert('Error copiando: '+e.message); }
+});
+
+  // Enviar al formulario parent si estamos embebidos en un iframe/modal
+  document.getElementById('sendToParent').addEventListener('click', ()=>{
+    const txt = document.getElementById('output').textContent;
+    if(window.parent && window.parent !== window){
+      window.parent.postMessage({type:'presupuesto_generated', text: txt}, '*');
+      alert('Presupuesto enviado al formulario (ventana padre).');
+    } else {
+      alert('No hay ventana padre receptora. Abre esta página dentro de la app.');
+    }
+  });
+</script>
+</body>
+</html>

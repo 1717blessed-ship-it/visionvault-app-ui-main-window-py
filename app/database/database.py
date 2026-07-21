@@ -1,11 +1,15 @@
 import json
 import sqlite3
 from pathlib import Path
+from decimal import Decimal
 
 from costos.models.cost_component import CostComponent
 from costos.models.cost_condition import CostCondition
 from costos.models.cost_rule import CostRule
+from costos.models.variable_cost_component import VariableCostComponent
+from costos.models.variable_cost_model import VariableCostModel, build_product_key
 from costos.services.cost_calculator import CostCalculator
+from costos.services.variable_cost_calculator import VariableCostCalculator
 
 
 DOCCIONE_PRICE_CATALOG_KEY = "precio_catalogo_doccione_2026_07_15"
@@ -418,9 +422,24 @@ class ImageDatabase:
             ("pack_quantity", "INTEGER DEFAULT 1"),
             ("catalog_key", "TEXT DEFAULT ''"),
             ("cost_model_id", "INTEGER DEFAULT NULL"),
+            ("variable_cost_model_id", "INTEGER DEFAULT NULL"),
+            ("outdated", "INTEGER DEFAULT 0"),
+            ("source_updated_at", "TEXT DEFAULT ''"),
+            ("last_synced_at", "TEXT DEFAULT ''"),
+            ("manually_overridden", "INTEGER DEFAULT 0"),
         ):
             if column not in price_rule_columns:
                 self.connection.execute(f"ALTER TABLE price_rules ADD COLUMN {column} {definition}")
+
+        # Migración: renombrar cost_model_id a variable_cost_model_id si existe
+        if "cost_model_id" in price_rule_columns and "variable_cost_model_id" not in price_rule_columns:
+            try:
+                self.connection.execute("ALTER TABLE price_rules RENAME COLUMN cost_model_id TO variable_cost_model_id")
+            except Exception:
+                # Si falla el renombrado, agregar la nueva columna solo si no existe
+                price_rule_columns_after = {row[1] for row in self.connection.execute("PRAGMA table_info(price_rules)")}
+                if "variable_cost_model_id" not in price_rule_columns_after:
+                    self.connection.execute("ALTER TABLE price_rules ADD COLUMN variable_cost_model_id INTEGER DEFAULT NULL")
         self.connection.execute("CREATE INDEX IF NOT EXISTS idx_price_rules_catalog ON price_rules(catalog_key)")
         self.connection.execute(
             """CREATE TABLE IF NOT EXISTS plancha_projects (
@@ -449,6 +468,11 @@ class ImageDatabase:
             ("last_printed_at", "TEXT DEFAULT ''"),
             ("preview_path", "TEXT DEFAULT ''"),
             ("previous_production_status", "TEXT DEFAULT ''"),
+            # Vista previa para cliente
+            ("client_preview_path", "TEXT DEFAULT ''"),
+            ("client_preview_bg_type", "TEXT DEFAULT ''"),
+            ("client_preview_bg_value", "TEXT DEFAULT ''"),
+            ("client_preview_updated_at", "TEXT DEFAULT ''"),
         ):
             if column not in plancha_columns:
                 self.connection.execute(f"ALTER TABLE plancha_projects ADD COLUMN {column} {definition}")
@@ -640,11 +664,54 @@ class ImageDatabase:
                 UNIQUE(device_id, event_type)
             )"""
         )
+        # Códigos de emparejamiento temporales (uso único, expiran en 5 min, almacenados como hash)
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS pairing_codes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code_hash TEXT NOT NULL UNIQUE,
+                installation_id TEXT NOT NULL DEFAULT 'studio-principal',
+                used INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            )"""
+        )
+        # Historial de etapas de producción para auditoría
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS production_stage_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                order_id INTEGER NOT NULL,
+                old_stage TEXT,
+                new_stage TEXT NOT NULL,
+                device_id INTEGER,
+                device_name TEXT,
+                operator_name TEXT,
+                source TEXT NOT NULL DEFAULT 'mobile',
+                notes TEXT DEFAULT '',
+                changed_at TEXT NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES order_jobs(id),
+                FOREIGN KEY(order_id) REFERENCES orders(id),
+                FOREIGN KEY(device_id) REFERENCES mobile_devices(id)
+            )"""
+        )
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_production_history_job ON production_stage_history(job_id, changed_at DESC)")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_production_history_order ON production_stage_history(order_id, changed_at DESC)")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_production_history_device ON production_stage_history(device_id, changed_at DESC)")
+        # Idempotencia del outbox: evitar mensajes duplicados al mismo dispositivo
+        self.connection.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_notification_outbox_event_device
+               ON notification_outbox(event_uuid, recipient_id, channel)"""
+        )
+        
+        # ── Migraciones de esquema (ejecutar antes de crear EventRepository) ──
         self._migrate_order_clients()
         self._migrate_order_jobs()
+        self._migrate_mobile_devices()
+        self._migrate_pairing_codes()
         self.install_doccione_price_catalog()
         self.connection.commit()
 
+        # ── Crear EventRepository después de todas las migraciones ──
         from app.events.event_repository import EventRepository
         self.event_repo = EventRepository(self.connection)
 
@@ -852,6 +919,60 @@ class ImageDatabase:
         for row in rows:
             client_id = self._ensure_client(row["client"], row["whatsapp"], now)
             self.connection.execute("UPDATE orders SET client_id = ? WHERE id = ?", (client_id, row["id"]))
+
+    def _migrate_mobile_devices(self) -> None:
+        """Agrega columnas de session token a mobile_devices si no existen."""
+        # Verificar columnas existentes
+        existing_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(mobile_devices)")}
+        
+        # Agregar columnas faltantes de forma idempotente
+        # SQLite no permite agregar columnas UNIQUE con ALTER TABLE, así que agregamos sin UNIQUE
+        for column, definition in (
+            ("session_token_hash", "TEXT"),
+            ("session_expires_at", "TEXT"),
+            ("session_last_used_at", "TEXT"),
+        ):
+            if column not in existing_columns:
+                self.connection.execute(f"ALTER TABLE mobile_devices ADD COLUMN {column} {definition}")
+        
+        # Crear índice único para session_token_hash DESPUÉS de agregar la columna
+        # Esto garantiza unicidad y evita el error "no such column"
+        self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_mobile_devices_session ON mobile_devices(session_token_hash)")
+
+    def _migrate_pairing_codes(self) -> None:
+        """Migra pairing_codes de código en texto plano a hash SHA-256."""
+        # Verificar si la columna code_hash existe
+        existing_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(pairing_codes)")}
+        
+        if "code_hash" not in existing_columns:
+            # La tabla tiene la estructura antigua con 'code' en texto plano
+            # Crear tabla nueva con hash
+            self.connection.execute(
+                """CREATE TABLE IF NOT EXISTS pairing_codes_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code_hash TEXT NOT NULL UNIQUE,
+                    installation_id TEXT NOT NULL DEFAULT 'studio-principal',
+                    used INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                )"""
+            )
+            
+            # Migrar datos existentes calculando el hash
+            import hashlib
+            rows = self.connection.execute("SELECT * FROM pairing_codes").fetchall()
+            for row in rows:
+                code_hash = hashlib.sha256(row["code"].encode()).hexdigest()
+                self.connection.execute(
+                    """INSERT INTO pairing_codes_new 
+                       (code_hash, installation_id, used, created_at, expires_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (code_hash, row["installation_id"], row["used"], row["created_at"], row["expires_at"])
+                )
+            
+            # Reemplazar tabla antigua
+            self.connection.execute("DROP TABLE pairing_codes")
+            self.connection.execute("ALTER TABLE pairing_codes_new RENAME TO pairing_codes")
 
     def _ensure_client(self, name: str, whatsapp: str, now: str | None = None) -> int:
         from datetime import datetime
@@ -1494,7 +1615,7 @@ class ImageDatabase:
             quantity = max(1, int(rule.get("min_quantity") or 1))
             sale_price = float(rule.get("price") or 0)
             resolved_rule, warning = self.resolve_price_rule_cost_model(rule)
-            legacy_rule = not bool(rule.get("cost_model_id"))
+            legacy_rule = not bool(rule.get("variable_cost_model_id"))
             if resolved_rule is None:
                 analysis = None
                 detail = warning or "Modelo no disponible"
@@ -1686,6 +1807,68 @@ class ImageDatabase:
                 ))
         return rule
 
+    def _build_cost_rule_from_variable_cost_model(self, model: dict | None) -> CostRule | None:
+        """Convierte un modelo de costo variable en una CostRule compatible con CostCalculator."""
+        if not model:
+            return None
+        
+        model_id = model.get("id")
+        if not model_id:
+            return None
+        
+        # Cargar componentes del modelo
+        components_data = self.variable_cost_model_components(int(model_id))
+        if not components_data:
+            return None
+        
+        # Construir la regla de costo
+        rule = CostRule(
+            id=int(model_id),
+            name=str(model.get("name") or "Modelo de costo variable"),
+            product_type=str(model.get("product_name") or ""),
+            minimum_margin=0.0,
+            active=bool(model.get("active", True)),
+        )
+        
+        # Convertir cada componente de VariableCostComponent a CostComponent
+        for comp_data in components_data:
+            if not comp_data.get("active"):
+                continue
+            
+            # Mapear calc_mode a value_type de CostComponent
+            calc_mode = comp_data.get("calc_mode", "per_unit")
+            if calc_mode == "percentage":
+                value_type = "percentage"
+                value = float(comp_data.get("unit_value") or 0)
+            elif calc_mode in ("fixed", "per_unit", "per_sheet", "per_job"):
+                value_type = "fixed"
+                # Para componentes directos, usar el amount calculado
+                amount = comp_data.get("amount") or 0
+                quantity = comp_data.get("quantity") or 1
+                unit_value = comp_data.get("unit_value") or 0
+                waste_pct = comp_data.get("waste_pct") or 0
+                
+                # Calcular el valor final: quantity * unit_value * (1 + waste_pct/100)
+                if calc_mode in ("per_unit", "per_sheet", "per_job"):
+                    value = float(quantity) * float(unit_value) * (1 + float(waste_pct) / 100)
+                else:
+                    value = float(amount)
+            else:
+                value_type = "fixed"
+                value = float(comp_data.get("amount") or 0)
+            
+            component = CostComponent(
+                name=str(comp_data.get("name") or "Componente"),
+                code=str(comp_data.get("name") or "component").lower().replace(" ", "_"),
+                value_type=value_type,
+                value=value,
+                enabled=True,
+                order=int(comp_data.get("sort_order") or 0),
+            )
+            rule.add_component(component)
+        
+        return rule
+
     def _build_cost_rule_from_legacy_price_rule(self, price_rule: dict | None) -> CostRule | None:
         if not price_rule:
             return None
@@ -1719,17 +1902,17 @@ class ImageDatabase:
         if not price_rule:
             return None, None
 
-        model_id = price_rule.get("cost_model_id")
+        model_id = price_rule.get("variable_cost_model_id")
         if model_id not in {None, "", 0}:
             try:
-                model = self.cost_model(int(model_id))
+                model = self.variable_cost_model(int(model_id))
             except (TypeError, ValueError):
-                return None, "La regla de precio referencia un modelo de costos inválido o inexistente."
+                return None, "La regla de precio referencia un modelo de costos variables inválido o inexistente."
             if not model:
-                return None, "La regla de precio referencia un modelo de costos inexistente."
+                return None, "La regla de precio referencia un modelo de costos variables inexistente."
             if not bool(model.get("active", True)):
-                return None, "La regla de precio referencia un modelo de costos desactivado."
-            return self._build_cost_rule_from_model(model), None
+                return None, "La regla de precio referencia un modelo de costos variables desactivado."
+            return self._build_cost_rule_from_variable_cost_model(model), None
 
         legacy_rule = self._build_cost_rule_from_legacy_price_rule(price_rule)
         if legacy_rule is None:
@@ -1741,6 +1924,66 @@ class ImageDatabase:
     def _resolve_price_rule_cost_model(self, price_rule: dict | None) -> CostRule | None:
         resolved, _ = self.resolve_price_rule_cost_model(price_rule)
         return resolved
+
+    def resolve_cost_model_with_priority(
+        self,
+        *,
+        variant_model_id: int | None = None,
+        price_rule: dict | None = None,
+        product_key: str = "",
+    ) -> tuple[CostRule | None, str | None]:
+        """Resuelve el modelo de costo según prioridad:
+        
+        1. Modelo asignado directamente a la variante
+        2. Modelo vinculado a la price_rule
+        3. Modelo activo encontrado por product_key
+        4. Costo manual existente (legacy)
+        5. Configuración incompleta
+        
+        Retorna (CostRule, warning) donde warning explica el estado.
+        """
+        # Prioridad 1: Modelo asignado directamente a la variante
+        if variant_model_id and variant_model_id not in {None, "", 0}:
+            try:
+                model = self.variable_cost_model(int(variant_model_id))
+                if model and bool(model.get("active", True)):
+                    return self._build_cost_rule_from_variable_cost_model(model), None
+                elif model:
+                    return None, "El modelo asignado a la variante está desactivado"
+                else:
+                    return None, "El modelo asignado a la variante no existe"
+            except (TypeError, ValueError):
+                return None, "El ID de modelo de variante es inválido"
+        
+        # Prioridad 2: Modelo vinculado a la price_rule
+        if price_rule:
+            model_id = price_rule.get("variable_cost_model_id")
+            if model_id and model_id not in {None, "", 0}:
+                try:
+                    model = self.variable_cost_model(int(model_id))
+                    if model and bool(model.get("active", True)):
+                        return self._build_cost_rule_from_variable_cost_model(model), None
+                    elif model:
+                        return None, "El modelo vinculado a la regla de precio está desactivado"
+                    else:
+                        return None, "El modelo vinculado a la regla de precio no existe"
+                except (TypeError, ValueError):
+                    return None, "El ID de modelo en la regla de precio es inválido"
+        
+        # Prioridad 3: Modelo activo encontrado por product_key
+        if product_key:
+            model = self.variable_cost_model_by_product_key(product_key)
+            if model:
+                return self._build_cost_rule_from_variable_cost_model(model), None
+        
+        # Prioridad 4: Costo manual existente (legacy en price_rule)
+        if price_rule:
+            legacy_rule = self._build_cost_rule_from_legacy_price_rule(price_rule)
+            if legacy_rule and any(comp.value > 0 for comp in legacy_rule.components):
+                return legacy_rule, None
+        
+        # Prioridad 5: Configuración incompleta
+        return None, "No hay modelo de costo configurado para este producto"
 
     def price_sizes(self) -> list[str]:
         rows = self.connection.execute(
@@ -1825,7 +2068,7 @@ class ImageDatabase:
         self, material: str, size: str, min_quantity: int, price: float,
         extra_service: str = "", discount_percent: float = 0,
         price_mode: str = "fijo", pack_quantity: int = 1,
-        cost_model_id: int | None = None,
+        variable_cost_model_id: int | None = None,
     ) -> int:
         minimum = max(1, int(min_quantity or 1))
         amount  = max(0.0, float(price or 0))
@@ -1836,11 +2079,11 @@ class ImageDatabase:
         pack = max(1, int(pack_quantity or 1))
         sql = """INSERT INTO price_rules(
                 material, size, min_quantity, price, extra_service, discount_percent,
-                active, price_mode, pack_quantity, cost_model_id
+                active, price_mode, pack_quantity, variable_cost_model_id
                ) VALUES(?, ?, ?, ?, ?, ?, 1, ?, ?, ?)"""
         params = (
             self._price_material(material), self._price_size(size), minimum, amount,
-            extra_service.strip(), discount, mode, pack, None if cost_model_id in {None, ""} else int(cost_model_id),
+            extra_service.strip(), discount, mode, pack, None if variable_cost_model_id in {None, ""} else int(variable_cost_model_id),
         )
         cursor = self.connection.execute(sql, params)
         try:
@@ -1882,7 +2125,7 @@ class ImageDatabase:
         self, rule_id: int, material: str, size: str, min_quantity: int, price: float,
         extra_service: str = "", discount_percent: float = 0,
         price_mode: str = "fijo", pack_quantity: int = 1,
-        cost_model_id: int | None = None,
+        variable_cost_model_id: int | None = None,
     ) -> bool:
         """Actualiza una regla sin alterar su origen ni la clave de catálogo."""
         minimum = max(1, int(min_quantity or 1))
@@ -1895,12 +2138,12 @@ class ImageDatabase:
         sql = """UPDATE price_rules
                SET material = ?, size = ?, min_quantity = ?, price = ?, extra_service = ?,
                    discount_percent = ?, active = 1, price_mode = ?, pack_quantity = ?,
-                   cost_model_id = ?
+                   variable_cost_model_id = ?
                WHERE id = ?"""
         params = (
             self._price_material(material), self._price_size(size), minimum, amount,
             extra_service.strip(), discount, mode, pack,
-            None if cost_model_id in {None, ""} else int(cost_model_id),
+            None if variable_cost_model_id in {None, ""} else int(variable_cost_model_id),
             int(rule_id),
         )
         cursor = self.connection.execute(sql, params)
@@ -2242,6 +2485,20 @@ class ImageDatabase:
         )
         return [dict(row) for row in rows]
 
+    def active_variable_cost_models(self) -> list[dict]:
+        """Devuelve solo los modelos activos de costo variable."""
+        rows = self.connection.execute(
+            "SELECT * FROM variable_cost_models WHERE active = 1 ORDER BY name COLLATE NOCASE, id"
+        )
+        return [dict(row) for row in rows]
+
+    def active_variable_cost_keys(self) -> set[str]:
+        """Devuelve el conjunto de product_key con un modelo activo."""
+        rows = self.connection.execute(
+            "SELECT product_key FROM variable_cost_models WHERE active = 1 AND product_key != ''"
+        )
+        return {row[0] for row in rows}
+
     def variable_cost_model(self, model_id: int) -> dict | None:
         """Devuelve un modelo de costo variable por ID."""
         row = self.connection.execute(
@@ -2262,45 +2519,32 @@ class ImageDatabase:
         name: str,
         product_id: int | None = None,
         product_name: str = "",
+        product_key: str = "",
         category: str = "",
         active: bool = True,
+        outdated: bool = False,
         components: list[dict] | None = None,
     ) -> int:
-        """Crea un nuevo modelo de costo variable con sus componentes."""
+        """Crea un nuevo modelo de costo variable con sus componentes.
+
+        La operación se ejecuta dentro de una transacción: si falla
+        un componente, no queda guardado un modelo incompleto.
+        """
         from datetime import datetime
         now = datetime.now().isoformat(timespec="seconds")
         cursor = self.connection.execute(
-            """INSERT INTO variable_cost_models(name, product_id, product_name, category, active, created_at, updated_at)
-               VALUES(?, ?, ?, ?, ?, ?, ?)""",
-            (name.strip(), product_id, product_name.strip(), category.strip(), int(active), now, now),
+            """INSERT INTO variable_cost_models(
+                name, product_id, product_name, product_key, category,
+                active, outdated, created_at, updated_at)
+               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                name.strip(), product_id, product_name.strip(),
+                product_key.strip(), category.strip(),
+                int(active), int(outdated), now, now,
+            ),
         )
         model_id = int(cursor.lastrowid or 0)
-        for idx, comp in enumerate(components or []):
-            self.connection.execute(
-                """INSERT INTO variable_cost_components(
-                    model_id, name, category, origin, source_id, calc_mode,
-                    quantity, unit_value, waste_pct, unit, percentage_base,
-                    amount, sort_order, active, created_at, updated_at)
-                   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    model_id,
-                    str(comp.get("name") or "").strip(),
-                    str(comp.get("category") or "").strip(),
-                    str(comp.get("origin") or "manual").strip(),
-                    comp.get("source_id"),
-                    str(comp.get("calc_mode") or "per_unit").strip(),
-                    float(comp.get("quantity") or 0),
-                    float(comp.get("unit_value") or 0),
-                    float(comp.get("waste_pct") or 0),
-                    str(comp.get("unit") or "").strip(),
-                    str(comp.get("percentage_base") or "").strip(),
-                    float(comp.get("amount") or 0),
-                    int(comp.get("sort_order") or idx),
-                    int(comp.get("active", 1)),
-                    now,
-                    now,
-                ),
-            )
+        self._insert_variable_cost_components(model_id, components, now)
         self.connection.commit()
         return model_id
 
@@ -2310,58 +2554,93 @@ class ImageDatabase:
         name: str,
         product_id: int | None = None,
         product_name: str = "",
+        product_key: str = "",
         category: str = "",
         active: bool = True,
+        outdated: bool = False,
         components: list[dict] | None = None,
     ) -> bool:
-        """Actualiza un modelo de costo variable y reemplaza sus componentes."""
+        """Actualiza un modelo de costo variable y reemplaza sus componentes.
+
+        Si ``components`` es None, los componentes no se modifican.
+        """
         from datetime import datetime
         now = datetime.now().isoformat(timespec="seconds")
         cursor = self.connection.execute(
             """UPDATE variable_cost_models SET
-                name = ?, product_id = ?, product_name = ?, category = ?,
-                active = ?, updated_at = ?
+                name = ?, product_id = ?, product_name = ?, product_key = ?,
+                category = ?, active = ?, outdated = ?, updated_at = ?
                WHERE id = ?""",
-            (name.strip(), product_id, product_name.strip(), category.strip(), int(active), now, model_id),
+            (
+                name.strip(), product_id, product_name.strip(),
+                product_key.strip(), category.strip(),
+                int(active), int(outdated), now, model_id,
+            ),
         )
         if components is not None:
             self.connection.execute(
                 "DELETE FROM variable_cost_components WHERE model_id = ?", (model_id,)
             )
-            for idx, comp in enumerate(components):
-                self.connection.execute(
-                    """INSERT INTO variable_cost_components(
-                        model_id, name, category, origin, source_id, calc_mode,
-                        quantity, unit_value, waste_pct, unit, percentage_base,
-                        amount, sort_order, active, created_at, updated_at)
-                       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        model_id,
-                        str(comp.get("name") or "").strip(),
-                        str(comp.get("category") or "").strip(),
-                        str(comp.get("origin") or "manual").strip(),
-                        comp.get("source_id"),
-                        str(comp.get("calc_mode") or "per_unit").strip(),
-                        float(comp.get("quantity") or 0),
-                        float(comp.get("unit_value") or 0),
-                        float(comp.get("waste_pct") or 0),
-                        str(comp.get("unit") or "").strip(),
-                        str(comp.get("percentage_base") or "").strip(),
-                        float(comp.get("amount") or 0),
-                        int(comp.get("sort_order") or idx),
-                        int(comp.get("active", 1)),
-                        now,
-                        now,
-                    ),
-                )
+            self._insert_variable_cost_components(model_id, components, now)
+        
+        # Marcar price_rules vinculadas como desactualizadas
+        self._mark_price_rules_outdated_for_model(model_id, now)
+        
         self.connection.commit()
         return bool(cursor.rowcount)
+
+    def _insert_variable_cost_components(
+        self, model_id: int, components: list[dict] | None, now: str
+    ) -> None:
+        """Inserta componentes de costo variable dentro de una transacción existente."""
+        for idx, comp in enumerate(components or []):
+            self.connection.execute(
+                """INSERT INTO variable_cost_components(
+                    model_id, name, category, origin, source_id, calc_mode,
+                    quantity, unit_value, waste_pct, unit, percentage_base,
+                    amount, sort_order, active,
+                    source_updated_at, last_synced_at, manually_overridden,
+                    created_at, updated_at)
+                   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    model_id,
+                    str(comp.get("name") or "").strip(),
+                    str(comp.get("category") or "").strip(),
+                    str(comp.get("origin") or "manual").strip(),
+                    comp.get("source_id"),
+                    str(comp.get("calc_mode") or comp.get("calculation_mode") or "per_unit").strip(),
+                    str(comp.get("quantity") or "0"),
+                    str(comp.get("unit_value") or "0"),
+                    str(comp.get("waste_pct") or "0"),
+                    str(comp.get("unit") or "").strip(),
+                    str(comp.get("percentage_base") or "").strip(),
+                    str(comp.get("amount") or comp.get("calculated_amount") or "0"),
+                    int(comp.get("sort_order") or comp.get("order") or idx),
+                    int(comp.get("active", 1)),
+                    str(comp.get("source_updated_at") or "").strip(),
+                    str(comp.get("last_synced_at") or "").strip(),
+                    int(comp.get("manually_overridden", 0)),
+                    now,
+                    now,
+                ),
+            )
 
     def remove_variable_cost_model(self, model_id: int) -> None:
         """Elimina un modelo de costo variable y sus componentes."""
         self.connection.execute("DELETE FROM variable_cost_components WHERE model_id = ?", (model_id,))
         self.connection.execute("DELETE FROM variable_cost_models WHERE id = ?", (model_id,))
         self.connection.commit()
+
+    def deactivate_variable_cost_model(self, model_id: int) -> bool:
+        """Desactiva un modelo (baja lógica) en lugar de eliminarlo."""
+        from datetime import datetime
+        now = datetime.now().isoformat(timespec="seconds")
+        cursor = self.connection.execute(
+            "UPDATE variable_cost_models SET active = 0, updated_at = ? WHERE id = ?",
+            (now, model_id),
+        )
+        self.connection.commit()
+        return bool(cursor.rowcount)
 
     def duplicate_variable_cost_model(self, model_id: int) -> int | None:
         """Duplica un modelo de costo variable existente."""
@@ -2373,19 +2652,74 @@ class ImageDatabase:
             name=f"{model['name']} (copia)",
             product_id=model.get("product_id"),
             product_name=str(model.get("product_name") or ""),
+            product_key=str(model.get("product_key") or ""),
             category=str(model.get("category") or ""),
             active=bool(model.get("active", 1)),
             components=components,
         )
         return new_id
 
-    def variable_cost_models_by_product(self, product_id: int) -> list[dict]:
-        """Devuelve todos los modelos de costo variable de un producto específico."""
+    def variable_cost_models_by_product(self, product_key: str) -> list[dict]:
+        """Devuelve todos los modelos de costo variable para una product_key."""
         rows = self.connection.execute(
-            "SELECT * FROM variable_cost_models WHERE product_id = ? ORDER BY name COLLATE NOCASE, id",
-            (product_id,),
+            "SELECT * FROM variable_cost_models WHERE product_key = ? ORDER BY active DESC, id",
+            (product_key,),
         )
         return [dict(row) for row in rows]
+
+    def variable_cost_model_by_product_key(self, product_key: str) -> dict | None:
+        """Devuelve el modelo activo para una product_key dada."""
+        row = self.connection.execute(
+            "SELECT * FROM variable_cost_models WHERE product_key = ? AND active = 1 LIMIT 1",
+            (product_key,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def _mark_price_rules_outdated_for_model(self, model_id: int, timestamp: str) -> None:
+        """Marca las price_rules vinculadas a un modelo como desactualizadas.
+        
+        Solo marca las reglas que no tienen manually_overridden = 1.
+        """
+        self.connection.execute(
+            """UPDATE price_rules 
+               SET outdated = 1, source_updated_at = ?
+               WHERE variable_cost_model_id = ? AND manually_overridden = 0""",
+            (timestamp, model_id),
+        )
+
+    def sync_price_rule_with_model(self, rule_id: int) -> tuple[bool, str | None]:
+        """Sincroniza explícitamente una price_rule con su modelo vinculado.
+        
+        Retorna (success, warning).
+        """
+        rule = self.price_rule(rule_id)
+        if not rule:
+            return False, "Regla no encontrada"
+        
+        model_id = rule.get("variable_cost_model_id")
+        if not model_id or model_id in {None, "", 0}:
+            return False, "La regla no tiene un modelo vinculado"
+        
+        model = self.variable_cost_model(int(model_id))
+        if not model:
+            return False, "El modelo vinculado no existe"
+        
+        if not bool(model.get("active", True)):
+            return False, "El modelo vinculado está desactivado"
+        
+        from datetime import datetime
+        now = datetime.now().isoformat(timespec="seconds")
+        
+        # Actualizar campos de sincronización
+        self.connection.execute(
+            """UPDATE price_rules 
+               SET outdated = 0, last_synced_at = ?, manually_overridden = 0
+               WHERE id = ?""",
+            (now, rule_id),
+        )
+        self.connection.commit()
+        
+        return True, None
 
     def price_rule_products(self) -> list[dict]:
         """Devuelve productos únicos de price_rules para el selector."""
@@ -3539,6 +3873,33 @@ class ImageDatabase:
         )
         self.connection.commit()
         return prev
+
+    # Vista previa para cliente ------------------------------------------
+
+    def save_client_preview(self, plancha_id: int, path: str, bg_type: str, bg_value: str = "") -> None:
+        """Guarda la ruta y configuración de la vista previa para cliente."""
+        from datetime import datetime
+        now = datetime.now().isoformat(timespec="seconds")
+        self.connection.execute(
+            """UPDATE plancha_projects
+               SET client_preview_path = ?, client_preview_bg_type = ?,
+                   client_preview_bg_value = ?, client_preview_updated_at = ?, updated_at = ?
+               WHERE id = ?""",
+            (path.strip(), bg_type, bg_value, now, now, plancha_id),
+        )
+        self.connection.commit()
+
+    def client_preview_config(self, plancha_id: int) -> dict:
+        """Devuelve la configuración actual de la vista cliente para una plancha."""
+        project = self.plancha_project(plancha_id)
+        if not project:
+            return {}
+        return {
+            "path": project.get("client_preview_path") or "",
+            "bg_type": project.get("client_preview_bg_type") or "",
+            "bg_value": project.get("client_preview_bg_value") or "",
+            "updated_at": project.get("client_preview_updated_at") or "",
+        }
 
     def set_plancha_usuario(self, plancha_id: int, usuario: str) -> None:
         """Registra quién creó/modificó la plancha."""
