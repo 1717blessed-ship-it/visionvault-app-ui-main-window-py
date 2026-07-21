@@ -23,6 +23,7 @@ from app.services.stage_catalog_service import (
     get_all_stages_for_mobile,
     get_workflows_for_mobile,
 )
+from app.services.sync_cursor_service import SyncCursorService
 from app.workflow.timeline import (
     get_current_stage,
     get_stage_progress,
@@ -129,6 +130,8 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
             self._get_materials()
         elif parsed.path == "/api/v1/mobile/device/status":
             self._get_device_status(device)
+        elif parsed.path == "/api/v1/mobile/capabilities":
+            self._get_capabilities()
         else:
             self._send_error(404, "Endpoint not found")
 
@@ -573,6 +576,20 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
         except Exception as e:
             logger.error("Error getting device status: %s", e)
             self._send_error(500, f"Error getting device status: {e}")
+
+    def _get_capabilities(self) -> None:
+        """Retorna capacidades del servidor para sincronización móvil."""
+        capabilities = {
+            "api_version": "1.0",
+            "server_version": "1.0.0",
+            "supported_types": sorted(SyncCursorService.SUPPORTED_TYPES),
+            "max_limit": SyncCursorService.MAX_LIMIT,
+            "cursor_version": SyncCursorService.CURSOR_VERSION,
+            "supports_pull": True,
+            "supports_push": False,
+            "supports_deletions": False,
+        }
+        self._send_json_response(200, capabilities)
 
     def log_message(self, format, *args):
         """Override para evitar logging default de HTTPServer."""

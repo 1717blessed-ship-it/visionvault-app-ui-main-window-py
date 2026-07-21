@@ -786,16 +786,52 @@ class TestLegacyCompatibility:
         device_id, session_token = sample_device
         conn = repo.conn
         job = conn.execute("SELECT id FROM order_jobs WHERE status = 'Recibido' LIMIT 1").fetchone()
-        
+
         handler = create_handler(repo, event_bus)
         handler.headers = {"Authorization": f"Bearer {session_token}"}
         handler.path = f"/api/mobile/jobs/{job['id']}/stage"
-        
+
         body_data = json.dumps({"stage": "Impresión", "notes": "Legacy test"}).encode("utf-8")
         handler.headers["Content-Length"] = str(len(body_data))
         handler.rfile = BytesIO(body_data)
-        
+
         handler._change_job_stage(job["id"], {"id": device_id, "device_name": "Test Device"})
-        
+
         response_data = json.loads(handler.response.body.decode("utf-8"))
         assert response_data["success"] is True
+
+
+class TestCapabilitiesEndpoint:
+    """Tests para endpoint /api/v1/mobile/capabilities."""
+
+    def test_capabilities_requires_auth(self, repo, event_bus):
+        """Endpoint capabilities requiere autenticación."""
+        handler = create_handler(repo, event_bus)
+        handler._send_error = Mock()
+        handler.headers = {}
+        handler.path = "/api/v1/mobile/capabilities"
+        handler.do_GET()
+
+        handler._send_error.assert_called_once_with(401, "Authorization header missing")
+
+    def test_capabilities_returns_contract(self, repo, event_bus, sample_device):
+        """Endpoint capabilities retorna contrato válido."""
+        device_id, session_token = sample_device
+
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = "/api/v1/mobile/capabilities"
+
+        handler._get_capabilities()
+
+        response_data = json.loads(handler.response.body.decode("utf-8"))
+        assert response_data["api_version"] == "1.0"
+        assert response_data["server_version"] == "1.0.0"
+        assert "jobs" in response_data["supported_types"]
+        assert "orders" in response_data["supported_types"]
+        assert "clients" in response_data["supported_types"]
+        assert response_data["max_limit"] == 500
+        assert response_data["cursor_version"] == 1
+        assert response_data["supports_pull"] is True
+        assert response_data["supports_push"] is False
+        assert response_data["supports_deletions"] is False
