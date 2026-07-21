@@ -501,3 +501,300 @@ class TestFCMTokenRenewalIndependence:
         device = handler._validate_auth()
         assert device is not None
         assert device["id"] == device_id
+
+
+
+class TestReferenceEndpointsV1:
+    """Tests para endpoints de referencia en /api/v1/mobile/reference/*."""
+    
+    def test_get_stages_v1(self, repo, event_bus, sample_device):
+        """GET /api/v1/mobile/reference/stages retorna catálogo de etapas."""
+        device_id, session_token = sample_device
+        
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = "/api/v1/mobile/reference/stages"
+        
+        handler._get_stages()
+        
+        response_data = json.loads(handler.response.body.decode("utf-8"))
+        assert "stages" in response_data
+        assert len(response_data["stages"]) > 0
+        # Verificar estructura de etapas
+        stage = response_data["stages"][0]
+        assert "key" in stage
+        assert "label" in stage
+        assert "category" in stage
+        assert "description" in stage
+        assert "color" in stage
+    
+    def test_get_workflows_v1(self, repo, event_bus, sample_device):
+        """GET /api/v1/mobile/reference/workflows retorna workflows."""
+        device_id, session_token = sample_device
+        
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = "/api/v1/mobile/reference/workflows"
+        
+        handler._get_workflows()
+        
+        response_data = json.loads(handler.response.body.decode("utf-8"))
+        assert "workflows" in response_data
+        assert len(response_data["workflows"]) > 0
+        # Verificar workflows esperados
+        assert "general" in response_data["workflows"]
+        assert "vinilo" in response_data["workflows"]
+        # Verificar estructura
+        workflow = response_data["workflows"]["general"]
+        assert "name" in workflow
+        assert "stages" in workflow
+        assert isinstance(workflow["stages"], list)
+    
+    def test_get_materials_v1(self, repo, event_bus, sample_device, sample_order):
+        """GET /api/v1/mobile/reference/materials retorna materiales."""
+        device_id, session_token = sample_device
+        
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = "/api/v1/mobile/reference/materials"
+        
+        handler._get_materials()
+        
+        response_data = json.loads(handler.response.body.decode("utf-8"))
+        assert "materials" in response_data
+        assert len(response_data["materials"]) > 0
+        # Verificar que incluye material del sample_order
+        assert "Vinilo" in response_data["materials"]
+
+
+class TestDeviceEndpointsV1:
+    """Tests para endpoints de dispositivo en /api/v1/mobile/device/*."""
+    
+    def test_get_device_status_v1(self, repo, event_bus, sample_device):
+        """GET /api/v1/mobile/device/status retorna estado del dispositivo."""
+        device_id, session_token = sample_device
+        
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = "/api/v1/mobile/device/status"
+        
+        # Obtener device completo desde el repo
+        device_info = repo.validate_session_token(session_token)
+        handler._get_device_status(device_info)
+        
+        response_data = json.loads(handler.response.body.decode("utf-8"))
+        assert response_data["device_id"] == device_id
+        assert response_data["device_name"] == "Test Device"
+        assert response_data["platform"] == "android"
+        assert "registered_at" in response_data
+        assert "last_seen" in response_data
+        assert "is_paused" in response_data
+        assert "notification_prefs" in response_data
+        assert "stats" in response_data
+        assert "server_version" in response_data
+        # Verificar que NO expone datos sensibles
+        assert "push_token" not in response_data
+        assert "session_token" not in response_data
+        assert "session_token_hash" not in response_data
+    
+    def test_update_preferences_success_v1(self, repo, event_bus, sample_device):
+        """POST /api/v1/mobile/device/preferences actualiza preferencias."""
+        device_id, session_token = sample_device
+        
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = "/api/v1/mobile/device/preferences"
+        
+        body_data = json.dumps({
+            "preferences": {
+                "job_stage_changed": True,
+                "order_updated": False,
+            }
+        }).encode("utf-8")
+        handler.headers["Content-Length"] = str(len(body_data))
+        handler.rfile = BytesIO(body_data)
+        
+        device_info = repo.validate_session_token(session_token)
+        handler._update_device_preferences(device_info)
+        
+        response_data = json.loads(handler.response.body.decode("utf-8"))
+        assert response_data["success"] is True
+        assert "preferences" in response_data
+        assert response_data["preferences"]["job_stage_changed"] is True
+        assert response_data["preferences"]["order_updated"] is False
+    
+    def test_update_preferences_invalid_event_type_v1(self, repo, event_bus, sample_device):
+        """POST /api/v1/mobile/device/preferences rechaza event_type desconocido."""
+        device_id, session_token = sample_device
+        
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = "/api/v1/mobile/device/preferences"
+        handler._send_error = Mock()
+        
+        body_data = json.dumps({
+            "preferences": {
+                "unknown_event_type": True,
+            }
+        }).encode("utf-8")
+        handler.headers["Content-Length"] = str(len(body_data))
+        handler.rfile = BytesIO(body_data)
+        
+        device_info = repo.validate_session_token(session_token)
+        handler._update_device_preferences(device_info)
+        
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args[0]
+        assert call_args[0] == 400
+        assert "Unknown event type" in call_args[1]
+    
+    def test_update_preferences_non_boolean_value_v1(self, repo, event_bus, sample_device):
+        """POST /api/v1/mobile/device/preferences rechaza valores no booleanos."""
+        device_id, session_token = sample_device
+        
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = "/api/v1/mobile/device/preferences"
+        handler._send_error = Mock()
+        
+        body_data = json.dumps({
+            "preferences": {
+                "job_stage_changed": "yes",  # String en vez de bool
+            }
+        }).encode("utf-8")
+        handler.headers["Content-Length"] = str(len(body_data))
+        handler.rfile = BytesIO(body_data)
+        
+        device_info = repo.validate_session_token(session_token)
+        handler._update_device_preferences(device_info)
+        
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args[0]
+        assert call_args[0] == 400
+        assert "must be boolean" in call_args[1]
+
+
+class TestSearchEndpointV1:
+    """Tests para endpoint de búsqueda en /api/v1/mobile/jobs/search."""
+    
+    def test_search_jobs_by_title_v1(self, repo, event_bus, sample_device, sample_order):
+        """GET /api/v1/mobile/jobs/search busca por título."""
+        device_id, session_token = sample_device
+        
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = "/api/v1/mobile/jobs/search?q=Pendiente"
+        handler._parse_url_params = Mock(return_value={"q": "Pendiente"})
+        
+        device_info = repo.validate_session_token(session_token)
+        handler._search_jobs(device_info)
+        
+        response_data = json.loads(handler.response.body.decode("utf-8"))
+        assert "jobs" in response_data
+        assert "query" in response_data
+        assert response_data["query"] == "Pendiente"
+        # Verificar que encontró el job
+        assert len(response_data["jobs"]) > 0
+        assert any("Pendiente" in job["title"] for job in response_data["jobs"])
+    
+    def test_search_jobs_by_client_v1(self, repo, event_bus, sample_device, sample_order):
+        """GET /api/v1/mobile/jobs/search busca por cliente."""
+        device_id, session_token = sample_device
+        
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = "/api/v1/mobile/jobs/search?q=Cliente"
+        handler._parse_url_params = Mock(return_value={"q": "Cliente"})
+        
+        device_info = repo.validate_session_token(session_token)
+        handler._search_jobs(device_info)
+        
+        response_data = json.loads(handler.response.body.decode("utf-8"))
+        assert "jobs" in response_data
+        assert len(response_data["jobs"]) > 0
+    
+    def test_search_jobs_missing_query_v1(self, repo, event_bus, sample_device):
+        """GET /api/v1/mobile/jobs/search sin query retorna 400."""
+        device_id, session_token = sample_device
+        
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = "/api/v1/mobile/jobs/search"
+        handler._parse_url_params = Mock(return_value={})
+        handler._send_error = Mock()
+        
+        device_info = repo.validate_session_token(session_token)
+        handler._search_jobs(device_info)
+        
+        handler._send_error.assert_called_once_with(400, "Query parameter 'q' is required")
+    
+    def test_search_jobs_query_too_long_v1(self, repo, event_bus, sample_device):
+        """GET /api/v1/mobile/jobs/search con query muy largo retorna 400."""
+        device_id, session_token = sample_device
+        
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        long_query = "x" * 101  # Más de 100 caracteres
+        handler.path = f"/api/v1/mobile/jobs/search?q={long_query}"
+        handler._parse_url_params = Mock(return_value={"q": long_query})
+        handler._send_error = Mock()
+        
+        device_info = repo.validate_session_token(session_token)
+        handler._search_jobs(device_info)
+        
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args[0]
+        assert call_args[0] == 400
+        assert "too long" in call_args[1]
+
+
+class TestLegacyCompatibility:
+    """Tests para compatibilidad con rutas legacy /api/mobile/*."""
+    
+    def test_legacy_jobs_list_still_works(self, repo, event_bus, sample_device, sample_order):
+        """Ruta legacy /api/mobile/jobs sigue funcionando."""
+        device_id, session_token = sample_device
+        
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = "/api/mobile/jobs"
+        handler._parse_url_params = Mock(return_value={})
+        
+        handler._list_jobs({"id": device_id, "device_name": "Test Device"})
+        
+        response_data = json.loads(handler.response.body.decode("utf-8"))
+        assert "jobs" in response_data
+    
+    def test_legacy_job_detail_still_works(self, repo, event_bus, sample_device, sample_order):
+        """Ruta legacy /api/mobile/jobs/{id} sigue funcionando."""
+        device_id, session_token = sample_device
+        conn = repo.conn
+        job = conn.execute("SELECT id FROM order_jobs LIMIT 1").fetchone()
+        
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = f"/api/mobile/jobs/{job['id']}"
+        
+        handler._get_job_detail(job["id"], {"id": device_id, "device_name": "Test Device"})
+        
+        response_data = json.loads(handler.response.body.decode("utf-8"))
+        assert response_data["id"] == job["id"]
+    
+    def test_legacy_change_stage_still_works(self, repo, event_bus, sample_device, sample_order):
+        """Ruta legacy /api/mobile/jobs/{id}/stage sigue funcionando."""
+        device_id, session_token = sample_device
+        conn = repo.conn
+        job = conn.execute("SELECT id FROM order_jobs WHERE status = 'Recibido' LIMIT 1").fetchone()
+        
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = f"/api/mobile/jobs/{job['id']}/stage"
+        
+        body_data = json.dumps({"stage": "Impresión", "notes": "Legacy test"}).encode("utf-8")
+        handler.headers["Content-Length"] = str(len(body_data))
+        handler.rfile = BytesIO(body_data)
+        
+        handler._change_job_stage(job["id"], {"id": device_id, "device_name": "Test Device"})
+        
+        response_data = json.loads(handler.response.body.decode("utf-8"))
+        assert response_data["success"] is True
