@@ -181,6 +181,11 @@ class OrdersRepository {
 
   /// Get orders with related client and jobs data
   /// 
+  /// Optimized to avoid N+1 query pattern:
+  /// - 1 query for orders
+  /// - 1 batch query for all clients (WHERE IN)
+  /// - 1 batch query for all jobs (WHERE IN)
+  /// 
   /// [status] - Optional filter by order status
   /// [limit] - Maximum number of orders to return (default 50)
   Future<List<OrderWithDetails>> getOrdersWithDetails({
@@ -189,16 +194,15 @@ class OrdersRepository {
   }) async {
     final db = await _dbHelper.database;
     
-    // Build query with optional status filter
+    // 1. Query orders with optional status filter
     String whereClause = '';
     List<dynamic> whereArgs = [];
     
     if (status != null) {
-      whereClause = 'o.status = ?';
+      whereClause = 'status = ?';
       whereArgs.add(status);
     }
     
-    // Query orders with optional filter
     final orderMaps = await db.query(
       'orders',
       where: whereClause.isEmpty ? null : whereClause,
@@ -207,41 +211,62 @@ class OrdersRepository {
       limit: limit,
     );
     
-    final List<OrderWithDetails> result = [];
-    
-    for (final orderMap in orderMaps) {
-      final order = Order.fromMap(orderMap);
-      
-      // Get client if clientId exists
-      Client? client;
-      if (order.clientId != null) {
-        final clientMaps = await db.query(
-          'clients',
-          where: 'id = ?',
-          whereArgs: [order.clientId],
-          limit: 1,
-        );
-        if (clientMaps.isNotEmpty) {
-          client = Client.fromMap(clientMaps.first);
-        }
-      }
-      
-      // Get jobs for this order
-      final jobMaps = await db.query(
-        'jobs',
-        where: 'order_id = ?',
-        whereArgs: [order.id],
-        orderBy: 'created_at ASC',
-      );
-      final jobs = jobMaps.map((map) => Job.fromMap(map)).toList();
-      
-      result.add(OrderWithDetails(
-        order: order,
-        client: client,
-        jobs: jobs,
-      ));
+    if (orderMaps.isEmpty) {
+      return [];
     }
     
-    return result;
+    final orders = orderMaps.map((map) => Order.fromMap(map)).toList();
+    
+    // 2. Batch query all clients (WHERE IN)
+    final clientIds = orders
+        .where((o) => o.clientId != null)
+        .map((o) => o.clientId!)
+        .toSet()
+        .toList();
+    
+    final Map<String, Client> clientsMap = {};
+    
+    if (clientIds.isNotEmpty) {
+      final placeholders = clientIds.map((_) => '?').join(',');
+      final clientMaps = await db.rawQuery(
+        'SELECT * FROM clients WHERE id IN ($placeholders)',
+        clientIds,
+      );
+      
+      for (final clientMap in clientMaps) {
+        final client = Client.fromMap(clientMap);
+        clientsMap[client.id] = client;
+      }
+    }
+    
+    // 3. Batch query all jobs (WHERE IN)
+    final orderIds = orders.map((o) => o.id).toList();
+    
+    final Map<String, List<Job>> jobsMap = {};
+    
+    if (orderIds.isNotEmpty) {
+      final placeholders = orderIds.map((_) => '?').join(',');
+      final jobMaps = await db.rawQuery(
+        'SELECT * FROM jobs WHERE order_id IN ($placeholders) ORDER BY created_at ASC',
+        orderIds,
+      );
+      
+      for (final jobMap in jobMaps) {
+        final job = Job.fromMap(jobMap);
+        final orderId = job.orderId;
+        if (orderId != null) {
+          jobsMap.putIfAbsent(orderId, () => []).add(job);
+        }
+      }
+    }
+    
+    // 4. Assemble results
+    return orders.map((order) {
+      return OrderWithDetails(
+        order: order,
+        client: order.clientId != null ? clientsMap[order.clientId] : null,
+        jobs: jobsMap[order.id] ?? [],
+      );
+    }).toList();
   }
 }
