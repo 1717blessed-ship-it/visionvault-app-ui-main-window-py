@@ -2352,6 +2352,101 @@ class StickerProcessor:
             return mask, metadata
 
     # ──────────────────────────────────────────────────────────────────────────
+    # Etapa 2A — Reconstrucción de base blanca desplazada
+    # ──────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _measure_white_base(rgb_np, alpha_np):
+        """Mide cobertura, exceso y faltante de la base blanca.
+
+        Returns dict con coverage_ratio, excess_ratio, missing_ratio.
+        """
+        import cv2
+
+        subject_mask = alpha_np > 127
+        white_mask = (
+            (rgb_np[:, :, 0] > 235)
+            & (rgb_np[:, :, 1] > 235)
+            & (rgb_np[:, :, 2] > 235)
+        )
+        expected = white_mask & subject_mask
+        actual_white = white_mask & (alpha_np > 127)
+
+        expected_area = int(expected.sum())
+        intersection = int((expected & actual_white).sum())
+        excess = int((actual_white & ~expected).sum())
+        missing = int((expected & ~actual_white).sum())
+
+        return {
+            "coverage_ratio": round(intersection / max(expected_area, 1), 4),
+            "excess_ratio": round(excess / max(expected_area, 1), 4),
+            "missing_ratio": round(missing / max(expected_area, 1), 4),
+            "expected_base_area": expected_area,
+            "excess_white_area": excess,
+            "missing_white_area": missing,
+        }
+
+    @staticmethod
+    def _rebuild_displaced_white_base(rgb_np, raw_alpha, target_radius,
+                                       tolerance=10):
+        """Reconstruye la base blanca cuando está desplazada.
+
+        Crea una máscara de diseño real desde el RGB original, genera una
+        base blanca nueva mediante distancia al diseño, y combina con el
+        blanco existente que esté próximo.
+
+        No usa convexHull ni cierre morfológico grande.
+
+        Returns: Image.alpha (L mode) con la máscara reconstruida.
+        """
+        import cv2
+        from PIL import Image
+
+        h, w = rgb_np.shape[:2]
+
+        r_ch = rgb_np[:, :, 0].astype(np.float32)
+        g_ch = rgb_np[:, :, 1].astype(np.float32)
+        b_ch = rgb_np[:, :, 2].astype(np.float32)
+        cmax = np.maximum(np.maximum(r_ch, g_ch), b_ch) / 255.0
+        cmin = np.minimum(np.minimum(r_ch, g_ch), b_ch) / 255.0
+        saturation = np.where(cmax == 0, 0.0, (cmax - cmin) / cmax)
+        luminance = 0.299 * r_ch + 0.587 * g_ch + 0.114 * b_ch
+
+        sat_thresh = 0.12
+        dark_thresh = 180
+        design_seed = (saturation > sat_thresh) | (luminance < dark_thresh)
+
+        existing_white = raw_alpha.point(lambda v: 255 if v > 127 else 0)
+        existing_white_np = np.array(existing_white) > 0
+        white_mask = (
+            (rgb_np[:, :, 0] > 235)
+            & (rgb_np[:, :, 1] > 235)
+            & (rgb_np[:, :, 2] > 235)
+        )
+        existing_white_area = existing_white_np & white_mask
+
+        inv_design = (~design_seed).astype(np.uint8)
+        dist_to_design = cv2.distanceTransform(inv_design, cv2.DIST_L2, 5)
+
+        generated_base = dist_to_design <= target_radius
+
+        valid_existing = existing_white_area & (
+            dist_to_design <= target_radius + tolerance
+        )
+
+        final_subject = design_seed | generated_base | valid_existing
+
+        labeled, n_labels = cv2.connectedComponents(
+            final_subject.astype(np.uint8))
+        if n_labels > 1:
+            sizes = [(labeled == i).sum() for i in range(1, n_labels)]
+            main_label = np.argmax(sizes) + 1
+            final_subject = labeled == main_label
+
+        result_alpha = np.where(final_subject, 255, 0).astype(np.uint8)
+        return Image.fromarray(result_alpha, "L")
+
+    # ──────────────────────────────────────────────────────────────────────────
     # TAREA 8 — process(): orquestador principal
     # ──────────────────────────────────────────────────────────────────────────
 
@@ -2498,6 +2593,30 @@ class StickerProcessor:
             or preserve_existing_white_source
             or border_mode == BorderMode.AMBIGUOUS_WHITE_ON_WHITE
         )
+
+        # ── Etapa 2A: reconstruir base blanca desplazada ──────────────────
+        rebuild_white_base = False
+        if border_mode == BorderMode.AMBIGUOUS_WHITE_ON_WHITE:
+            import numpy as _np
+            _rgb = _np.array(rgba.convert("RGB"), dtype=_np.uint8)
+            _alpha = _np.array(raw_alpha, dtype=_np.uint8)
+            _wb = self._measure_white_base(_rgb, _alpha)
+            if (_wb["coverage_ratio"] < 0.95
+                    and (_wb["missing_ratio"] > 0.05
+                         or _wb["excess_ratio"] > 0.10)):
+                rebuild_white_base = True
+                target_r = self.profile.final_white_px
+                raw_alpha = self._rebuild_displaced_white_base(
+                    _rgb, _alpha, target_r)
+                prepared_rgba.putalpha(raw_alpha)
+                logger.info(
+                    "Etapa 2A: base blanca reconstruida para %s "
+                    "(coverage=%.2f, missing=%.2f, excess=%.2f)",
+                    source_path.name,
+                    _wb["coverage_ratio"],
+                    _wb["missing_ratio"],
+                    _wb["excess_ratio"],
+                )
 
         if skip_postprocessing:
             refined_alpha = raw_alpha
