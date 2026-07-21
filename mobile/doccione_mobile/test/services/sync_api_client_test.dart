@@ -230,6 +230,193 @@ void main() {
       });
     });
 
+    group('testConnection', () {
+      test('should return ok with healthInfo on valid health response', () async {
+        final mockClient = MockClient((request) async {
+          expect(request.url.path, '/api/v1/mobile/health');
+          return http.Response(
+            jsonEncode({
+              'status': 'ok',
+              'service': 'doccione-studio',
+              'api_version': 'v1',
+              'mobile_api': true,
+              'version': '1.0.0',
+            }),
+            200,
+          );
+        });
+
+        final client = SyncApiClient(
+          baseUrl: baseUrl,
+          httpClient: mockClient,
+        );
+
+        final result = await client.testConnection();
+
+        expect(result.success, true);
+        expect(result.statusCode, 200);
+        expect(result.healthInfo, isNotNull);
+        expect(result.healthInfo!['status'], 'ok');
+        expect(result.healthInfo!['service'], 'doccione-studio');
+        expect(result.healthInfo!['api_version'], 'v1');
+        expect(result.healthInfo!['mobile_api'], true);
+
+        client.close();
+      });
+
+      test('should fail when status is not ok', () async {
+        final mockClient = MockClient((request) async {
+          return http.Response(
+            jsonEncode({
+              'status': 'error',
+              'service': 'doccione-studio',
+              'api_version': 'v1',
+              'mobile_api': true,
+            }),
+            200,
+          );
+        });
+
+        final client = SyncApiClient(
+          baseUrl: baseUrl,
+          httpClient: mockClient,
+        );
+
+        final result = await client.testConnection();
+
+        expect(result.success, false);
+        expect(result.message, contains('status: error'));
+
+        client.close();
+      });
+
+      test('should fail when service is not doccione-studio', () async {
+        final mockClient = MockClient((request) async {
+          return http.Response(
+            jsonEncode({
+              'status': 'ok',
+              'service': 'unknown-service',
+              'api_version': 'v1',
+              'mobile_api': true,
+            }),
+            200,
+          );
+        });
+
+        final client = SyncApiClient(
+          baseUrl: baseUrl,
+          httpClient: mockClient,
+        );
+
+        final result = await client.testConnection();
+
+        expect(result.success, false);
+        expect(result.message, contains('service: unknown-service'));
+
+        client.close();
+      });
+
+      test('should fail when mobile_api is false', () async {
+        final mockClient = MockClient((request) async {
+          return http.Response(
+            jsonEncode({
+              'status': 'ok',
+              'service': 'doccione-studio',
+              'api_version': 'v1',
+              'mobile_api': false,
+            }),
+            200,
+          );
+        });
+
+        final client = SyncApiClient(
+          baseUrl: baseUrl,
+          httpClient: mockClient,
+        );
+
+        final result = await client.testConnection();
+
+        expect(result.success, false);
+        expect(result.message, contains('mobile_api'));
+
+        client.close();
+      });
+
+      test('should return unauthorized on 401', () async {
+        final mockClient = MockClient((request) async {
+          return http.Response('Unauthorized', 401);
+        });
+
+        final client = SyncApiClient(
+          baseUrl: baseUrl,
+          httpClient: mockClient,
+        );
+
+        final result = await client.testConnection();
+
+        expect(result.success, false);
+        expect(result.statusCode, 401);
+
+        client.close();
+      });
+
+      test('should return network error on connection refused', () async {
+        final mockClient = MockClient((request) async {
+          throw http.ClientException('Connection refused');
+        });
+
+        final client = SyncApiClient(
+          baseUrl: baseUrl,
+          httpClient: mockClient,
+        );
+
+        final result = await client.testConnection();
+
+        expect(result.success, false);
+        expect(result.message, contains('Servidor no encontrado'));
+
+        client.close();
+      });
+
+      test('should return timeout on slow response', () async {
+        final mockClient = MockClient((request) async {
+          await Future.delayed(const Duration(seconds: 2));
+          return http.Response('{}', 200);
+        });
+
+        final client = SyncApiClient(
+          baseUrl: baseUrl,
+          timeout: const Duration(milliseconds: 100),
+          httpClient: mockClient,
+        );
+
+        final result = await client.testConnection();
+
+        expect(result.success, false);
+        expect(result.message, contains('Tiempo de espera agotado'));
+
+        client.close();
+      });
+
+      test('should return server error on 500', () async {
+        final mockClient = MockClient((request) async {
+          return http.Response('Internal Server Error', 500);
+        });
+
+        final client = SyncApiClient(
+          baseUrl: baseUrl,
+          httpClient: mockClient,
+        );
+
+        final result = await client.testConnection();
+
+        expect(result.success, false);
+        expect(result.statusCode, 500);
+
+        client.close();
+      });
+    });
+
     group('headers', () {
       test('should include auth token when provided', () async {
         final mockClient = MockClient((request) async {

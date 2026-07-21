@@ -62,95 +62,12 @@ class SyncApiClient {
     }
   }
 
-  /// Test connection to the server
-  /// Returns a ConnectionTestResult with detailed test information
-  /// Uses GET /api/v1/mobile/capabilities as the primary health check endpoint
-  /// Falls back to /api/v1/status/health and /api/v1/mobile/health if needed
+  /// Test connection to the server using GET /api/v1/mobile/health
+  /// Validates: status == "ok", service == "doccione-studio",
+  /// api_version == "v1", mobile_api == true
   Future<ConnectionTestResult> testConnection() async {
     final stopwatch = Stopwatch()..start();
-    
-    // Try the primary endpoint first: capabilities
-    try {
-      final uri = Uri.parse('$baseUrl/api/v1/mobile/capabilities');
-      final headers = _buildHeaders();
 
-      final response = await _httpClient
-          .get(uri, headers: headers)
-          .timeout(timeout);
-
-      stopwatch.stop();
-
-      if (response.statusCode == 200) {
-        return ConnectionTestResult.ok(responseTime: stopwatch.elapsed);
-      } else if (response.statusCode == 401 || response.statusCode == 403) {
-        return ConnectionTestResult.unauthorized(statusCode: response.statusCode);
-      } else if (response.statusCode >= 500) {
-        return ConnectionTestResult.serverError(statusCode: response.statusCode);
-      } else {
-        return ConnectionTestResult.unexpected(
-          detail: 'Código inesperado: ${response.statusCode}',
-        );
-      }
-    } on TimeoutException {
-      stopwatch.stop();
-      return ConnectionTestResult.timeout();
-    } on http.ClientException {
-      stopwatch.stop();
-      return ConnectionTestResult.networkError();
-    } catch (e) {
-      stopwatch.stop();
-      final message = e.toString();
-      if (message.contains('Connection refused') ||
-          message.contains('Failed host lookup') ||
-          message.contains('No address associated')) {
-        return ConnectionTestResult.networkError();
-      }
-      return ConnectionTestResult.unexpected(detail: e.toString());
-    }
-
-    // If we're here, the primary endpoint failed. Try the secondary endpoint.
-    // This is for when the capabilities endpoint doesn't exist, but a health endpoint does.
-    stopwatch.start();
-    try {
-      final uri = Uri.parse('$baseUrl/api/v1/status/health');
-      final headers = _buildHeaders();
-
-      final response = await _httpClient
-          .get(uri, headers: headers)
-          .timeout(timeout);
-
-      stopwatch.stop();
-
-      if (response.statusCode == 200) {
-        return ConnectionTestResult.ok(responseTime: stopwatch.elapsed);
-      } else if (response.statusCode == 401 || response.statusCode == 403) {
-        return ConnectionTestResult.unauthorized(statusCode: response.statusCode);
-      } else if (response.statusCode >= 500) {
-        return ConnectionTestResult.serverError(statusCode: response.statusCode);
-      } else {
-        return ConnectionTestResult.unexpected(
-          detail: 'Código inesperado: ${response.statusCode}',
-        );
-      }
-    } on TimeoutException {
-      stopwatch.stop();
-      return ConnectionTestResult.timeout();
-    } on http.ClientException {
-      stopwatch.stop();
-      return ConnectionTestResult.networkError();
-    } catch (e) {
-      stopwatch.stop();
-      final message = e.toString();
-      if (message.contains('Connection refused') ||
-          message.contains('Failed host lookup') ||
-          message.contains('No address associated')) {
-        return ConnectionTestResult.networkError();
-      }
-      return ConnectionTestResult.unexpected(detail: e.toString());
-    }
-
-    // If we're here, both the primary and secondary endpoints failed. Try the lightweight endpoint.
-    stopwatch.start();
     try {
       final uri = Uri.parse('$baseUrl/api/v1/mobile/health');
       final headers = _buildHeaders();
@@ -162,7 +79,32 @@ class SyncApiClient {
       stopwatch.stop();
 
       if (response.statusCode == 200) {
-        return ConnectionTestResult.ok(responseTime: stopwatch.elapsed);
+        final body = jsonDecode(response.body) as Map<String, dynamic>;
+
+        final status = body['status'];
+        final service = body['service'];
+        final apiVersion = body['api_version'];
+        final mobileApi = body['mobile_api'];
+
+        if (status == 'ok' &&
+            service == 'doccione-studio' &&
+            apiVersion == 'v1' &&
+            mobileApi == true) {
+          return ConnectionTestResult.ok(
+            responseTime: stopwatch.elapsed,
+            healthInfo: body,
+          );
+        } else {
+          final details = <String>[];
+          if (status != 'ok') details.add('status: $status');
+          if (service != 'doccione-studio') details.add('service: $service');
+          if (apiVersion != 'v1') details.add('api_version: $apiVersion');
+          if (mobileApi != true) details.add('mobile_api: $mobileApi');
+
+          return ConnectionTestResult.unexpected(
+            detail: 'Respuesta inválida: ${details.join(', ')}',
+          );
+        }
       } else if (response.statusCode == 401 || response.statusCode == 403) {
         return ConnectionTestResult.unauthorized(statusCode: response.statusCode);
       } else if (response.statusCode >= 500) {

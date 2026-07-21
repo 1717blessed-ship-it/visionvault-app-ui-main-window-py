@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:doccione_mobile/database/database_helper.dart';
 import 'package:doccione_mobile/database/server_config_repository.dart';
+import 'package:doccione_mobile/models/connection_test_result.dart';
 import 'package:doccione_mobile/screens/server_config_screen.dart';
 
 void main() {
@@ -28,7 +29,7 @@ void main() {
 
   Future<void> pumpScreen(
     WidgetTester tester, {
-    Future<bool> Function()? onTestConnection,
+    Future<ConnectionTestResult> Function(String baseUrl)? onTestConnection,
   }) async {
     await tester.pumpWidget(
       MaterialApp(
@@ -93,9 +94,11 @@ void main() {
       bool callbackCalled = false;
       await pumpScreen(
         tester,
-        onTestConnection: () async {
+        onTestConnection: (baseUrl) async {
           callbackCalled = true;
-          return true;
+          return ConnectionTestResult.ok(
+            responseTime: const Duration(milliseconds: 100),
+          );
         },
       );
       await tester.tap(find.text('Probar conexión'));
@@ -106,21 +109,49 @@ void main() {
     testWidgets('shows test success message', (tester) async {
       await pumpScreen(
         tester,
-        onTestConnection: () async => true,
+        onTestConnection: (baseUrl) async => ConnectionTestResult.ok(
+          responseTime: const Duration(milliseconds: 100),
+        ),
       );
       await tester.tap(find.text('Probar conexión'));
       await tester.pumpAndSettle();
       expect(find.text('Conexión exitosa'), findsOneWidget);
     });
 
+    testWidgets('shows Continuar button on success', (tester) async {
+      await pumpScreen(
+        tester,
+        onTestConnection: (baseUrl) async => ConnectionTestResult.ok(
+          responseTime: const Duration(milliseconds: 100),
+        ),
+      );
+      await tester.tap(find.text('Probar conexión'));
+      await tester.pumpAndSettle();
+      expect(find.text('Continuar'), findsOneWidget);
+    });
+
     testWidgets('shows test failure message', (tester) async {
       await pumpScreen(
         tester,
-        onTestConnection: () async => false,
+        onTestConnection: (baseUrl) async => ConnectionTestResult.unexpected(
+          detail: 'No se pudo conectar',
+        ),
       );
       await tester.tap(find.text('Probar conexión'));
       await tester.pumpAndSettle();
       expect(find.text('No se pudo conectar'), findsOneWidget);
+    });
+
+    testWidgets('does not show Continuar on failure', (tester) async {
+      await pumpScreen(
+        tester,
+        onTestConnection: (baseUrl) async => ConnectionTestResult.unexpected(
+          detail: 'Connection refused',
+        ),
+      );
+      await tester.tap(find.text('Probar conexión'));
+      await tester.pumpAndSettle();
+      expect(find.text('Continuar'), findsNothing);
     });
 
     testWidgets('disables test button while testing', (tester) async {

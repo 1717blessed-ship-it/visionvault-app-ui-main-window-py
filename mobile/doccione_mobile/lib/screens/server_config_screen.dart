@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import '../config/server_config.dart';
 import '../database/server_config_repository.dart';
 import '../models/connection_test_result.dart';
+import '../services/sync_api_client.dart';
 
 class ServerConfigScreen extends StatefulWidget {
   final ServerConfigRepository repository;
@@ -108,6 +109,11 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
     try {
       final baseUrl = _baseUrlPreview;
       final result = await widget.onTestConnection!(baseUrl);
+
+      if (result.success) {
+        await _saveConfig();
+      }
+
       setState(() {
         _isTesting = false;
         _testResult = result;
@@ -338,6 +344,47 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
                               ),
                             ],
                           ),
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                    ],
+
+                    // Health info
+                    if (_testResult != null &&
+                        _testResult!.success &&
+                        _testResult!.healthInfo != null) ...[
+                      Card(
+                        child: Padding(
+                          padding: const EdgeInsets.all(12),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'Información del servidor',
+                                style: Theme.of(context).textTheme.labelSmall,
+                              ),
+                              const SizedBox(height: 8),
+                              Text('Servicio: ${_testResult!.healthInfo!['service'] ?? 'N/A'}'),
+                              Text('API: ${_testResult!.healthInfo!['api_version'] ?? 'N/A'}'),
+                              if (_testResult!.healthInfo!['version'] != null)
+                                Text('Versión: ${_testResult!.healthInfo!['version']}'),
+                            ],
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                    ],
+
+                    // Continuar button after successful test
+                    if (_testResult != null && _testResult!.success) ...[
+                      SizedBox(
+                        width: double.infinity,
+                        child: FilledButton.icon(
+                          onPressed: () {
+                            Navigator.pop(context);
+                          },
+                          icon: const Icon(Icons.arrow_forward),
+                          label: const Text('Continuar'),
                         ),
                       ),
                       const SizedBox(height: 16),

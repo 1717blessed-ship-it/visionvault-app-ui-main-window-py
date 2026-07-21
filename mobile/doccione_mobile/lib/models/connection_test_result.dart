@@ -3,20 +3,26 @@ class ConnectionTestResult {
   final String message;
   final int? statusCode;
   final Duration? responseTime;
+  final Map<String, dynamic>? healthInfo;
 
   const ConnectionTestResult({
     required this.success,
     required this.message,
     this.statusCode,
     this.responseTime,
+    this.healthInfo,
   });
 
-  factory ConnectionTestResult.ok({required Duration responseTime}) {
+  factory ConnectionTestResult.ok({
+    required Duration responseTime,
+    Map<String, dynamic>? healthInfo,
+  }) {
     return ConnectionTestResult(
       success: true,
       message: 'Conexión exitosa',
       statusCode: 200,
       responseTime: responseTime,
+      healthInfo: healthInfo,
     );
   }
 

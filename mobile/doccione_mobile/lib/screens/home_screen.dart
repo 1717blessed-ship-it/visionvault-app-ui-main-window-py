@@ -341,8 +341,8 @@ class _HomePageState extends State<HomePage> {
           IconButton(
             icon: const Icon(Icons.settings),
             tooltip: 'Configuración del servidor',
-            onPressed: () {
-              Navigator.push(
+            onPressed: () async {
+              await Navigator.push(
                 context,
                 MaterialPageRoute(
                   builder: (context) => ServerConfigScreen(
@@ -358,6 +358,7 @@ class _HomePageState extends State<HomePage> {
                   ),
                 ),
               );
+              _loadServerConfig();
             },
           ),
         ],

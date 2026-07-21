@@ -9,6 +9,23 @@ void main() {
       expect(result.message, 'Conexión exitosa');
       expect(result.statusCode, 200);
       expect(result.responseTime!.inMilliseconds, 150);
+      expect(result.healthInfo, isNull);
+    });
+
+    test('ok creates success result with healthInfo', () {
+      final healthInfo = {
+        'status': 'ok',
+        'service': 'doccione-studio',
+        'api_version': 'v1',
+        'mobile_api': true,
+      };
+      final result = ConnectionTestResult.ok(
+        responseTime: const Duration(milliseconds: 200),
+        healthInfo: healthInfo,
+      );
+      expect(result.success, true);
+      expect(result.healthInfo, healthInfo);
+      expect(result.healthInfo!['service'], 'doccione-studio');
     });
 
     test('unauthorized creates failure result', () {
