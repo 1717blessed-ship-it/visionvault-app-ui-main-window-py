@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../models/dashboard_metrics.dart';
+import '../screens/orders_list_screen.dart';
 
 /// Widget that displays dashboard metrics in a card
 class DashboardMetricsCard extends StatelessWidget {
@@ -32,6 +33,7 @@ class DashboardMetricsCard extends StatelessWidget {
                     metrics.ordersToday,
                     Icons.today,
                     Colors.blue,
+                    null, // No filter - today is computed, not a status
                   ),
                 ),
                 Expanded(
@@ -41,6 +43,7 @@ class DashboardMetricsCard extends StatelessWidget {
                     metrics.ordersInProduction,
                     Icons.build,
                     Colors.orange,
+                    'production',
                   ),
                 ),
               ],
@@ -55,6 +58,7 @@ class DashboardMetricsCard extends StatelessWidget {
                     metrics.ordersPending,
                     Icons.schedule,
                     Colors.amber,
+                    'pending',
                   ),
                 ),
                 Expanded(
@@ -64,6 +68,7 @@ class DashboardMetricsCard extends StatelessWidget {
                     metrics.ordersCompleted,
                     Icons.check_circle,
                     Colors.green,
+                    'completed',
                   ),
                 ),
               ],
@@ -98,30 +103,46 @@ class DashboardMetricsCard extends StatelessWidget {
     int value,
     IconData icon,
     Color color,
+    String? filterStatus,
   ) {
-    return Container(
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: color.withOpacity(0.1),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Column(
-        children: [
-          Icon(icon, color: color, size: 28),
-          const SizedBox(height: 8),
-          Text(
-            value.toString(),
-            style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-                  fontWeight: FontWeight.bold,
-                  color: color,
+    return InkWell(
+      onTap: filterStatus != null
+          ? () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => OrdersListScreen(
+                    initialStatus: filterStatus,
+                  ),
                 ),
-          ),
-          const SizedBox(height: 4),
-          Text(
-            label,
-            style: Theme.of(context).textTheme.labelSmall,
-          ),
-        ],
+              );
+            }
+          : null,
+      borderRadius: BorderRadius.circular(8),
+      child: Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: color.withOpacity(0.1),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Column(
+          children: [
+            Icon(icon, color: color, size: 28),
+            const SizedBox(height: 8),
+            Text(
+              value.toString(),
+              style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                    fontWeight: FontWeight.bold,
+                    color: color,
+                  ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              label,
+              style: Theme.of(context).textTheme.labelSmall,
+            ),
+          ],
+        ),
       ),
     );
   }

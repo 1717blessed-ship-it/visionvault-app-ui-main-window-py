@@ -1,6 +1,9 @@
 import 'package:sqflite/sqflite.dart';
 import '../models/order.dart';
 import '../models/dashboard_metrics.dart';
+import '../models/order_with_details.dart';
+import '../models/client.dart';
+import '../models/job.dart';
 import 'database_helper.dart';
 import 'sync_state_repository.dart';
 import 'jobs_repository.dart';
@@ -174,5 +177,71 @@ class OrdersRepository {
     );
 
     return maps.map((map) => Order.fromMap(map)).toList();
+  }
+
+  /// Get orders with related client and jobs data
+  /// 
+  /// [status] - Optional filter by order status
+  /// [limit] - Maximum number of orders to return (default 50)
+  Future<List<OrderWithDetails>> getOrdersWithDetails({
+    String? status,
+    int limit = 50,
+  }) async {
+    final db = await _dbHelper.database;
+    
+    // Build query with optional status filter
+    String whereClause = '';
+    List<dynamic> whereArgs = [];
+    
+    if (status != null) {
+      whereClause = 'o.status = ?';
+      whereArgs.add(status);
+    }
+    
+    // Query orders with optional filter
+    final orderMaps = await db.query(
+      'orders',
+      where: whereClause.isEmpty ? null : whereClause,
+      whereArgs: whereArgs.isEmpty ? null : whereArgs,
+      orderBy: 'order_date DESC, updated_at DESC',
+      limit: limit,
+    );
+    
+    final List<OrderWithDetails> result = [];
+    
+    for (final orderMap in orderMaps) {
+      final order = Order.fromMap(orderMap);
+      
+      // Get client if clientId exists
+      Client? client;
+      if (order.clientId != null) {
+        final clientMaps = await db.query(
+          'clients',
+          where: 'id = ?',
+          whereArgs: [order.clientId],
+          limit: 1,
+        );
+        if (clientMaps.isNotEmpty) {
+          client = Client.fromMap(clientMaps.first);
+        }
+      }
+      
+      // Get jobs for this order
+      final jobMaps = await db.query(
+        'jobs',
+        where: 'order_id = ?',
+        whereArgs: [order.id],
+        orderBy: 'created_at ASC',
+      );
+      final jobs = jobMaps.map((map) => Job.fromMap(map)).toList();
+      
+      result.add(OrderWithDetails(
+        order: order,
+        client: client,
+        jobs: jobs,
+      ));
+    }
+    
+    return result;
   }
 }

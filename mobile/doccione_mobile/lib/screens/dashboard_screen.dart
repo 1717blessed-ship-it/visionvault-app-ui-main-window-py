@@ -7,6 +7,7 @@ import '../database/clients_repository.dart';
 import '../models/dashboard_metrics.dart';
 import '../widgets/dashboard_metrics_card.dart';
 import '../widgets/sync_status_card.dart';
+import '../screens/orders_list_screen.dart';
 
 /// Dashboard screen showing sync status and order metrics
 class DashboardScreen extends StatefulWidget {
@@ -121,10 +122,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
               width: double.infinity,
               child: ElevatedButton.icon(
                 onPressed: () {
-                  // TODO: Navigate to OrdersListScreen
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('Lista de pedidos - Próximamente'),
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (context) => const OrdersListScreen(),
                     ),
                   );
                 },
