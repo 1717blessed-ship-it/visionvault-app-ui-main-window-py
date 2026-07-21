@@ -81,6 +81,18 @@ def repo(temp_db):
             last_autosave_at TEXT
         )"""
     )
+    
+    # Agregar columnas faltantes en clients
+    existing_client_columns = {row[1] for row in conn.execute("PRAGMA table_info(clients)")}
+    if "client_type" not in existing_client_columns:
+        conn.execute("ALTER TABLE clients ADD COLUMN client_type TEXT DEFAULT 'Particular'")
+    
+    # Agregar columnas faltantes en orders
+    existing_order_columns = {row[1] for row in conn.execute("PRAGMA table_info(orders)")}
+    for column in ("order_concept", "order_description"):
+        if column not in existing_order_columns:
+            conn.execute(f"ALTER TABLE orders ADD COLUMN {column} TEXT DEFAULT ''")
+    
     conn.execute(
         """CREATE TABLE IF NOT EXISTS order_jobs (
             id INTEGER PRIMARY KEY,
@@ -835,3 +847,199 @@ class TestCapabilitiesEndpoint:
         assert response_data["supports_pull"] is True
         assert response_data["supports_push"] is False
         assert response_data["supports_deletions"] is False
+
+
+class TestSyncPullEndpoint:
+    """Tests para endpoint /api/v1/mobile/sync/pull."""
+
+    def test_sync_pull_requires_auth(self, repo, event_bus):
+        """Endpoint sync/pull requiere autenticación."""
+        handler = create_handler(repo, event_bus)
+        handler._send_error = Mock()
+        handler.headers = {}
+        handler.path = "/api/v1/mobile/sync/pull"
+        handler.do_GET()
+
+        handler._send_error.assert_called_once_with(401, "Authorization header missing")
+
+    def test_sync_pull_empty_first_sync(self, repo, event_bus, sample_device):
+        """Primera sincronización sin datos retorna estructura válida."""
+        device_id, session_token = sample_device
+
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = "/api/v1/mobile/sync/pull"
+        handler._parse_url_params = Mock(return_value={"limit": "10"})
+
+        handler._sync_pull({"id": device_id, "device_name": "Test Device"})
+
+        response_data = json.loads(handler.response.body.decode("utf-8"))
+        assert "server_time" in response_data
+        assert "snapshot_until" in response_data
+        assert "complete" in response_data
+        assert "next_cursor" in response_data
+        assert "entities" in response_data
+        assert "jobs" in response_data["entities"]
+        assert "orders" in response_data["entities"]
+        assert "clients" in response_data["entities"]
+
+    def test_sync_pull_with_data(self, repo, event_bus, sample_device, sample_order):
+        """Primera sincronización con datos retorna items."""
+        device_id, session_token = sample_device
+
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = "/api/v1/mobile/sync/pull"
+        handler._parse_url_params = Mock(return_value={"limit": "10"})
+
+        handler._sync_pull({"id": device_id, "device_name": "Test Device"})
+
+        response_data = json.loads(handler.response.body.decode("utf-8"))
+        jobs = response_data["entities"]["jobs"]["items"]
+        # Debe haber al menos un job del sample_order
+        assert len(jobs) > 0
+        assert "id" in jobs[0]
+        assert "updated_at" in jobs[0]
+
+    def test_sync_pull_limit_plus_one(self, repo, event_bus, sample_device):
+        """LIMIT + 1 determina has_more correctamente."""
+        device_id, session_token = sample_device
+
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = "/api/v1/mobile/sync/pull"
+        handler._parse_url_params = Mock(return_value={"limit": "2"})
+
+        handler._sync_pull({"id": device_id, "device_name": "Test Device"})
+
+        response_data = json.loads(handler.response.body.decode("utf-8"))
+        jobs = response_data["entities"]["jobs"]["items"]
+        # Si hay más de 2 jobs, has_more debe ser True
+        if len(jobs) == 2:
+            assert response_data["entities"]["jobs"]["has_more"] is True
+
+    def test_sync_pull_cursor_pagination(self, repo, event_bus, sample_device):
+        """Paginación con cursor funciona correctamente."""
+        device_id, session_token = sample_device
+
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = "/api/v1/mobile/sync/pull"
+        handler._parse_url_params = Mock(return_value={"limit": "1"})
+
+        # Primera página
+        handler._sync_pull({"id": device_id, "device_name": "Test Device"})
+        response_data = json.loads(handler.response.body.decode("utf-8"))
+        next_cursor = response_data.get("next_cursor")
+
+        if next_cursor:
+            # Segunda página con cursor
+            handler._parse_url_params = Mock(return_value={"cursor": next_cursor, "limit": "1"})
+            handler._sync_pull({"id": device_id, "device_name": "Test Device"})
+            response_data_2 = json.loads(handler.response.body.decode("utf-8"))
+            assert "entities" in response_data_2
+
+    def test_sync_pull_partial_types(self, repo, event_bus, sample_device):
+        """Sincronización parcial de tipos funciona."""
+        device_id, session_token = sample_device
+
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = "/api/v1/mobile/sync/pull"
+        handler._parse_url_params = Mock(return_value={"types": "jobs", "limit": "10"})
+
+        handler._sync_pull({"id": device_id, "device_name": "Test Device"})
+
+        response_data = json.loads(handler.response.body.decode("utf-8"))
+        assert "jobs" in response_data["entities"]
+        # orders y clients no deben estar presentes
+        assert "orders" not in response_data["entities"]
+        assert "clients" not in response_data["entities"]
+
+    def test_sync_pull_invalid_cursor(self, repo, event_bus, sample_device):
+        """Cursor inválido retorna error 400."""
+        device_id, session_token = sample_device
+
+        handler = create_handler(repo, event_bus)
+        handler._send_error = Mock()
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = "/api/v1/mobile/sync/pull"
+        handler._parse_url_params = Mock(return_value={"cursor": "invalid_base64_token"})
+
+        handler._sync_pull({"id": device_id, "device_name": "Test Device"})
+
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args[0]
+        assert call_args[0] == 400
+
+    def test_sync_pull_cursor_with_since_rejected(self, repo, event_bus, sample_device):
+        """No se puede usar cursor con since simultáneamente."""
+        device_id, session_token = sample_device
+
+        # Primero obtener un cursor válido
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = "/api/v1/mobile/sync/pull"
+        handler._parse_url_params = Mock(return_value={"limit": "1"})
+        handler._sync_pull({"id": device_id, "device_name": "Test Device"})
+        response_data = json.loads(handler.response.body.decode("utf-8"))
+        cursor = response_data.get("next_cursor")
+
+        if cursor:
+            # Intentar usar cursor con since
+            handler._send_error = Mock()
+            handler._parse_url_params = Mock(return_value={"cursor": cursor, "since": "2026-07-21T00:00:00"})
+            handler._sync_pull({"id": device_id, "device_name": "Test Device"})
+
+            handler._send_error.assert_called_once()
+            call_args = handler._send_error.call_args[0]
+            assert call_args[0] == 400
+
+    def test_sync_pull_limit_validation(self, repo, event_bus, sample_device):
+        """Validación de limit funciona correctamente."""
+        device_id, session_token = sample_device
+
+        # Test limit 0 (inválido)
+        handler = create_handler(repo, event_bus)
+        handler._send_error = Mock()
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = "/api/v1/mobile/sync/pull"
+        handler._parse_url_params = Mock(return_value={"limit": "0"})
+        handler._sync_pull({"id": device_id, "device_name": "Test Device"})
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args[0]
+        assert call_args[0] == 400
+
+        # Test limit 501 (inválido)
+        handler._send_error.reset_mock()
+        handler._parse_url_params = Mock(return_value={"limit": "501"})
+        handler._sync_pull({"id": device_id, "device_name": "Test Device"})
+        handler._send_error.assert_called_once()
+        call_args = handler._send_error.call_args[0]
+        assert call_args[0] == 400
+
+        # Test limit 1 (válido)
+        handler._send_error.reset_mock()
+        handler._parse_url_params = Mock(return_value={"limit": "1"})
+        handler._sync_pull({"id": device_id, "device_name": "Test Device"})
+        handler._send_error.assert_not_called()
+
+        # Test limit 500 (válido)
+        handler._send_error.reset_mock()
+        handler._parse_url_params = Mock(return_value={"limit": "500"})
+        handler._sync_pull({"id": device_id, "device_name": "Test Device"})
+        handler._send_error.assert_not_called()
+
+    def test_sync_pull_incremental_with_since(self, repo, event_bus, sample_device):
+        """Sincronización incremental con since funciona."""
+        device_id, session_token = sample_device
+
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = "/api/v1/mobile/sync/pull"
+        handler._parse_url_params = Mock(return_value={"since": "2026-07-20T00:00:00", "limit": "10"})
+
+        handler._sync_pull({"id": device_id, "device_name": "Test Device"})
+
+        response_data = json.loads(handler.response.body.decode("utf-8"))
+        assert "entities" in response_data

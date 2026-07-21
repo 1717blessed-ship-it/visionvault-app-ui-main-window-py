@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Final
 from urllib.parse import parse_qs, urlparse
@@ -132,6 +133,8 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
             self._get_device_status(device)
         elif parsed.path == "/api/v1/mobile/capabilities":
             self._get_capabilities()
+        elif parsed.path == "/api/v1/mobile/sync/pull":
+            self._sync_pull(device)
         else:
             self._send_error(404, "Endpoint not found")
 
@@ -590,6 +593,262 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
             "supports_deletions": False,
         }
         self._send_json_response(200, capabilities)
+
+    def _sync_pull(self, device: dict[str, Any]) -> None:
+        """Sincronización incremental de solo lectura."""
+        from app.services.sync_cursor_service import SyncCursorError
+
+        params = self._parse_url_params()
+
+        # Parsear y validar parámetros
+        try:
+            cursor_token = params.get("cursor")
+            since = params.get("since")
+            limit = int(params.get("limit", str(SyncCursorService.MAX_LIMIT)))
+            types_str = params.get("types", "jobs,orders,clients")
+            types = [t.strip() for t in types_str.split(",") if t.strip()]
+
+            SyncCursorService.validate_limit(limit)
+            SyncCursorService.validate_types(types)
+
+            # Decodificar cursor si existe
+            cursor_data = None
+            if cursor_token:
+                cursor_data = SyncCursorService.decode_cursor(cursor_token)
+                # Validar compatibilidad con parámetros
+                SyncCursorService.validate_cursor_compatibility(cursor_data, types, limit)
+                # No aceptar since cuando hay cursor
+                if since:
+                    self._send_error(400, "Cannot use 'since' with cursor")
+                    return
+            elif since:
+                # Validar timestamp when using since
+                SyncCursorService._validate_timestamp(since)
+
+            # Determinar snapshot_until
+            if cursor_data:
+                snapshot_until = cursor_data["snapshot_until"]
+            else:
+                snapshot_until = datetime.now().isoformat(timespec="seconds")
+
+            # Inicializar cursores de entidad
+            entity_cursors = {}
+            if cursor_data:
+                entity_cursors = cursor_data["entities"]
+            else:
+                for entity_type in types:
+                    entity_cursors[entity_type] = SyncCursorService.create_initial_entity_cursor()
+
+            # Consultar cada entidad
+            entities_response = {}
+            all_complete = True
+
+            for entity_type in types:
+                entity_cursor = entity_cursors[entity_type]
+
+                # Si entidad está completa, no consultar
+                if entity_cursor["complete"]:
+                    entities_response[entity_type] = {"items": [], "has_more": False}
+                    continue
+
+                # Ejecutar query según tipo
+                if entity_type == "jobs":
+                    items, has_more = self._query_jobs(
+                        entity_cursor, snapshot_until, limit, cursor_data is not None
+                    )
+                elif entity_type == "orders":
+                    items, has_more = self._query_orders(
+                        entity_cursor, snapshot_until, limit, cursor_data is not None
+                    )
+                elif entity_type == "clients":
+                    items, has_more = self._query_clients(
+                        entity_cursor, snapshot_until, limit, cursor_data is not None
+                    )
+                else:
+                    continue
+
+                # Actualizar cursor de entidad
+                if items:
+                    last_item = items[-1]
+                    entity_cursors[entity_type] = SyncCursorService.update_entity_cursor(
+                        entity_cursor, last_item["updated_at"], last_item["id"], has_more
+                    )
+                else:
+                    entity_cursors[entity_type]["complete"] = True
+
+                entities_response[entity_type] = {"items": items, "has_more": has_more}
+
+                if not entity_cursors[entity_type]["complete"]:
+                    all_complete = False
+
+            # Construir next_cursor si hay más datos
+            next_cursor = None
+            if not all_complete:
+                next_cursor = SyncCursorService.encode_cursor(
+                    snapshot_until, set(types), limit, entity_cursors
+                )
+
+            response = {
+                "server_time": datetime.now().isoformat(timespec="seconds"),
+                "snapshot_until": snapshot_until,
+                "complete": all_complete,
+                "next_cursor": next_cursor,
+                "entities": entities_response,
+            }
+
+            self._send_json_response(200, response)
+
+        except SyncCursorError as e:
+            logger.warning("Sync pull validation error: %s", e)
+            self._send_error(400, str(e))
+        except (ValueError, KeyError) as e:
+            logger.error("Sync pull parameter error: %s", e)
+            self._send_error(400, "Invalid parameters")
+        except Exception as e:
+            logger.error("Sync pull error: %s", e)
+            self._send_error(500, "Internal server error")
+
+    def _query_jobs(
+        self, cursor: dict[str, Any], snapshot_until: str, limit: int, use_cursor: bool
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Consulta order_jobs con paginación por cursor."""
+        limit_plus_one = limit + 1
+
+        if use_cursor and cursor["updated_at"]:
+            # Página posterior con cursor
+            query = """
+                SELECT id, order_id, title, material, size, quantity,
+                       status, notes, sort_order, created_at, updated_at
+                FROM order_jobs
+                WHERE (updated_at, id) > (?, ?)
+                AND updated_at <= ?
+                ORDER BY updated_at ASC, id ASC
+                LIMIT ?
+            """
+            params = (cursor["updated_at"], cursor["id"], snapshot_until, limit_plus_one)
+        else:
+            # Primera página (con since o sin since)
+            if cursor["updated_at"]:
+                # Con since (nueva ronda incremental)
+                query = """
+                    SELECT id, order_id, title, material, size, quantity,
+                           status, notes, sort_order, created_at, updated_at
+                    FROM order_jobs
+                    WHERE updated_at >= ?
+                    AND updated_at <= ?
+                    ORDER BY updated_at ASC, id ASC
+                    LIMIT ?
+                """
+                params = (cursor["updated_at"], snapshot_until, limit_plus_one)
+            else:
+                # Primera sync absoluta
+                query = """
+                    SELECT id, order_id, title, material, size, quantity,
+                           status, notes, sort_order, created_at, updated_at
+                    FROM order_jobs
+                    WHERE updated_at <= ?
+                    ORDER BY updated_at ASC, id ASC
+                    LIMIT ?
+                """
+                params = (snapshot_until, limit_plus_one)
+
+        rows = self.event_repo.conn.execute(query, params).fetchall()
+        items = [dict(row) for row in rows[:limit]]
+        has_more = len(rows) > limit
+        return items, has_more
+
+    def _query_orders(
+        self, cursor: dict[str, Any], snapshot_until: str, limit: int, use_cursor: bool
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Consulta orders con paginación por cursor."""
+        limit_plus_one = limit + 1
+
+        if use_cursor and cursor["updated_at"]:
+            query = """
+                SELECT id, client, client_id, whatsapp, order_date, status,
+                       material, size, quantity, delivery_date, print_priority,
+                       is_archived, observations, order_concept, order_description,
+                       created_at, updated_at
+                FROM orders
+                WHERE (updated_at, id) > (?, ?)
+                AND updated_at <= ?
+                ORDER BY updated_at ASC, id ASC
+                LIMIT ?
+            """
+            params = (cursor["updated_at"], cursor["id"], snapshot_until, limit_plus_one)
+        else:
+            if cursor["updated_at"]:
+                query = """
+                    SELECT id, client, client_id, whatsapp, order_date, status,
+                           material, size, quantity, delivery_date, print_priority,
+                           is_archived, observations, order_concept, order_description,
+                           created_at, updated_at
+                    FROM orders
+                    WHERE updated_at >= ?
+                    AND updated_at <= ?
+                    ORDER BY updated_at ASC, id ASC
+                    LIMIT ?
+                """
+                params = (cursor["updated_at"], snapshot_until, limit_plus_one)
+            else:
+                query = """
+                    SELECT id, client, client_id, whatsapp, order_date, status,
+                           material, size, quantity, delivery_date, print_priority,
+                           is_archived, observations, order_concept, order_description,
+                           created_at, updated_at
+                    FROM orders
+                    WHERE updated_at <= ?
+                    ORDER BY updated_at ASC, id ASC
+                    LIMIT ?
+                """
+                params = (snapshot_until, limit_plus_one)
+
+        rows = self.event_repo.conn.execute(query, params).fetchall()
+        items = [dict(row) for row in rows[:limit]]
+        has_more = len(rows) > limit
+        return items, has_more
+
+    def _query_clients(
+        self, cursor: dict[str, Any], snapshot_until: str, limit: int, use_cursor: bool
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Consulta clients con paginación por cursor."""
+        limit_plus_one = limit + 1
+
+        if use_cursor and cursor["updated_at"]:
+            query = """
+                SELECT id, name, whatsapp, client_type, created_at, updated_at
+                FROM clients
+                WHERE (updated_at, id) > (?, ?)
+                AND updated_at <= ?
+                ORDER BY updated_at ASC, id ASC
+                LIMIT ?
+            """
+            params = (cursor["updated_at"], cursor["id"], snapshot_until, limit_plus_one)
+        else:
+            if cursor["updated_at"]:
+                query = """
+                    SELECT id, name, whatsapp, client_type, created_at, updated_at
+                    FROM clients
+                    WHERE updated_at >= ?
+                    AND updated_at <= ?
+                    ORDER BY updated_at ASC, id ASC
+                    LIMIT ?
+                """
+                params = (cursor["updated_at"], snapshot_until, limit_plus_one)
+            else:
+                query = """
+                    SELECT id, name, whatsapp, client_type, created_at, updated_at
+                    FROM clients
+                    WHERE updated_at <= ?
+                    ORDER BY updated_at ASC, id ASC
+                    LIMIT ?
+                """
+                params = (snapshot_until, limit_plus_one)
+
+        rows = self.event_repo.conn.execute(query, params).fetchall()
+        items = [dict(row) for row in rows[:limit]]
+        has_more = len(rows) > limit
+        return items, has_more
 
     def log_message(self, format, *args):
         """Override para evitar logging default de HTTPServer."""
