@@ -24,15 +24,24 @@ class OrderWithDetails {
   /// Get formatted order date
   String get formattedOrderDate {
     if (order.orderDate == null) return 'Sin fecha';
-    final date = order.orderDate!;
-    return '${date.day.toString().padLeft(2, '0')}/${date.month.toString().padLeft(2, '0')}/${date.year}';
+    try {
+      final date = DateTime.parse(order.orderDate!);
+      return '${date.day.toString().padLeft(2, '0')}/${date.month.toString().padLeft(2, '0')}/${date.year}';
+    } catch (e) {
+      return order.orderDate!;
+    }
   }
   
   /// Get formatted delivery date
   String get formattedDeliveryDate {
     if (order.deliveryDate == null) return 'Sin fecha';
-    final date = order.deliveryDate!;
-    return '${date.day.toString().padLeft(2, '0')}/${date.month.toString().padLeft(2, '0')}/${date.year}';
+    try {
+      // Try to parse as DateTime (handles both "2026-07-25" and "2026-07-25 18:00" formats)
+      final date = DateTime.parse(order.deliveryDate!);
+      return '${date.day.toString().padLeft(2, '0')}/${date.month.toString().padLeft(2, '0')}/${date.year}';
+    } catch (e) {
+      return order.deliveryDate!;
+    }
   }
   
   /// Get primary job title (first job or empty)

@@ -3,6 +3,7 @@ import 'package:doccione_mobile/database/database_helper.dart';
 import 'package:doccione_mobile/database/orders_repository.dart';
 import 'package:doccione_mobile/models/order_with_details.dart';
 import 'package:doccione_mobile/widgets/order_card.dart';
+import 'package:doccione_mobile/screens/order_detail_screen.dart';
 
 class OrdersListScreen extends StatefulWidget {
   final String? initialStatus;
@@ -142,10 +143,13 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
                             return OrderCard(
                               orderDetails: orderDetails,
                               onTap: () {
-                                // TODO: Navigate to order detail screen
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  SnackBar(
-                                    content: Text('Detalle de pedido #${orderDetails.order.orderNumber ?? orderDetails.order.id.substring(0, 8)}'),
+                                Navigator.push(
+                                  context,
+                                  MaterialPageRoute(
+                                    builder: (context) => OrderDetailScreen(
+                                      orderDetails: orderDetails,
+                                      onContactWhatsApp: null, // TODO: Implement WhatsApp integration
+                                    ),
                                   ),
                                 );
                               },
