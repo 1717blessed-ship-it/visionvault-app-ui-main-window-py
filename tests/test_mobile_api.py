@@ -1043,3 +1043,108 @@ class TestSyncPullEndpoint:
 
         response_data = json.loads(handler.response.body.decode("utf-8"))
         assert "entities" in response_data
+
+
+class TestHealthEndpoint:
+    """Tests para GET /api/v1/mobile/health — endpoint público sin autenticación."""
+
+    def test_health_200_without_authorization(self, repo, event_bus):
+        """Health check responde 200 sin header Authorization."""
+        handler = create_handler(repo, event_bus)
+        handler.headers = {}
+        handler.path = "/api/v1/mobile/health"
+
+        handler._get_health()
+
+        assert handler.response.status_code == 200
+
+    def test_health_content_type_json(self, repo, event_bus):
+        """Content-Type es application/json."""
+        handler = create_handler(repo, event_bus)
+        handler.headers = {}
+        handler.path = "/api/v1/mobile/health"
+
+        handler._get_health()
+
+        assert handler.response.headers["Content-Type"] == "application/json"
+
+    def test_health_status_ok(self, repo, event_bus):
+        """Campo status == 'ok'."""
+        handler = create_handler(repo, event_bus)
+        handler.headers = {}
+        handler.path = "/api/v1/mobile/health"
+
+        handler._get_health()
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert data["status"] == "ok"
+
+    def test_health_service_name(self, repo, event_bus):
+        """Campo service == 'doccione-studio'."""
+        handler = create_handler(repo, event_bus)
+        handler.headers = {}
+        handler.path = "/api/v1/mobile/health"
+
+        handler._get_health()
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert data["service"] == "doccione-studio"
+
+    def test_health_api_version(self, repo, event_bus):
+        """Campo api_version == 'v1'."""
+        handler = create_handler(repo, event_bus)
+        handler.headers = {}
+        handler.path = "/api/v1/mobile/health"
+
+        handler._get_health()
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert data["api_version"] == "v1"
+
+    def test_health_mobile_api_true(self, repo, event_bus):
+        """Campo mobile_api == True."""
+        handler = create_handler(repo, event_bus)
+        handler.headers = {}
+        handler.path = "/api/v1/mobile/health"
+
+        handler._get_health()
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert data["mobile_api"] is True
+
+    def test_health_does_not_touch_repo(self, repo, event_bus):
+        """Health check no accede al repositorio."""
+        handler = create_handler(repo, event_bus)
+        handler.headers = {}
+        handler.path = "/api/v1/mobile/health"
+
+        original_conn = handler.event_repo.conn
+        handler.event_repo = Mock()
+        handler.event_repo.conn = original_conn
+
+        handler._get_health()
+
+        handler.event_repo.validate_session_token.assert_not_called()
+
+    def test_other_endpoints_still_require_auth(self, repo, event_bus):
+        """Endpoints protegidos siguen pidiendo autenticación."""
+        handler = create_handler(repo, event_bus)
+        handler.headers = {}
+        handler.path = "/api/v1/mobile/jobs"
+        handler._send_error = Mock()
+
+        handler.do_GET()
+
+        handler._send_error.assert_called_once_with(401, "Authorization header missing")
+
+    def test_health_via_do_GET_no_auth_required(self, repo, event_bus):
+        """GET /api/v1/mobile/health vía do_GET no requiere token."""
+        handler = create_handler(repo, event_bus)
+        handler.headers = {}
+        handler.path = "/api/v1/mobile/health"
+
+        handler.do_GET()
+
+        assert handler.response.status_code == 200
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert data["status"] == "ok"

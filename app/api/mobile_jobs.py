@@ -97,7 +97,12 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         """Maneja requests GET."""
         parsed = urlparse(self.path)
-        
+
+        # Health check público — sin autenticación
+        if parsed.path == "/api/v1/mobile/health":
+            self._get_health()
+            return
+
         # Validar autenticación
         device = self._validate_auth()
         if not device:
@@ -593,6 +598,15 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
             "supports_deletions": False,
         }
         self._send_json_response(200, capabilities)
+
+    def _get_health(self) -> None:
+        """Health check público del API móvil — sin autenticación."""
+        self._send_json_response(200, {
+            "status": "ok",
+            "service": "doccione-studio",
+            "api_version": "v1",
+            "mobile_api": True,
+        })
 
     def _sync_pull(self, device: dict[str, Any]) -> None:
         """Sincronización incremental de solo lectura."""
