@@ -269,4 +269,176 @@ class OrdersRepository {
       );
     }).toList();
   }
+
+  /// Search and filter orders with related data
+  /// 
+  /// Optimized to avoid N+1 query pattern using batch queries.
+  /// 
+  /// [searchQuery] - Search in order number, client name, whatsapp, material, and job titles
+  /// [status] - Filter by order status
+  /// [priority] - Filter by print priority
+  /// [showArchived] - Include archived orders (default: false)
+  /// [deliveryDateFrom] - Filter orders with delivery date >= this date
+  /// [deliveryDateTo] - Filter orders with delivery date <= this date
+  /// [sortBy] - Sort field: 'delivery_date', 'priority', 'order_date', 'client'
+  /// [sortDescending] - Sort direction (default: false for ascending)
+  /// [limit] - Maximum number of orders to return (default: 100)
+  Future<List<OrderWithDetails>> searchOrders({
+    String? searchQuery,
+    String? status,
+    String? priority,
+    bool showArchived = false,
+    String? deliveryDateFrom,
+    String? deliveryDateTo,
+    String sortBy = 'order_date',
+    bool sortDescending = true,
+    int limit = 100,
+  }) async {
+    final db = await _dbHelper.database;
+    
+    // Build WHERE clause
+    final List<String> whereClauses = [];
+    final List<dynamic> whereArgs = [];
+    
+    // Archived filter
+    if (!showArchived) {
+      whereClauses.add('(o.is_archived IS NULL OR o.is_archived = 0)');
+    }
+    
+    // Status filter
+    if (status != null) {
+      whereClauses.add('o.status = ?');
+      whereArgs.add(status);
+    }
+    
+    // Priority filter
+    if (priority != null) {
+      whereClauses.add('o.print_priority = ?');
+      whereArgs.add(priority);
+    }
+    
+    // Delivery date range filter
+    if (deliveryDateFrom != null) {
+      whereClauses.add('o.delivery_date >= ?');
+      whereArgs.add(deliveryDateFrom);
+    }
+    if (deliveryDateTo != null) {
+      whereClauses.add('o.delivery_date <= ?');
+      whereArgs.add(deliveryDateTo);
+    }
+    
+    // Search query filter (searches in order, client, and jobs)
+    if (searchQuery != null && searchQuery.isNotEmpty) {
+      whereClauses.add('''
+        (o.order_number LIKE ? OR 
+         o.client LIKE ? OR 
+         o.whatsapp LIKE ? OR 
+         o.material LIKE ? OR 
+         o.id IN (SELECT DISTINCT order_id FROM jobs WHERE title LIKE ? OR material LIKE ?))
+      ''');
+      final searchPattern = '%$searchQuery%';
+      whereArgs.addAll([searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern]);
+    }
+    
+    final whereClause = whereClauses.isEmpty ? '' : whereClauses.join(' AND ');
+    
+    // Build ORDER BY clause
+    String orderByClause;
+    final sortDir = sortDescending ? 'DESC' : 'ASC';
+    
+    switch (sortBy) {
+      case 'delivery_date':
+        orderByClause = 'o.delivery_date $sortDir, o.order_date DESC';
+        break;
+      case 'priority':
+        // Sort by priority: high > medium > low, then by order_date
+        orderByClause = '''
+          CASE o.print_priority 
+            WHEN 'high' THEN 1 
+            WHEN 'alta' THEN 1 
+            WHEN 'medium' THEN 2 
+            WHEN 'media' THEN 2 
+            WHEN 'low' THEN 3 
+            WHEN 'baja' THEN 3 
+            ELSE 4 
+          END ${sortDescending ? 'ASC' : 'DESC'}, 
+          o.order_date DESC
+        ''';
+        break;
+      case 'client':
+        orderByClause = 'o.client $sortDir, o.order_date DESC';
+        break;
+      case 'order_date':
+      default:
+        orderByClause = 'o.order_date $sortDir, o.updated_at DESC';
+        break;
+    }
+    
+    // 1. Query orders with filters
+    final orderMaps = await db.rawQuery('''
+      SELECT DISTINCT o.* 
+      FROM orders o
+      ${whereClause.isEmpty ? '' : 'WHERE $whereClause'}
+      ORDER BY $orderByClause
+      LIMIT ?
+    ''', [...whereArgs, limit]);
+    
+    if (orderMaps.isEmpty) {
+      return [];
+    }
+    
+    final orders = orderMaps.map((map) => Order.fromMap(map)).toList();
+    
+    // 2. Batch query all clients (WHERE IN)
+    final clientIds = orders
+        .where((o) => o.clientId != null)
+        .map((o) => o.clientId!)
+        .toSet()
+        .toList();
+    
+    final Map<String, Client> clientsMap = {};
+    
+    if (clientIds.isNotEmpty) {
+      final placeholders = clientIds.map((_) => '?').join(',');
+      final clientMaps = await db.rawQuery(
+        'SELECT * FROM clients WHERE id IN ($placeholders)',
+        clientIds,
+      );
+      
+      for (final clientMap in clientMaps) {
+        final client = Client.fromMap(clientMap);
+        clientsMap[client.id] = client;
+      }
+    }
+    
+    // 3. Batch query all jobs (WHERE IN)
+    final orderIds = orders.map((o) => o.id).toList();
+    
+    final Map<String, List<Job>> jobsMap = {};
+    
+    if (orderIds.isNotEmpty) {
+      final placeholders = orderIds.map((_) => '?').join(',');
+      final jobMaps = await db.rawQuery(
+        'SELECT * FROM jobs WHERE order_id IN ($placeholders) ORDER BY sort_order ASC, created_at ASC',
+        orderIds,
+      );
+      
+      for (final jobMap in jobMaps) {
+        final job = Job.fromMap(jobMap);
+        final orderId = job.orderId;
+        if (orderId != null) {
+          jobsMap.putIfAbsent(orderId, () => []).add(job);
+        }
+      }
+    }
+    
+    // 4. Assemble results
+    return orders.map((order) {
+      return OrderWithDetails(
+        order: order,
+        client: order.clientId != null ? clientsMap[order.clientId] : null,
+        jobs: jobsMap[order.id] ?? [],
+      );
+    }).toList();
+  }
 }
