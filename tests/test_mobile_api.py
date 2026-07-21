@@ -1183,3 +1183,56 @@ class TestHandlerInitRealRepo:
         handler.do_GET()
 
         handler._send_error.assert_called_once_with(401, "Authorization header missing")
+
+
+class TestServerBindConfiguration:
+    """Verifica que MobileJobsServer escucha en 0.0.0.0:port."""
+
+    def test_bind_host_is_0_0_0_0(self, repo, event_bus):
+        """HTTPServer se crea con host 0.0.0.0 para acceso en red local."""
+        from app.api.mobile_jobs import MobileJobsServer
+        from unittest.mock import patch as mock_patch
+
+        mock_server = MagicMock()
+        with mock_patch("app.api.mobile_jobs.HTTPServer", return_value=mock_server) as MockHTTP:
+            server = MobileJobsServer(event_repo=repo, event_bus=event_bus, port=9999)
+            server.start()
+            server.stop()
+            args, _ = MockHTTP.call_args
+            assert args[0] == ("0.0.0.0", 9999)
+
+    def test_port_matches_constructor(self, repo, event_bus):
+        """El puerto usado es el recibido por el constructor."""
+        from app.api.mobile_jobs import MobileJobsServer
+        from unittest.mock import patch as mock_patch
+
+        mock_server = MagicMock()
+        with mock_patch("app.api.mobile_jobs.HTTPServer", return_value=mock_server) as MockHTTP:
+            server = MobileJobsServer(event_repo=repo, event_bus=event_bus, port=5555)
+            server.start()
+            server.stop()
+            args, _ = MockHTTP.call_args
+            assert args[0][1] == 5555
+
+    def test_health_responds_200(self, repo, event_bus):
+        """Health endpoint sigue respondiendo 200 después del cambio de bind."""
+        handler = create_handler(repo, event_bus)
+        handler.headers = {}
+        handler.path = "/api/v1/mobile/health"
+
+        handler._get_health()
+
+        assert handler.response.status_code == 200
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert data["status"] == "ok"
+
+    def test_protected_still_401_without_token(self, repo, event_bus):
+        """Endpoints protegidos siguen devolviendo 401 sin token."""
+        handler = create_handler(repo, event_bus)
+        handler.headers = {}
+        handler.path = "/api/v1/mobile/jobs"
+        handler._send_error = Mock()
+
+        handler.do_GET()
+
+        handler._send_error.assert_called_once_with(401, "Authorization header missing")

@@ -896,7 +896,7 @@ class MobileJobsServer:
                 )
 
             try:
-                server = HTTPServer(("localhost", self.port), handler)
+                server = HTTPServer(("0.0.0.0", self.port), handler)
             except OSError:
                 logger.exception(
                     "Could not start Mobile Jobs API server on port %d",
