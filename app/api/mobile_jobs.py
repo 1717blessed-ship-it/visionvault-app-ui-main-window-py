@@ -120,6 +120,8 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
                 self._change_job_stage(int(job_id), device)
             else:
                 self._send_error(400, "Invalid job ID")
+        elif parsed.path == "/api/mobile/device/preferences":
+            self._update_device_preferences(device)
         else:
             self._send_error(404, "Endpoint not found")
 
@@ -479,6 +481,44 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
         except Exception as e:
             logger.error("Error getting materials: %s", e)
             self._send_error(500, f"Error getting materials: {e}")
+
+    def _update_device_preferences(self, device: dict[str, Any]) -> None:
+        """Actualiza las preferencias de notificaciones del dispositivo."""
+        try:
+            # Leer body
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode("utf-8"))
+
+            preferences = data.get("preferences")
+            if not isinstance(preferences, dict):
+                self._send_error(400, "preferences field must be a dictionary")
+                return
+
+            # Actualizar cada preferencia
+            updated_count = 0
+            for event_type, enabled in preferences.items():
+                if not isinstance(enabled, bool):
+                    self._send_error(400, f"Preference value for '{event_type}' must be boolean")
+                    return
+
+                self.event_repo.set_device_pref(device["id"], event_type, enabled)
+                updated_count += 1
+
+            # Obtener preferencias actualizadas
+            updated_prefs = self.event_repo.get_device_prefs(device["id"])
+
+            self._send_json_response(200, {
+                "success": True,
+                "message": f"{updated_count} preferences updated",
+                "preferences": updated_prefs,
+            })
+
+        except json.JSONDecodeError:
+            self._send_error(400, "Invalid JSON body")
+        except Exception as e:
+            logger.error("Error updating device preferences: %s", e)
+            self._send_error(500, f"Error updating device preferences: {e}")
 
     def _get_device_status(self, device: dict[str, Any]) -> None:
         """Obtiene el estado actual del dispositivo."""
