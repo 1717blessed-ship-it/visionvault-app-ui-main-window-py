@@ -1,10 +1,11 @@
 import 'package:flutter/material.dart';
 import '../config/server_config.dart';
 import '../database/server_config_repository.dart';
+import '../models/connection_test_result.dart';
 
 class ServerConfigScreen extends StatefulWidget {
   final ServerConfigRepository repository;
-  final Future<bool> Function()? onTestConnection;
+  final Future<ConnectionTestResult> Function(String baseUrl)? onTestConnection;
 
   const ServerConfigScreen({
     super.key,
@@ -27,7 +28,7 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
   bool _isTesting = false;
   String? _error;
   String? _saveSuccess;
-  String? _testResult;
+  ConnectionTestResult? _testResult;
   ServerConfig? _currentConfig;
 
   @override
@@ -101,18 +102,20 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
       _isTesting = true;
       _testResult = null;
       _error = null;
+      _saveSuccess = null;
     });
 
     try {
-      final success = await widget.onTestConnection!();
+      final baseUrl = _baseUrlPreview;
+      final result = await widget.onTestConnection!(baseUrl);
       setState(() {
         _isTesting = false;
-        _testResult = success ? 'Conexión exitosa' : 'No se pudo conectar';
+        _testResult = result;
       });
     } catch (e) {
       setState(() {
         _isTesting = false;
-        _testResult = 'Error al probar conexión: $e';
+        _testResult = ConnectionTestResult.unexpected(detail: e.toString());
       });
     }
   }
@@ -295,7 +298,7 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
                     // Test result
                     if (_testResult != null) ...[
                       Card(
-                        color: _testResult!.contains('exitosa')
+                        color: _testResult!.success
                             ? Theme.of(context).colorScheme.primaryContainer
                             : Theme.of(context).colorScheme.errorContainer,
                         child: Padding(
@@ -303,22 +306,34 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
                           child: Row(
                             children: [
                               Icon(
-                                _testResult!.contains('exitosa')
+                                _testResult!.success
                                     ? Icons.check_circle
                                     : Icons.error,
-                                color: _testResult!.contains('exitosa')
+                                color: _testResult!.success
                                     ? Theme.of(context).colorScheme.primary
                                     : Theme.of(context).colorScheme.error,
                               ),
                               const SizedBox(width: 8),
                               Expanded(
-                                child: Text(
-                                  _testResult!,
-                                  style: TextStyle(
-                                    color: _testResult!.contains('exitosa')
-                                        ? Theme.of(context).colorScheme.primary
-                                        : Theme.of(context).colorScheme.error,
-                                  ),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      _testResult!.message,
+                                      style: TextStyle(
+                                        color: _testResult!.success
+                                            ? Theme.of(context).colorScheme.primary
+                                            : Theme.of(context).colorScheme.error,
+                                      ),
+                                    ),
+                                    if (_testResult!.responseTime != null) ...[
+                                      const SizedBox(height: 4),
+                                      Text(
+                                        'Latencia: ${_testResult!.responseTime!.inMilliseconds}ms',
+                                        style: Theme.of(context).textTheme.labelSmall,
+                                      ),
+                                    ],
+                                  ],
                                 ),
                               ),
                             ],

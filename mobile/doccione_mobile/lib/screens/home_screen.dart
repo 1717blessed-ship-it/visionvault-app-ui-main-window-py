@@ -9,6 +9,7 @@ import 'dashboard_screen.dart';
 import 'server_config_screen.dart';
 import '../database/database_helper.dart';
 import '../database/server_config_repository.dart';
+import '../services/sync_api_client.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -346,6 +347,14 @@ class _HomePageState extends State<HomePage> {
                 MaterialPageRoute(
                   builder: (context) => ServerConfigScreen(
                     repository: ServerConfigRepository(DatabaseHelper()),
+                    onTestConnection: (baseUrl) async {
+                      final client = SyncApiClient(baseUrl: baseUrl);
+                      try {
+                        return await client.testConnection();
+                      } finally {
+                        client.close();
+                      }
+                    },
                   ),
                 ),
               );
