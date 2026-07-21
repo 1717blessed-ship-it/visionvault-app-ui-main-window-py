@@ -102,6 +102,8 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
             self._get_materials()
         elif parsed.path == "/api/mobile/device/status":
             self._get_device_status(device)
+        elif parsed.path == "/api/mobile/jobs/search":
+            self._search_jobs(device)
         else:
             self._send_error(404, "Endpoint not found")
 
@@ -187,6 +189,78 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
         except Exception as e:
             logger.error("Error listing jobs: %s", e)
             self._send_error(500, f"Error listing jobs: {e}")
+
+    def _search_jobs(self, device: dict[str, Any]) -> None:
+        """Busca jobs por texto en título, cliente, material, notas."""
+        params = self._parse_url_params()
+
+        query_text = params.get("q", "").strip()
+        if not query_text:
+            self._send_error(400, "Query parameter 'q' is required")
+            return
+
+        limit = min(50, max(1, int(params.get("limit", "20"))))
+        offset = max(0, int(params.get("offset", "0")))
+
+        try:
+            # Búsqueda en múltiples campos
+            search_pattern = f"%{query_text}%"
+            query = """
+                SELECT j.id, j.order_id, j.title, j.material, j.size, j.quantity,
+                       j.status, j.notes, j.sort_order, j.created_at, j.updated_at,
+                       o.client, o.delivery_date, o.print_priority
+                FROM order_jobs j
+                JOIN orders o ON j.order_id = o.id
+                WHERE o.is_archived = 0
+                  AND (j.title LIKE ? 
+                       OR o.client LIKE ? 
+                       OR j.material LIKE ? 
+                       OR j.notes LIKE ?
+                       OR CAST(j.id AS TEXT) LIKE ?
+                       OR CAST(j.order_id AS TEXT) LIKE ?)
+                ORDER BY o.print_priority DESC, o.delivery_date ASC, j.sort_order ASC
+                LIMIT ? OFFSET ?
+            """
+
+            params_list = [search_pattern] * 6 + [limit, offset]
+            rows = self.event_repo.conn.execute(query, params_list).fetchall()
+
+            jobs = []
+            for row in rows:
+                job_dict = dict(row)
+                # Calcular progreso y timeline
+                job_dict["progress"] = get_stage_progress(job_dict)
+                job_dict["current_stage"] = get_current_stage(job_dict)
+                job_dict["workflow_stages"] = workflow_stages(job_dict)
+                jobs.append(job_dict)
+
+            # Total count
+            count_query = """
+                SELECT COUNT(*)
+                FROM order_jobs j
+                JOIN orders o ON j.order_id = o.id
+                WHERE o.is_archived = 0
+                  AND (j.title LIKE ? 
+                       OR o.client LIKE ? 
+                       OR j.material LIKE ? 
+                       OR j.notes LIKE ?
+                       OR CAST(j.id AS TEXT) LIKE ?
+                       OR CAST(j.order_id AS TEXT) LIKE ?)
+            """
+            count_params = [search_pattern] * 6
+            total = self.event_repo.conn.execute(count_query, count_params).fetchone()[0]
+
+            self._send_json_response(200, {
+                "jobs": jobs,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "query": query_text,
+            })
+
+        except Exception as e:
+            logger.error("Error searching jobs: %s", e)
+            self._send_error(500, f"Error searching jobs: {e}")
 
     def _get_job_detail(self, job_id: int, device: dict[str, Any]) -> None:
         """Obtiene detalle de un job específico."""
