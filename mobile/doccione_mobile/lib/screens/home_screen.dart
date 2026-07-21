@@ -28,10 +28,12 @@ class _HomePageState extends State<HomePage> {
   final TextEditingController _pairingCodeController = TextEditingController();
   final FlutterSecureStorage _secureStorage = const FlutterSecureStorage();
   String? _sessionToken;
+  String _baseUrl = 'http://localhost:8765';
 
   @override
   void initState() {
     super.initState();
+    _loadServerConfig();
     _loadSessionToken();
     _initializeFirebase();
     _initializeLocalNotifications();
@@ -53,6 +55,14 @@ class _HomePageState extends State<HomePage> {
         _pairingStatus = 'Vinculado';
       });
     }
+  }
+
+  Future<void> _loadServerConfig() async {
+    final repository = ServerConfigRepository(DatabaseHelper());
+    final config = await repository.getConfig();
+    setState(() {
+      _baseUrl = config.baseUrl;
+    });
   }
 
   Future<void> _saveSessionToken(String token) async {
@@ -119,7 +129,7 @@ class _HomePageState extends State<HomePage> {
   Future<void> _updateTokenOnServer(String oldToken, String newToken) async {
     try {
       final response = await http.post(
-        Uri.parse('http://localhost:8765/api/device/update-token'),
+        Uri.parse('$_baseUrl/api/device/update-token'),
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({
           'old_token': oldToken,
@@ -156,7 +166,7 @@ class _HomePageState extends State<HomePage> {
 
     try {
       final response = await http.post(
-        Uri.parse('http://localhost:8765/api/pair/validate'),
+        Uri.parse('$_baseUrl/api/pair/validate'),
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({
           'code': code,

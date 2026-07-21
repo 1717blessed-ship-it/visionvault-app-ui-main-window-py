@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../database/database_helper.dart';
+import '../database/server_config_repository.dart';
 import '../database/sync_state_repository.dart';
 import '../database/jobs_repository.dart';
 import '../database/orders_repository.dart';
@@ -49,9 +50,11 @@ class _SyncStatusCardState extends State<SyncStatusCard> {
     final ordersRepo = OrdersRepository(_dbHelper);
     final clientsRepo = ClientsRepository(_dbHelper);
 
-    // Use session token if available, otherwise use placeholder
+    final repository = ServerConfigRepository(_dbHelper);
+    final config = await repository.getConfig();
+
     final apiClient = SyncApiClient(
-      baseUrl: 'http://localhost:8000',
+      baseUrl: config.baseUrl,
       authToken: widget.sessionToken,
       timeout: const Duration(seconds: 30),
     );
