@@ -164,16 +164,18 @@ El test #12 (`test_update_device_token_safe_new_token`) tiene un error adicional
 
 | Criterio | Estado | Notas |
 |----------|--------|-------|
-| Ventana principal aparece correctamente | Pendiente verificación manual | El `finish_startup()` no depende de los defers |
-| Producción muestra tarjetas y miniaturas | Pendiente verificación manual | `refresh_production()` se ejecuta vía `after_idle` |
-| Miniaturas aparecen progresivamente | Pendiente verificación manual | Batch de 3 con 8ms delay |
-| Cambiar de sección y regresar funciona | Pendiente verificación manual | `queue_production_refresh()` debounce |
-| Actualizar Producción no acumula callbacks | Verificado en código | `after_cancel` previo en `queue_production_refresh()` |
-| Notificaciones se cargan después del inicio | Pendiente verificación manual | `after_idle` en `_build()` |
-| Firebase se inicializa diferidamente | Verificado en código | `after_idle` en `__init__` |
-| Cerrar durante cargas diferidas no genera Tcl errors | Verificado en código | Guardas `winfo_exists()` y `try/except TclError` |
+| Ventana principal aparece correctamente | ✅ Validado manualmente | Inicia sin errores |
+| Producción muestra tarjetas y miniaturas | ✅ Validado manualmente | Carga correcta |
+| Miniaturas aparecen sin duplicarse | ✅ Validado manualmente | Sin duplicados |
+| Cambiar de sección y regresar funciona | ✅ Validado manualmente | Navegación correcta |
+| Actualizar Producción no acumula callbacks | ✅ Validado manualmente | Refrescos consecutivos OK |
+| Notificaciones se cargan después del inicio | ✅ Validado manualmente | Panel visible tras inicio |
+| Firebase no bloquea el inicio | ✅ Validado manualmente | Arranque fluido |
+| Cerrar la app no genera errores Tcl | ✅ Validado manualmente | Sin excepciones en consola |
+| No hay nuevas excepciones en consola | ✅ Validado manualmente | Limpio |
 
-**Nota:** La validación visual de UI requiere ejecución manual de la aplicación. El análisis de código confiere que los cambios son seguros; los defers usan `after_idle` (se ejecutan en el próximo idle del event loop tras `_build()`) y todos los callbacks verifican la existencia de widgets antes de operar.
+**Fecha de validación manual:** 2026-07-22
+**Resultado:** Todos los criterios aprobados. Sin regresiones visuales ni funcionales.
 
 ---
 
