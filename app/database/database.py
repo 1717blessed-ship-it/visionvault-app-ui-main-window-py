@@ -95,7 +95,7 @@ class ImageDatabase:
         # except Exception:
         #     pass
 
-        self.connection = sqlite3.connect(db_path)
+        self.connection = sqlite3.connect(db_path, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute(
             """CREATE TABLE IF NOT EXISTS images (
