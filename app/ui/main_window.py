@@ -234,13 +234,8 @@ class VisionVaultApp(DndRoot):
             port=8766,
         )
         self._mobile_jobs_server.start()
-        # Intentar inicializar Firebase (no bloqueante si no está configurado)
-        try:
-            firebase_ok = initialize_firebase()
-            if firebase_ok:
-                self._notification_service.start_worker(interval_seconds=15)
-        except Exception:
-            pass
+        # Firebase init diferido para no bloquear el arranque (~290 ms).
+        self.after_idle(self._deferred_init_firebase)
         self.initial_render_complete = False
         self.startup_window_mapped = False
         self._startup_metric_saved = False
@@ -654,14 +649,7 @@ class VisionVaultApp(DndRoot):
                  font=(IDENTITY_FONT, 9, "bold")).pack(anchor="w", padx=16, pady=(0, 8))
         self.notifications_frame = tk.Frame(navigation, background=COLORS.background_secondary)
         self.notifications_frame.pack(fill="x", padx=10, pady=(0, 12))
-        try:
-            self.refresh_notifications()
-        except Exception as e:
-            # Evitar que un fallo en el panel de notificaciones impida el arranque
-            try:
-                self.status.set(f"Aviso: no se pudieron cargar notificaciones: {e}")
-            except Exception:
-                pass
+        self.after_idle(self._deferred_refresh_notifications)
         
         # Botón para abrir el Centro de Notificaciones
         _notif_center_btn = tk.Button(
@@ -728,8 +716,10 @@ class VisionVaultApp(DndRoot):
         designs_tab = ttk.Frame(self.tabs)
         selected_tab = ttk.Frame(self.tabs)
         production_tab = ttk.Frame(self.tabs)
+        processed_tab = ttk.Frame(self.tabs)
         self.tabs.add(designs_tab, text="Diseños")
         self.tabs.add(selected_tab, text="Seleccionados (0)")
+        self.tabs.add(processed_tab, text="Últimos Procesados (0)")
         self.tabs.add(orders_tab, text="Pedidos")
         self.tabs.add(production_tab, text="Producción")
         # La biblioteca es el punto de entrada operativo de Doccione Studio.
@@ -738,6 +728,7 @@ class VisionVaultApp(DndRoot):
         self.selected_tab = selected_tab
         self.orders_tab = orders_tab
         self.production_tab = production_tab
+        self.processed_tab = processed_tab
         self.order_tabs: dict[int, ttk.Frame] = {}
         orders_builder = getattr(type(self), "build_orders_module", None)
         if callable(orders_builder):
@@ -808,9 +799,41 @@ class VisionVaultApp(DndRoot):
             on_trash=lambda img: self.trash_sticker(img),
         )
         self.selected_gallery.pack(fill="both", expand=True)
+        
+        # ── Tab de Últimos Procesados ──────────────────────────────────────
+        processed_header = tk.Frame(processed_tab, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
+        processed_header.pack(fill="x", padx=10, pady=(10, 0))
+        tk.Label(processed_header, text="ÚLTIMOS PROCESADOS", background=COLORS.panel, foreground=COLORS.text,
+                 font=(IDENTITY_FONT, 15, "bold")).pack(side="left", padx=14, pady=10)
+        tk.Label(processed_header, text="Stickers procesados pendientes de confirmación · Doble clic para ver",
+                 background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 9)).pack(side="left", padx=(0, 14), pady=10)
+        
+        # Botones de acción para todos los procesados
+        processed_controls = tk.Frame(processed_header, background=COLORS.panel)
+        processed_controls.pack(side="right", padx=14, pady=10)
+        ttk.Button(processed_controls, text="Confirmar todos", command=lambda: self.approve_all_processed(),
+                   style="Primary.TButton").pack(side="right", padx=(0, 7))
+        ttk.Button(processed_controls, text="Descartar todos", command=lambda: self.discard_all_processed(),
+                   style="Secondary.TButton").pack(side="right")
+        
+        # Galería de procesados
+        self.processed_gallery = Gallery(
+            processed_tab,
+            lambda img: self.preview_processed_image(img),
+            lambda img: None,  # No tags for processed items
+            lambda img, name: None,
+            lambda: None,
+            lambda img: None,  # No selection for processed items
+            lambda img: False,
+            lambda image: self.dragged_paths(image),
+            on_trash=lambda img: self.discard_processed_sticker(img),
+        )
+        self.processed_gallery.pack(fill="both", expand=True)
+        
         self._build_navigation_buttons({
             "Biblioteca": designs_tab,
             "Seleccionados": selected_tab,
+            "Últimos Procesados": processed_tab,
             "Pedidos": orders_tab,
             "Producción": production_tab,
         })
@@ -6751,7 +6774,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         self.production_summary = tk.StringVar(value="Cargando planchas…")
         tk.Label(header_content, textvariable=self.production_summary, background=COLORS.panel, foreground=COLORS.muted,
                  font=(UI_FONT, 10)).pack(side="left", padx=14)
-        ttk.Button(header_content, text="Actualizar", command=lambda: self.refresh_production(), style="Secondary.TButton").pack(side="right")
+        ttk.Button(header_content, text="Actualizar", command=lambda: self.queue_production_refresh(), style="Secondary.TButton").pack(side="right")
         ttk.Button(header_content, text="Producción continua", command=lambda: self._open_continuous_from_production(), style="Secondary.TButton").pack(side="right", padx=(0, 7))
         ttk.Button(header_content, text="Abrir cola de impresión", command=lambda: self.open_print_queue_window(), style="Primary.TButton").pack(side="right", padx=(0, 7))
 
@@ -6774,7 +6797,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         filter_values = ["Todas", "Guardadas", "Listas", "En cola", "Impresas", "Con errores"]
         for label in filter_values:
             ttk.Radiobutton(filter_inner, text=label, variable=self.production_filter, value=label,
-                           command=lambda: self.refresh_production()).pack(side="left", padx=(8, 0))
+                           command=lambda: self.queue_production_refresh()).pack(side="left", padx=(8, 0))
 
         # Estilo del treeview con fila más alta para preview
         production_style = ttk.Style(parent)
@@ -6965,6 +6988,9 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         self._production_preview_cache: dict[int, object] = {}
         self._production_plancha_data: dict[str, dict] = {}
         self._production_detail_current_preview_path: str = ""
+        self._production_refresh_after: str | None = None
+        self._production_thumb_cache: dict[str, object] = {}
+        self._production_loading_batch_after: str | None = None
 
         # --- Bindings ---
         self.production_tree.bind("<<TreeviewSelect>>", self._on_production_select)
@@ -6979,6 +7005,43 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         self._production_menu.add_command(label="Agregar a producción continua", command=self._production_add_to_continuous)
         self.production_tree.bind("<Button-3>", self._show_production_menu)
 
+        self.after_idle(self._deferred_refresh_production)
+
+    def _deferred_init_firebase(self):
+        """Inicializa Firebase tras mostrar la UI (~290 ms fuera del arranque)."""
+        try:
+            firebase_ok = initialize_firebase()
+            if firebase_ok:
+                self._notification_service.start_worker(interval_seconds=15)
+        except Exception:
+            pass
+
+    def _deferred_refresh_notifications(self):
+        """Carga el panel de notificaciones tras la construcción (~278 ms fuera del arranque)."""
+        try:
+            self.refresh_notifications()
+        except Exception as e:
+            try:
+                self.status.set(f"Aviso: no se pudieron cargar notificaciones: {e}")
+            except Exception:
+                pass
+
+    def _deferred_refresh_production(self):
+        """Callback único programado tras la construcción inicial."""
+        self._production_refresh_after = None
+        self.refresh_production()
+
+    def queue_production_refresh(self, delay: int = 60):
+        """Evita ejecutar refresh_production() más de una vez por ráfaga."""
+        if self._production_refresh_after is not None:
+            try:
+                self.after_cancel(self._production_refresh_after)
+            except tk.TclError:
+                pass
+        self._production_refresh_after = self.after(delay, self._flush_production_refresh)
+
+    def _flush_production_refresh(self):
+        self._production_refresh_after = None
         self.refresh_production()
 
     def open_print_queue_window(self):
@@ -7161,6 +7224,13 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
     def refresh_production(self):
         if not hasattr(self, "production_tree"):
             return
+        # Cancelar carga de miniaturas pendiente
+        if self._production_loading_batch_after is not None:
+            try:
+                self.after_cancel(self._production_loading_batch_after)
+            except tk.TclError:
+                pass
+            self._production_loading_batch_after = None
         # Guardar selección actual para restaurarla después
         prev_sel = self.production_tree.selection()
         prev_plancha_id = None
@@ -7190,6 +7260,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         }
 
         restored = False
+        previews_to_load: list[tuple[str, str, int]] = []
         for plancha in rows:
             plancha_id = int(plancha["id"])
             order_label = f"#{plancha.get('order_id', '?')} · {plancha.get('order_client') or 'Sin cliente'}" if plancha.get("order_id") else "Sin pedido"
@@ -7210,7 +7281,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             ))
             self._production_plancha_data[iid] = plancha
             if has_preview:
-                self._load_production_preview(iid, preview_path, plancha_id)
+                previews_to_load.append((iid, preview_path, plancha_id))
             # Restaurar selección previa si el item sigue en la tabla
             if prev_plancha_id == iid and not restored:
                 self.after_idle(lambda i=iid: (self.production_tree.selection_set(i),
@@ -7233,20 +7304,56 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 f"Total: {total} · Listas: {lists} · En cola: {queued} · "
                 f"Impresas: {printed}" + (f" · Con errores: {errors}" if errors else "")
             )
+        # Cargar miniaturas en lotes diferidos para no bloquear la UI
+        if previews_to_load:
+            self._production_previews_pending = previews_to_load
+            self._production_loading_batch_after = self.after_idle(self._load_production_previews_batch)
+
+    def _load_production_previews_batch(self):
+        """Carga 3 miniaturas por lote, programando el siguiente lote con un delay."""
+        self._production_loading_batch_after = None
+        pending = getattr(self, "_production_previews_pending", None)
+        if not pending:
+            return
+        if not self.winfo_exists():
+            return
+        batch_size = 3
+        batch = pending[:batch_size]
+        self._production_previews_pending = pending[batch_size:]
+        for iid, path, plancha_id in batch:
+            if not self.winfo_exists():
+                return
+            if not self.production_tree.exists(iid):
+                continue
+            self._load_production_preview(iid, path, plancha_id)
+        if self._production_previews_pending and self.winfo_exists():
+            self._production_loading_batch_after = self.after(8, self._load_production_previews_batch)
 
     def _load_production_preview(self, iid: str, path: str, plancha_id: int):
-        """Carga un mini thumbnail para la columna de preview de forma segura."""
+        """Carga un mini thumbnail para la columna de preview con caché."""
         try:
             from PIL import Image, ImageTk
+            # Clave de caché: ruta + tamaño de archivo + tamaño de thumbnail
+            try:
+                mtime = Path(path).stat().st_mtime
+            except OSError:
+                return
+            cache_key = f"{path}|{mtime}|56x52"
+            cached = self._production_thumb_cache.get(cache_key)
+            if cached is not None:
+                self._production_preview_cache[plancha_id] = cached
+                self.production_tree.set(iid, "preview", "✓")
+                self.production_tree.item(iid, tags=(f"preview:{plancha_id}",))
+                return
             with Image.open(path) as img:
                 img = img.convert("RGBA")
                 thumb = img.copy()
                 thumb.thumbnail((56, 52), Image.Resampling.LANCZOS)
                 photo = ImageTk.PhotoImage(thumb)
-                self._production_preview_cache[plancha_id] = photo
-                self.production_tree.set(iid, "preview", "✓")
-                # Usar tag para mostrar el ítem como referencia visual
-                self.production_tree.item(iid, tags=(f"preview:{plancha_id}",))
+            self._production_thumb_cache[cache_key] = photo
+            self._production_preview_cache[plancha_id] = photo
+            self.production_tree.set(iid, "preview", "✓")
+            self.production_tree.item(iid, tags=(f"preview:{plancha_id}",))
         except Exception:
             pass
 
@@ -7307,7 +7414,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 project=project, order_id=order_id, plancha_id=plancha_id, preserve_layout=True,
             )
             # Refrescar Producción al cerrar el editor (guardado/imprimir/etc.)
-            editor.bind("<Destroy>", lambda e: self.after_idle(self.refresh_production) if e.widget == editor else None)
+            editor.bind("<Destroy>", lambda e: self.after_idle(self.queue_production_refresh) if e.widget == editor else None)
         except Exception as error:
             messagebox.showerror("No se pudo abrir", str(error), parent=self)
 
@@ -8446,6 +8553,8 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             query, limit=self.gallery.display_capacity(), extension=self.current_extension, tags=tags, categories=categories, random_order=True
         )
         self.gallery.show_images(images)
+        # Actualizar también la galería de procesados
+        self.refresh_processed_gallery()
 
     def predict_search(self, query: str):
         """Busca por etiquetas, categorías, clientes y planchas, nunca por nombre de archivo."""
@@ -8931,6 +9040,215 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 self.flush_order_autosave(order_id)
         self.database.close()
         self.destroy()
+
+    def refresh_processed_gallery(self):
+        """Actualiza la galería de últimos procesados."""
+        if not hasattr(self, "processed_gallery"):
+            return
+        processed = self.database.pending_processed_stickers(limit=100)
+        images = []
+        for job in processed:
+            artifact_path = job.get("artifact_path")
+            if artifact_path and Path(artifact_path).exists():
+                images.append({
+                    "path": artifact_path,
+                    "name": Path(artifact_path).name,
+                    "extension": Path(artifact_path).suffix.lower(),
+                    "size": Path(artifact_path).stat().st_size if Path(artifact_path).exists() else 0,
+                    "modified": Path(artifact_path).stat().st_mtime if Path(artifact_path).exists() else 0,
+                    "caption": job.get("category", ""),
+                    "tags": job.get("tags", ""),
+                    "job_id": job.get("id"),
+                    "status": job.get("status"),
+                    "source_path": job.get("source_path"),
+                })
+        self.processed_gallery.show_images(images)
+        # Actualizar el título del tab
+        for tab_id in self.tabs.tabs():
+            if self.tabs.tab(tab_id, "text").startswith("Últimos Procesados"):
+                self.tabs.tab(tab_id, text=f"Últimos Procesados ({len(images)})")
+                break
+
+    def preview_processed_image(self, image):
+        """Vista previa de un sticker procesado con opciones de confirmar/descartar."""
+        if not image:
+            return
+        from app.indexer.thumbnails import load_thumbnail
+
+        preview = tk.Toplevel(self)
+        preview.title(f"Procesado: {image['name']}")
+        preview.geometry("1080x720")
+        preview.minsize(760, 520)
+        preview.configure(background="#080909")
+        preview.transient(self)
+        self.center_window(preview)
+        content = tk.Frame(preview, background="#080909")
+        content.pack(fill="both", expand=True, padx=16, pady=16)
+        visual = tk.Frame(content, background="#080909")
+        visual.pack(side="left", fill="both", expand=True)
+        photo = load_thumbnail(image["path"], (760, 650))
+        if photo:
+            label = ttk.Label(visual, image=photo, style="Card.TLabel")
+            label.image = photo
+            label.pack(expand=True)
+        else:
+            ttk.Label(visual, text="No se pudo generar la vista previa.", padding=24).pack(expand=True)
+
+        details = tk.Frame(content, width=290, background="#1c1c1c")
+        details.pack(side="right", fill="y", padx=(16, 0))
+        details.pack_propagate(False)
+        tk.Label(details, text="Sticker Procesado", background="#1c1c1c", foreground="#f3e0d2", 
+                 font=("Bahnschrift SemiCondensed", 13, "bold")).pack(pady=(14, 10))
+        
+        # Información del sticker
+        source = Path(image["path"])
+        stat = source.stat()
+        dimensions = self.image_dimensions(source)
+        entries = (
+            ("Archivo", image["name"]),
+            ("Dimensiones", dimensions),
+            ("Tamaño", self.human_size(stat.st_size)),
+            ("Estado", image.get("status", "Desconocido")),
+        )
+        for title, value in entries:
+            row = tk.Frame(details, background="#1c1c1c")
+            row.pack(fill="x", padx=14, pady=3)
+            tk.Label(row, text=f"{title}:", background="#1c1c1c", foreground="#7a6a5e", 
+                     font=("Bahnschrift SemiCondensed", 10)).pack(side="left")
+            tk.Label(row, text=str(value)[:30], background="#1c1c1c", foreground="#f3e0d2", 
+                     font=("Bahnschrift SemiCondensed", 10, "bold")).pack(side="right")
+        
+        # Botones de acción
+        actions_frame = tk.Frame(details, background="#1c1c1c")
+        actions_frame.pack(fill="x", padx=14, pady=(20, 0))
+        
+        ttk.Button(actions_frame, text="Confirmar y agregar a biblioteca", 
+                   command=lambda: self.approve_single_processed(image, preview),
+                   style="Primary.TButton").pack(fill="x", pady=(0, 8))
+        ttk.Button(actions_frame, text="Descartar", 
+                   command=lambda: self.discard_single_processed(image, preview),
+                   style="Danger.TButton").pack(fill="x")
+
+    def approve_single_processed(self, image, preview_window=None):
+        """Aprueba un sticker procesado individual y lo agrega a la biblioteca."""
+        job_id = image.get("job_id")
+        if not job_id:
+            messagebox.showerror("Error", "No se pudo identificar el sticker.", parent=self)
+            return
+        
+        # Obtener el trabajo de la base de datos
+        jobs = self.database.sticker_processing_jobs(limit=1000)
+        job = next((j for j in jobs if j["id"] == job_id), None)
+        if not job:
+            messagebox.showerror("Error", "No se encontró el sticker procesado.", parent=self)
+            return
+        
+        # Obtener los artefactos
+        artifacts = json.loads(job.get("artifacts", "{}"))
+        if not artifacts:
+            messagebox.showerror("Error", "No se encontraron artefactos del sticker.", parent=self)
+            return
+        
+        # Crear el resultado para approve_processed_sticker
+        result = {
+            "job_id": job_id,
+            "artifacts": artifacts,
+        }
+        
+        # Aprobar y agregar a la biblioteca
+        category = job.get("category", "")
+        tags = json.loads(job.get("tags", "[]"))
+        
+        try:
+            self.database.approve_processed_sticker(result, category, tags)
+            self.status.set(f"Sticker aprobado y agregado a la biblioteca.")
+            if preview_window:
+                preview_window.destroy()
+            self.refresh_processed_gallery()
+            self.refresh(self.search.query.get())
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo aprobar el sticker:\n{e}", parent=self)
+
+    def discard_single_processed(self, image, preview_window=None):
+        """Descarta un sticker procesado individual."""
+        job_id = image.get("job_id")
+        if not job_id:
+            return
+        
+        if not messagebox.askyesno("Confirmar descarte", 
+                                    "¿Estás seguro de que quieres descartar este sticker?",
+                                    parent=self):
+            return
+        
+        try:
+            self.database.set_sticker_processing_status(job_id, "Descartado")
+            self.status.set("Sticker descartado.")
+            if preview_window:
+                preview_window.destroy()
+            self.refresh_processed_gallery()
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo descartar el sticker:\n{e}", parent=self)
+
+    def approve_all_processed(self):
+        """Aprueba todos los stickers procesados pendientes."""
+        processed = self.database.pending_processed_stickers(limit=100)
+        if not processed:
+            messagebox.showinfo("Sin stickers", "No hay stickers procesados pendientes.", parent=self)
+            return
+        
+        if not messagebox.askyesno("Confirmar", 
+                                    f"¿Estás seguro de que quieres aprobar {len(processed)} stickers?\n\n"
+                                    "Todos serán agregados a la biblioteca principal.",
+                                    parent=self):
+            return
+        
+        approved = 0
+        for job in processed:
+            try:
+                artifacts = json.loads(job.get("artifacts", "{}"))
+                if artifacts:
+                    result = {
+                        "job_id": job["id"],
+                        "artifacts": artifacts,
+                    }
+                    category = job.get("category", "")
+                    tags = json.loads(job.get("tags", "[]"))
+                    self.database.approve_processed_sticker(result, category, tags)
+                    approved += 1
+            except Exception:
+                continue
+        
+        self.status.set(f"{approved} de {len(processed)} stickers aprobados.")
+        self.refresh_processed_gallery()
+        self.refresh(self.search.query.get())
+
+    def discard_all_processed(self):
+        """Descarta todos los stickers procesados pendientes."""
+        processed = self.database.pending_processed_stickers(limit=100)
+        if not processed:
+            messagebox.showinfo("Sin stickers", "No hay stickers procesados pendientes.", parent=self)
+            return
+        
+        if not messagebox.askyesno("Confirmar", 
+                                    f"¿Estás seguro de que quieres descartar {len(processed)} stickers?\n\n"
+                                    "Esta acción no se puede deshacer.",
+                                    parent=self):
+            return
+        
+        discarded = 0
+        for job in processed:
+            try:
+                self.database.set_sticker_processing_status(job["id"], "Descartado")
+                discarded += 1
+            except Exception:
+                continue
+        
+        self.status.set(f"{discarded} de {len(processed)} stickers descartados.")
+        self.refresh_processed_gallery()
+
+    def discard_processed_sticker(self, image):
+        """Descarta un sticker procesado desde la galería."""
+        self.discard_single_processed(image)
 
     # Durante una edición anterior estos métodos quedaron dentro de este
     # ayudante de exportación. Al instalarlos explícitamente en la clase se
