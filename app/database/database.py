@@ -476,16 +476,22 @@ class ImageDatabase:
         ):
             if column not in plancha_columns:
                 self.connection.execute(f"ALTER TABLE plancha_projects ADD COLUMN {column} {definition}")
-        # Migración: asignar production_status basado en el estado actual
-        self.connection.execute(
-            """UPDATE plancha_projects SET production_status = CASE
-                WHEN COALESCE(final_png_path, '') = '' AND COALESCE(project_path, '') = '' THEN 'borrador'
-                WHEN COALESCE(final_png_path, '') = '' THEN 'guardada'
-                WHEN print_status = 'Impresa' THEN 'impresa'
-                ELSE 'lista'
-            END
-            WHERE production_status = 'borrador' OR production_status IS NULL"""
-        )
+        # Migración: asignar production_status basado en el estado actual.
+        # Evitar el escaneo completo cuando no existen filas pendientes.
+        _pending_planchas = self.connection.execute(
+            "SELECT 1 FROM plancha_projects "
+            "WHERE production_status = 'borrador' OR production_status IS NULL LIMIT 1"
+        ).fetchone()
+        if _pending_planchas:
+            self.connection.execute(
+                """UPDATE plancha_projects SET production_status = CASE
+                    WHEN COALESCE(final_png_path, '') = '' AND COALESCE(project_path, '') = '' THEN 'borrador'
+                    WHEN COALESCE(final_png_path, '') = '' THEN 'guardada'
+                    WHEN print_status = 'Impresa' THEN 'impresa'
+                    ELSE 'lista'
+                END
+                WHERE production_status = 'borrador' OR production_status IS NULL"""
+            )
         # Producciones continuas: solo conservan referencias a planchas A4
         # guardadas. No duplican ni modifican los PNG originales.
         self.connection.execute(
@@ -607,102 +613,6 @@ class ImageDatabase:
             "ON variable_cost_models(product_key) WHERE active = 1 AND product_key != ''"
         )
 
-        # --- Sistema de eventos y notificaciones push ---
-        self.connection.execute(
-            """CREATE TABLE IF NOT EXISTS app_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_uuid TEXT NOT NULL UNIQUE,
-                event_type TEXT NOT NULL,
-                priority TEXT NOT NULL DEFAULT 'normal',
-                title TEXT NOT NULL,
-                message TEXT NOT NULL,
-                entity_type TEXT,
-                entity_id INTEGER,
-                payload_json TEXT,
-                created_at TEXT NOT NULL,
-                processed INTEGER NOT NULL DEFAULT 0
-            )"""
-        )
-        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_app_events_type ON app_events(event_type, created_at DESC)")
-        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_app_events_processed ON app_events(processed, created_at DESC)")
-        self.connection.execute(
-            """CREATE TABLE IF NOT EXISTS notification_outbox (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_uuid TEXT NOT NULL,
-                channel TEXT NOT NULL DEFAULT 'push',
-                recipient_id TEXT,
-                status TEXT NOT NULL DEFAULT 'pending',
-                attempts INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT,
-                next_attempt_at TEXT,
-                sent_at TEXT,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(event_uuid) REFERENCES app_events(event_uuid)
-            )"""
-        )
-        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_outbox_status ON notification_outbox(status, next_attempt_at)")
-        self.connection.execute(
-            """CREATE TABLE IF NOT EXISTS mobile_devices (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                device_name TEXT,
-                platform TEXT NOT NULL,
-                push_token TEXT NOT NULL UNIQUE,
-                active INTEGER NOT NULL DEFAULT 1,
-                last_seen_at TEXT,
-                created_at TEXT NOT NULL
-            )"""
-        )
-        self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_mobile_devices_token ON mobile_devices(push_token)")
-        self.connection.execute(
-            """CREATE TABLE IF NOT EXISTS device_notification_prefs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                device_id INTEGER NOT NULL,
-                event_type TEXT NOT NULL,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                FOREIGN KEY(device_id) REFERENCES mobile_devices(id),
-                UNIQUE(device_id, event_type)
-            )"""
-        )
-        # Códigos de emparejamiento temporales (uso único, expiran en 5 min, almacenados como hash)
-        self.connection.execute(
-            """CREATE TABLE IF NOT EXISTS pairing_codes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                code_hash TEXT NOT NULL UNIQUE,
-                installation_id TEXT NOT NULL DEFAULT 'studio-principal',
-                used INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                expires_at TEXT NOT NULL
-            )"""
-        )
-        # Historial de etapas de producción para auditoría
-        self.connection.execute(
-            """CREATE TABLE IF NOT EXISTS production_stage_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                job_id INTEGER NOT NULL,
-                order_id INTEGER NOT NULL,
-                old_stage TEXT,
-                new_stage TEXT NOT NULL,
-                device_id INTEGER,
-                device_name TEXT,
-                operator_name TEXT,
-                source TEXT NOT NULL DEFAULT 'mobile',
-                notes TEXT DEFAULT '',
-                changed_at TEXT NOT NULL,
-                FOREIGN KEY(job_id) REFERENCES order_jobs(id),
-                FOREIGN KEY(order_id) REFERENCES orders(id),
-                FOREIGN KEY(device_id) REFERENCES mobile_devices(id)
-            )"""
-        )
-        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_production_history_job ON production_stage_history(job_id, changed_at DESC)")
-        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_production_history_order ON production_stage_history(order_id, changed_at DESC)")
-        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_production_history_device ON production_stage_history(device_id, changed_at DESC)")
-        # Idempotencia del outbox: evitar mensajes duplicados al mismo dispositivo
-        self.connection.execute(
-            """CREATE UNIQUE INDEX IF NOT EXISTS idx_notification_outbox_event_device
-               ON notification_outbox(event_uuid, recipient_id, channel)"""
-        )
-        
         # ── Migraciones de esquema (ejecutar antes de crear EventRepository) ──
         self._migrate_order_clients()
         self._migrate_order_jobs()
@@ -923,6 +833,13 @@ class ImageDatabase:
 
     def _migrate_mobile_devices(self) -> None:
         """Agrega columnas de session token a mobile_devices si no existen."""
+        # La tabla mobile_devices la crea EventRepository.create_tables() después
+        # de esta migración. Si aún no existe, no hay nada que migrar.
+        table_exists = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='mobile_devices'"
+        ).fetchone()
+        if not table_exists:
+            return
         # Verificar columnas existentes
         existing_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(mobile_devices)")}
         
@@ -943,6 +860,13 @@ class ImageDatabase:
 
     def _migrate_pairing_codes(self) -> None:
         """Migra pairing_codes de código en texto plano a hash SHA-256."""
+        # La tabla pairing_codes la crea EventRepository.create_tables() después
+        # de esta migración. Si aún no existe, no hay nada que migrar.
+        table_exists = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pairing_codes'"
+        ).fetchone()
+        if not table_exists:
+            return
         # Verificar si la columna code_hash existe
         existing_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(pairing_codes)")}
         
@@ -1077,6 +1001,85 @@ class ImageDatabase:
         )
         self.connection.commit()
         self.add_order_event(order_id, "Estado", f"Estado actualizado a: {status}.")
+
+    def update_order_priority(self, order_id: int, print_priority: int) -> dict:
+        from datetime import datetime
+
+        print_priority = min(4, max(0, int(print_priority or 0)))
+        now = datetime.now().isoformat(timespec="seconds")
+        self.connection.execute(
+            "UPDATE orders SET print_priority = ?, updated_at = ? WHERE id = ?",
+            (print_priority, now, order_id),
+        )
+        self.connection.commit()
+        self.add_order_event(order_id, "Prioridad", f"Prioridad actualizada a: {print_priority}.")
+        row = self.connection.execute(
+            "SELECT id, print_priority, updated_at FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        return dict(row) if row else {"id": order_id, "print_priority": print_priority, "updated_at": now}
+
+    def update_job_fields(self, order_id: int, job_id: int, quantity: int | None = None, size: str | None = None) -> dict:
+        from datetime import datetime
+
+        now = datetime.now().isoformat(timespec="seconds")
+        job = self.connection.execute(
+            "SELECT id, order_id, quantity, size FROM order_jobs WHERE id = ? AND order_id = ?",
+            (job_id, order_id),
+        ).fetchone()
+        if not job:
+            raise ValueError("Trabajo no encontrado en este pedido.")
+        new_quantity = max(1, int(quantity if quantity is not None else job["quantity"]))
+        new_size = str(size if size is not None else job["size"]).strip()
+        self.connection.execute(
+            "UPDATE order_jobs SET quantity = ?, size = ?, updated_at = ? WHERE id = ?",
+            (new_quantity, new_size, now, job_id),
+        )
+        self._sync_order_from_jobs(order_id, now)
+        self.connection.commit()
+        self.add_order_event(order_id, "Trabajo", f"Trabajo #{job_id}: cantidad={new_quantity}, tamaño={new_size}.")
+        row = self.connection.execute(
+            "SELECT id, quantity, size, updated_at FROM order_jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        return dict(row) if row else {"id": job_id, "quantity": new_quantity, "size": new_size, "updated_at": now}
+
+    def mark_order_delivered(self, order_id: int) -> dict:
+        from datetime import datetime
+
+        now = datetime.now().isoformat(timespec="seconds")
+        order = self.connection.execute(
+            "SELECT id, status FROM orders WHERE id = ? AND is_archived = 0", (order_id,)
+        ).fetchone()
+        if not order:
+            raise ValueError("Pedido no encontrado o archivado.")
+        current = order["status"]
+        if current == "Entregado":
+            raise ValueError("El pedido ya está marcado como Entregado.")
+        with self.connection:
+            self.connection.execute(
+                "UPDATE order_jobs SET status = 'Entregado', updated_at = ? WHERE order_id = ?",
+                (now, order_id),
+            )
+            self.connection.execute(
+                "UPDATE orders SET status = 'Entregado', updated_at = ? WHERE id = ?",
+                (now, order_id),
+            )
+        self.add_order_event(order_id, "Entrega", f"Pedido marcado como Entregado (estado anterior: {current}).")
+        try:
+            self.event_repo.publish_event(
+                event_type="order.delivered",
+                priority="high",
+                title="Pedido entregado",
+                message=f"Pedido #{order_id} marcado como Entregado",
+                entity_type="order",
+                entity_id=order_id,
+                payload={"old_status": current},
+            )
+        except Exception:
+            pass
+        row = self.connection.execute(
+            "SELECT id, status, updated_at FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        return dict(row) if row else {"id": order_id, "status": "Entregado", "updated_at": now}
 
     def archive_order(self, order_id: int) -> None:
         """Marca el pedido como Archivado sin eliminar ningún dato."""
