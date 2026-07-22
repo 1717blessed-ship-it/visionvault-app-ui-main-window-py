@@ -6763,9 +6763,39 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         PlanchaEditor(self, images_sorted, database=self.database, library_images=self.database.search(limit=10000), order_id=order_id)
 
     def build_production_module(self, parent):
-        """Panel de Producción: tabla de planchas + ficha lateral con detalle."""
-        # --- Header ---
-        header = tk.Frame(parent, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
+        """Panel de Producción: Notebook con Tablero por etapas y tabla de planchas."""
+        # --- Crear Notebook para múltiples vistas de producción ---
+        production_notebook = ttk.Notebook(parent)
+        production_notebook.pack(fill="both", expand=True)
+        
+        # --- Tab 1: Tablero por etapas ---
+        board_tab = tk.Frame(production_notebook, background=COLORS.background)
+        production_notebook.add(board_tab, text="Tablero por Etapas")
+        
+        # Importar y crear tablero
+        try:
+            from app.ui.production_board import ProductionBoardView
+            self.production_board = ProductionBoardView(board_tab, self.database)
+            self.production_board.pack(fill="both", expand=True)
+            
+            # Binding para manejar selección de pedido desde el tablero
+            self.production_board.bind("<<OrderSelected>>", self._on_board_order_selected)
+        except Exception as e:
+            error_label = tk.Label(
+                board_tab,
+                text=f"Error al cargar tablero de producción:\n{e}",
+                background=COLORS.background,
+                foreground=COLORS.error,
+                font=(UI_FONT, 10),
+            )
+            error_label.pack(expand=True)
+        
+        # --- Tab 2: Planchas (vista existente) ---
+        planchas_tab = tk.Frame(production_notebook, background=COLORS.background)
+        production_notebook.add(planchas_tab, text="Planchas")
+        
+        # --- Header de Planchas ---
+        header = tk.Frame(planchas_tab, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
         header.pack(fill="x", padx=10, pady=(10, 8))
         header_content = tk.Frame(header, background=COLORS.panel)
         header_content.pack(fill="x", padx=14, pady=11)

@@ -31,9 +31,9 @@ class SyncStateRepository {
   }
 
   /// Set the current next cursor
-  Future<void> setCurrentNextCursor(String? cursor) async {
-    final db = await _dbHelper.database;
-    await db.update(
+  Future<void> setCurrentNextCursor(String? cursor, {Transaction? txn}) async {
+    final executor = txn ?? await _dbHelper.database;
+    await executor.update(
       'sync_state',
       {'current_next_cursor': cursor},
       where: 'id = ?',
@@ -83,9 +83,9 @@ class SyncStateRepository {
   }
 
   /// Complete a full sync (clear cursor, update snapshot)
-  Future<void> completeSync(String snapshot) async {
-    final db = await _dbHelper.database;
-    await db.update(
+  Future<void> completeSync(String snapshot, {Transaction? txn}) async {
+    final executor = txn ?? await _dbHelper.database;
+    await executor.update(
       'sync_state',
       {
         'last_completed_snapshot': snapshot,

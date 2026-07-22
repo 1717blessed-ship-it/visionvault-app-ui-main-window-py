@@ -40,7 +40,7 @@ class Client {
 
   factory Client.fromMap(Map<String, dynamic> map) {
     return Client(
-      id: map['id'] as String,
+      id: map['id'].toString(),
       name: map['name'] as String?,
       email: map['email'] as String?,
       phone: map['phone'] as String?,

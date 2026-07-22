@@ -64,8 +64,8 @@ class Job {
 
   factory Job.fromMap(Map<String, dynamic> map) {
     return Job(
-      id: map['id'] as String,
-      orderId: map['order_id'] as String?,
+      id: map['id'].toString(),
+      orderId: map['order_id']?.toString(),
       jobNumber: map['job_number'] as String?,
       title: map['title'] as String?,
       material: map['material'] as String?,
@@ -75,7 +75,7 @@ class Job {
       notes: map['notes'] as String?,
       sortOrder: map['sort_order'] as int?,
       priority: map['priority'] as String?,
-      clientId: map['client_id'] as String?,
+      clientId: map['client_id']?.toString(),
       assignedTo: map['assigned_to'] as String?,
       dueDate: map['due_date'] as String?,
       createdAt: map['created_at'] as String?,

@@ -89,9 +89,11 @@ def repo(temp_db):
     
     # Agregar columnas faltantes en orders
     existing_order_columns = {row[1] for row in conn.execute("PRAGMA table_info(orders)")}
-    for column in ("order_concept", "order_description"):
+    for column in ("order_concept", "order_description", "discount_percent",
+                    "budget_total", "paid_amount", "payment_status"):
         if column not in existing_order_columns:
-            conn.execute(f"ALTER TABLE orders ADD COLUMN {column} TEXT DEFAULT ''")
+            default = "0" if column in ("discount_percent", "budget_total", "paid_amount") else "'Pendiente'" if column == "payment_status" else "''"
+            conn.execute(f"ALTER TABLE orders ADD COLUMN {column} TEXT DEFAULT {default}")
     
     conn.execute(
         """CREATE TABLE IF NOT EXISTS order_jobs (
@@ -115,6 +117,17 @@ def repo(temp_db):
             event_type TEXT NOT NULL,
             message TEXT NOT NULL,
             data_json TEXT,
+            created_at TEXT NOT NULL
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS order_payments (
+            id INTEGER PRIMARY KEY,
+            order_id INTEGER NOT NULL,
+            amount REAL NOT NULL,
+            method TEXT DEFAULT '',
+            note TEXT DEFAULT '',
+            paid_at TEXT NOT NULL,
             created_at TEXT NOT NULL
         )"""
     )
@@ -1235,4 +1248,475 @@ class TestServerBindConfiguration:
 
         handler.do_GET()
 
+        handler._send_error.assert_called_once_with(401, "Authorization header missing")
+
+
+# ── Tests para Quick-Edit Endpoints ─────────────────────────────────────────
+
+def _make_handler_with_body(repo, event_bus, session_token, path, body_dict):
+    """Helper: crea un handler con body JSON simulado."""
+    handler = create_handler(repo, event_bus)
+    handler.headers = {"Authorization": f"Bearer {session_token}"}
+    handler.path = path
+    body_data = json.dumps(body_dict).encode("utf-8")
+    handler.headers["Content-Length"] = str(len(body_data))
+    handler.rfile = BytesIO(body_data)
+    return handler
+
+
+# ── PATCH /orders/{id}/status ──────────────────────────────────────────────
+
+class TestUpdateOrderStatus:
+    """Tests para PATCH /api/v1/mobile/orders/{id}/status."""
+
+    def test_update_status_success(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          f"/api/v1/mobile/orders/{sample_order}/status",
+                                          {"status": "En producción"})
+        handler._update_order_status(sample_order, device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert data["success"] is True
+        assert data["order"]["status"] == "En producción"
+
+    def test_update_status_not_found(self, repo, event_bus, sample_device):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          "/api/v1/mobile/orders/99999/status",
+                                          {"status": "Finalizado"})
+        handler._update_order_status(99999, device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert "error" in data
+        assert "not found" in data["error"].lower()
+
+    def test_update_status_invalid_value(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          f"/api/v1/mobile/orders/{sample_order}/status",
+                                          {"status": "ValorInvalido"})
+        handler._update_order_status(sample_order, device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert "error" in data
+        assert "Invalid status" in data["error"]
+
+    def test_update_status_missing_field(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          f"/api/v1/mobile/orders/{sample_order}/status",
+                                          {})
+        handler._update_order_status(sample_order, device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert "error" in data
+        assert "required" in data["error"]
+
+    def test_update_status_empty_body(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = f"/api/v1/mobile/orders/{sample_order}/status"
+        handler.headers["Content-Length"] = "0"
+        handler.rfile = BytesIO(b"")
+        handler._update_order_status(sample_order, device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert "error" in data
+        assert "body is required" in data["error"]
+
+
+# ── PATCH /orders/{id}/priority ─────────────────────────────────────────────
+
+class TestUpdateOrderPriority:
+    """Tests para PATCH /api/v1/mobile/orders/{id}/priority."""
+
+    def test_update_priority_success(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          f"/api/v1/mobile/orders/{sample_order}/priority",
+                                          {"print_priority": 3})
+        handler._update_order_priority(sample_order, device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert data["success"] is True
+        assert data["order"]["print_priority"] == 3
+
+    def test_update_priority_clamp_low(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          f"/api/v1/mobile/orders/{sample_order}/priority",
+                                          {"print_priority": -5})
+        handler._update_order_priority(sample_order, device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert "error" in data
+        assert "between 0 and 4" in data["error"]
+
+    def test_update_priority_clamp_high(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          f"/api/v1/mobile/orders/{sample_order}/priority",
+                                          {"print_priority": 10})
+        handler._update_order_priority(sample_order, device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert "error" in data
+        assert "between 0 and 4" in data["error"]
+
+    def test_update_priority_not_found(self, repo, event_bus, sample_device):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          "/api/v1/mobile/orders/99999/priority",
+                                          {"print_priority": 2})
+        handler._update_order_priority(99999, device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert "error" in data
+
+    def test_update_priority_missing_field(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          f"/api/v1/mobile/orders/{sample_order}/priority",
+                                          {})
+        handler._update_order_priority(sample_order, device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert "error" in data
+        assert "required" in data["error"]
+
+    def test_update_priority_not_integer(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          f"/api/v1/mobile/orders/{sample_order}/priority",
+                                          {"print_priority": "alta"})
+        handler._update_order_priority(sample_order, device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert "error" in data
+        assert "integer" in data["error"]
+
+
+# ── PATCH /orders/{oid}/jobs/{jid} ─────────────────────────────────────────
+
+class TestUpdateJobFields:
+    """Tests para PATCH /api/v1/mobile/orders/{oid}/jobs/{jid}."""
+
+    def test_update_quantity_success(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        conn = repo.conn
+        job = conn.execute("SELECT id FROM order_jobs WHERE order_id = ? LIMIT 1", (sample_order,)).fetchone()
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          f"/api/v1/mobile/orders/{sample_order}/jobs/{job['id']}",
+                                          {"quantity": 25})
+        handler._update_job_fields(sample_order, job["id"], device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert data["success"] is True
+        assert data["job"]["quantity"] == 25
+
+    def test_update_size_success(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        conn = repo.conn
+        job = conn.execute("SELECT id FROM order_jobs WHERE order_id = ? LIMIT 1", (sample_order,)).fetchone()
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          f"/api/v1/mobile/orders/{sample_order}/jobs/{job['id']}",
+                                          {"size": "20cm"})
+        handler._update_job_fields(sample_order, job["id"], device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert data["success"] is True
+        assert data["job"]["size"] == "20cm"
+
+    def test_update_both_fields(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        conn = repo.conn
+        job = conn.execute("SELECT id FROM order_jobs WHERE order_id = ? LIMIT 1", (sample_order,)).fetchone()
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          f"/api/v1/mobile/orders/{sample_order}/jobs/{job['id']}",
+                                          {"quantity": 50, "size": "15cm"})
+        handler._update_job_fields(sample_order, job["id"], device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert data["success"] is True
+        assert data["job"]["quantity"] == 50
+        assert data["job"]["size"] == "15cm"
+
+    def test_quantity_floor_at_one(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        conn = repo.conn
+        job = conn.execute("SELECT id FROM order_jobs WHERE order_id = ? LIMIT 1", (sample_order,)).fetchone()
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          f"/api/v1/mobile/orders/{sample_order}/jobs/{job['id']}",
+                                          {"quantity": -3})
+        handler._update_job_fields(sample_order, job["id"], device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert data["success"] is True
+        assert data["job"]["quantity"] == 1
+
+    def test_job_not_found(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          f"/api/v1/mobile/orders/{sample_order}/jobs/99999",
+                                          {"quantity": 5})
+        handler._update_job_fields(sample_order, 99999, device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert "error" in data
+        assert "not found" in data["error"].lower()
+
+    def test_missing_all_fields(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        conn = repo.conn
+        job = conn.execute("SELECT id FROM order_jobs WHERE order_id = ? LIMIT 1", (sample_order,)).fetchone()
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          f"/api/v1/mobile/orders/{sample_order}/jobs/{job['id']}",
+                                          {})
+        handler._update_job_fields(sample_order, job["id"], device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert "error" in data
+        assert "required" in data["error"]
+
+    def test_order_total_quantity_updates(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        conn = repo.conn
+        job = conn.execute("SELECT id FROM order_jobs WHERE order_id = ? LIMIT 1", (sample_order,)).fetchone()
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          f"/api/v1/mobile/orders/{sample_order}/jobs/{job['id']}",
+                                          {"quantity": 99})
+        handler._update_job_fields(sample_order, job["id"], device)
+
+        # sample_order has 3 jobs with qty 5 each (total 15). Changing one to 99 → 99+5+5 = 109
+        order_row = conn.execute("SELECT quantity FROM orders WHERE id = ?", (sample_order,)).fetchone()
+        assert order_row["quantity"] == 109
+
+
+# ── POST /orders/{id}/payments ──────────────────────────────────────────────
+
+class TestRegisterPayment:
+    """Tests para POST /api/v1/mobile/orders/{id}/payments."""
+
+    def test_register_payment_success(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          f"/api/v1/mobile/orders/{sample_order}/payments",
+                                          {"amount": 2500, "method": "Efectivo"})
+        handler._register_payment(sample_order, device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert data["success"] is True
+        assert data["payment"]["amount"] == 2500.0
+        assert data["payment"]["method"] == "Efectivo"
+        assert "financials" in data
+
+    def test_register_payment_not_found(self, repo, event_bus, sample_device):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          "/api/v1/mobile/orders/99999/payments",
+                                          {"amount": 1000})
+        handler._register_payment(99999, device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert "error" in data
+
+    def test_register_payment_zero_amount(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          f"/api/v1/mobile/orders/{sample_order}/payments",
+                                          {"amount": 0})
+        handler._register_payment(sample_order, device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert "error" in data
+        assert "greater than zero" in data["error"]
+
+    def test_register_payment_negative_amount(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          f"/api/v1/mobile/orders/{sample_order}/payments",
+                                          {"amount": -100})
+        handler._register_payment(sample_order, device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert "error" in data
+
+    def test_register_payment_missing_amount(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          f"/api/v1/mobile/orders/{sample_order}/payments",
+                                          {"method": "Transferencia"})
+        handler._register_payment(sample_order, device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert "error" in data
+        assert "required" in data["error"]
+
+    def test_payment_creates_event(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          f"/api/v1/mobile/orders/{sample_order}/payments",
+                                          {"amount": 1500, "method": "MP"})
+        handler._register_payment(sample_order, device)
+
+        events = repo.conn.execute(
+            "SELECT * FROM order_events WHERE order_id = ? AND event_type = 'payment.received'",
+            (sample_order,),
+        ).fetchall()
+        assert len(events) >= 1
+
+
+# ── POST /orders/{id}/deliver ───────────────────────────────────────────────
+
+class TestMarkDelivered:
+    """Tests para POST /api/v1/mobile/orders/{id}/deliver."""
+
+    def test_mark_delivered_success(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        repo.conn.execute(
+            "UPDATE order_jobs SET status = 'Finalizado' WHERE order_id = ?", (sample_order,)
+        )
+        repo.conn.commit()
+
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = f"/api/v1/mobile/orders/{sample_order}/deliver"
+        handler._mark_delivered(sample_order, device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert data["success"] is True
+        assert data["order"]["status"] == "Entregado"
+
+    def test_mark_delivered_not_found(self, repo, event_bus, sample_device):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = "/api/v1/mobile/orders/99999/deliver"
+        handler._mark_delivered(99999, device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert "error" in data
+        assert "not found" in data["error"].lower()
+
+    def test_mark_delivered_creates_event(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = f"/api/v1/mobile/orders/{sample_order}/deliver"
+        handler._mark_delivered(sample_order, device)
+
+        events = repo.conn.execute(
+            "SELECT * FROM order_events WHERE order_id = ? AND event_type = 'order.delivered'",
+            (sample_order,),
+        ).fetchall()
+        assert len(events) >= 1
+
+    def test_mark_delivered_all_jobs_entregado_status(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = f"/api/v1/mobile/orders/{sample_order}/deliver"
+        handler._mark_delivered(sample_order, device)
+
+        jobs = repo.conn.execute(
+            "SELECT status FROM order_jobs WHERE order_id = ?", (sample_order,)
+        ).fetchall()
+        assert all(j["status"] == "Entregado" for j in jobs)
+
+
+# ── do_PATCH routing ────────────────────────────────────────────────────────
+
+class TestDoPATCHRouting:
+    """Verifica que do_PATCH enruta correctamente."""
+
+    def test_patch_status_routes_correctly(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          f"/api/v1/mobile/orders/{sample_order}/status",
+                                          {"status": "Finalizado"})
+        handler.do_PATCH()
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert data["success"] is True
+
+    def test_patch_priority_routes_correctly(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          f"/api/v1/mobile/orders/{sample_order}/priority",
+                                          {"print_priority": 1})
+        handler.do_PATCH()
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert data["success"] is True
+
+    def test_patch_unknown_returns_404(self, repo, event_bus, sample_device):
+        device_id, session_token = sample_device
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = "/api/v1/mobile/orders/1/unknown"
+        handler.do_PATCH()
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert "error" in data
+        assert "not found" in data["error"].lower()
+
+    def test_post_deliver_routes_correctly(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        handler = create_handler(repo, event_bus)
+        handler.headers = {"Authorization": f"Bearer {session_token}"}
+        handler.path = f"/api/v1/mobile/orders/{sample_order}/deliver"
+        handler.headers["Content-Length"] = "2"
+        handler.rfile = BytesIO(b"{}")
+        handler.do_POST()
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert data["success"] is True
+
+    def test_post_payment_routes_correctly(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        handler = _make_handler_with_body(repo, event_bus, session_token,
+                                          f"/api/v1/mobile/orders/{sample_order}/payments",
+                                          {"amount": 500})
+        handler.do_POST()
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert data["success"] is True
+
+
+# ── Auth check for do_PATCH ─────────────────────────────────────────────────
+
+class TestDoPATCHRequiresAuth:
+    """Verifica que do_PATCH requiere autenticación."""
+
+    def test_patch_requires_auth(self, repo, event_bus, sample_order):
+        handler = create_handler(repo, event_bus)
+        handler.headers = {}
+        handler.path = f"/api/v1/mobile/orders/{sample_order}/status"
+        handler._send_error = Mock()
+        handler.do_PATCH()
         handler._send_error.assert_called_once_with(401, "Authorization header missing")

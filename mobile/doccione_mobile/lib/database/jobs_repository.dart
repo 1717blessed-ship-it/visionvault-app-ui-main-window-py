@@ -9,11 +9,11 @@ class JobsRepository {
   JobsRepository(this._dbHelper);
 
   /// Upsert a single job (insert or update if exists)
-  Future<void> upsertJob(Map<String, dynamic> jobData) async {
-    final db = await _dbHelper.database;
+  Future<void> upsertJob(Map<String, dynamic> jobData, {Transaction? txn}) async {
+    final executor = txn ?? await _dbHelper.database;
     final job = Job.fromMap(jobData);
-    
-    await db.insert(
+
+    await executor.insert(
       'jobs',
       job.toMap(),
       conflictAlgorithm: ConflictAlgorithm.replace,
@@ -21,9 +21,9 @@ class JobsRepository {
   }
 
   /// Upsert multiple jobs in a batch operation
-  Future<void> upsertJobs(List<Map<String, dynamic>> jobsData) async {
-    final db = await _dbHelper.database;
-    final batch = db.batch();
+  Future<void> upsertJobs(List<Map<String, dynamic>> jobsData, {Transaction? txn}) async {
+    final executor = txn ?? await _dbHelper.database;
+    final batch = executor.batch();
 
     for (final jobData in jobsData) {
       final job = Job.fromMap(jobData);

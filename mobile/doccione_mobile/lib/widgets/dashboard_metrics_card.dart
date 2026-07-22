@@ -5,10 +5,12 @@ import '../screens/orders_list_screen.dart';
 /// Widget that displays dashboard metrics in a card
 class DashboardMetricsCard extends StatelessWidget {
   final DashboardMetrics metrics;
+  final String? sessionToken;
 
   const DashboardMetricsCard({
     super.key,
     required this.metrics,
+    this.sessionToken,
   });
 
   @override
@@ -113,6 +115,7 @@ class DashboardMetricsCard extends StatelessWidget {
                 MaterialPageRoute(
                   builder: (context) => OrdersListScreen(
                     initialStatus: filterStatus,
+                    sessionToken: sessionToken,
                   ),
                 ),
               );

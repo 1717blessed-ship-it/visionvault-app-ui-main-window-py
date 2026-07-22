@@ -246,7 +246,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 ),
               )
             else
-              DashboardMetricsCard(metrics: _metrics),
+              DashboardMetricsCard(metrics: _metrics, sessionToken: widget.sessionToken),
             
             const SizedBox(height: 16),
 
@@ -258,7 +258,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   Navigator.push(
                     context,
                     MaterialPageRoute(
-                      builder: (context) => const OrdersListScreen(),
+                      builder: (context) => OrdersListScreen(sessionToken: widget.sessionToken),
                     ),
                   );
                 },

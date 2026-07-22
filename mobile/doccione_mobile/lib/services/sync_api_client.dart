@@ -193,7 +193,7 @@ class SyncApiClient {
     };
 
     if (authToken != null) {
-      headers['Authorization'] = 'Bearer \$authToken';
+      headers['Authorization'] = 'Bearer $authToken';
     }
 
     return headers;

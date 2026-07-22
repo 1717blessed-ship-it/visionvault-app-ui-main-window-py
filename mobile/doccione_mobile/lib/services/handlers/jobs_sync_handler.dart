@@ -1,3 +1,4 @@
+import 'package:sqflite/sqflite.dart';
 import '../../database/jobs_repository.dart';
 import 'sync_entity_handler.dart';
 
@@ -11,8 +12,8 @@ class JobsSyncHandler implements SyncEntityHandler {
   String get entityType => 'jobs';
 
   @override
-  Future<void> process(List<Map<String, dynamic>> items) async {
+  Future<void> process(List<Map<String, dynamic>> items, {Transaction? txn}) async {
     if (items.isEmpty) return;
-    await _repository.upsertJobs(items);
+    await _repository.upsertJobs(items, txn: txn);
   }
 }

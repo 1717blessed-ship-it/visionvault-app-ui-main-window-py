@@ -1,0 +1,1235 @@
+{
+  "total_queries": 105,
+  "total_time_ms": 1443.513999998686,
+  "queries": [
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS images ( path TEXT PRIMARY KEY, name TEXT NOT NULL, extension TEXT NOT NULL, size INTEGER NOT NULL, modified REAL NOT NULL, caption TEXT DEFAULT '' )",
+      "location": "database.py:100(__init__)",
+      "elapsed_ms": 1.3314000025275163,
+      "timestamp": 44701.0735336
+    },
+    {
+      "sql": "PRAGMA table_info(images)",
+      "location": "database.py:106(__init__)",
+      "elapsed_ms": 0.11949999316129833,
+      "timestamp": 44701.073772
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE)",
+      "location": "database.py:139(__init__)",
+      "elapsed_ms": 0.07000000186963007,
+      "timestamp": 44701.0739509
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS image_tags ( image_path TEXT NOT NULL, tag_id INTEGER NOT NULL, PRIMARY KEY (image_path, tag_id), FOREIGN KEY (image_path) REFERENCES images(path), FOREIGN KEY (tag_id) REFERENCES tags(id) )",
+      "location": "database.py:140(__init__)",
+      "elapsed_ms": 0.06299999949987978,
+      "timestamp": 44701.074084
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_image_tags_path ON image_tags(image_path)",
+      "location": "database.py:148(__init__)",
+      "elapsed_ms": 0.052600000344682485,
+      "timestamp": 44701.0742
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_image_tags_tag ON image_tags(tag_id)",
+      "location": "database.py:149(__init__)",
+      "elapsed_ms": 0.04870000702794641,
+      "timestamp": 44701.0743092
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_images_modified ON images(modified DESC)",
+      "location": "database.py:150(__init__)",
+      "elapsed_ms": 0.04719999560620636,
+      "timestamp": 44701.0744219
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_images_category ON images(category)",
+      "location": "database.py:151(__init__)",
+      "elapsed_ms": 0.04980000085197389,
+      "timestamp": 44701.0745338
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS visual_similarities ( query_path TEXT NOT NULL, candidate_path TEXT NOT NULL, score REAL NOT NULL, query_modified REAL NOT NULL, candidate_modified REAL NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(query_path, candidate_path) )",
+      "location": "database.py:152(__init__)",
+      "elapsed_ms": 0.04810000245925039,
+      "timestamp": 44701.0746423
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_visual_similarities_query ON visual_similarities(query_path, score DESC)",
+      "location": "database.py:160(__init__)",
+      "elapsed_ms": 0.047900000936351717,
+      "timestamp": 44701.0747482
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS ai_results ( image_path TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, modified REAL NOT NULL, result TEXT NOT NULL, PRIMARY KEY (image_path, provider, model) )",
+      "location": "database.py:161(__init__)",
+      "elapsed_ms": 0.04799999442184344,
+      "timestamp": 44701.0748546
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS dismissed_ai_tags ( image_path TEXT NOT NULL, tag TEXT NOT NULL COLLATE NOCASE, PRIMARY KEY (image_path, tag) )",
+      "location": "database.py:168(__init__)",
+      "elapsed_ms": 0.04690000059781596,
+      "timestamp": 44701.0749606
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS sticker_processing_jobs ( id TEXT PRIMARY KEY, source_path TEXT NOT NULL, status TEXT NOT NULL, engine TEXT DEFAULT '', analysis TEXT DEFAULT '{}', quality_status TEXT DEFAULT '', quality_notes TEXT DEFAULT '[]', profile TEXT DEFAULT '{}', artifacts TEXT DEFAULT '{}', cate",
+      "location": "database.py:175(__init__)",
+      "elapsed_ms": 0.04949999856762588,
+      "timestamp": 44701.075073
+    },
+    {
+      "sql": "PRAGMA table_info(sticker_processing_jobs)",
+      "location": "database.py:185(__init__)",
+      "elapsed_ms": 0.04909999552182853,
+      "timestamp": 44701.0751803
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS sticker_artifacts ( job_id TEXT NOT NULL, kind TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY(job_id, kind), FOREIGN KEY(job_id) REFERENCES sticker_processing_jobs(id) )",
+      "location": "database.py:188(__init__)",
+      "elapsed_ms": 0.04730000364361331,
+      "timestamp": 44701.075303
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_sticker_jobs_status ON sticker_processing_jobs(status, updated_at DESC)",
+      "location": "database.py:195(__init__)",
+      "elapsed_ms": 0.04650000482797623,
+      "timestamp": 44701.0754071
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS plancha_usage ( id INTEGER PRIMARY KEY, image_path TEXT NOT NULL, client TEXT DEFAULT '', order_number TEXT DEFAULT '', size_cm REAL NOT NULL, quantity INTEGER NOT NULL, used_at TEXT NOT NULL, source TEXT NOT NULL )",
+      "location": "database.py:196(__init__)",
+      "elapsed_ms": 0.04739999712910503,
+      "timestamp": 44701.0755127
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_plancha_usage_path ON plancha_usage(image_path)",
+      "location": "database.py:205(__init__)",
+      "elapsed_ms": 0.045000000682193786,
+      "timestamp": 44701.0756145
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS orders ( id INTEGER PRIMARY KEY, client TEXT NOT NULL, whatsapp TEXT DEFAULT '', order_date TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Nuevo', material TEXT DEFAULT '', size TEXT DEFAULT '', quantity INTEGER DEFAULT 0, price REAL DEFAULT 0, observations TEXT DEFAULT '', ",
+      "location": "database.py:206(__init__)",
+      "elapsed_ms": 0.04839999746764079,
+      "timestamp": 44701.0757231
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS clients ( id INTEGER PRIMARY KEY, name TEXT NOT NULL, whatsapp TEXT DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL )",
+      "location": "database.py:219(__init__)",
+      "elapsed_ms": 0.04479999915929511,
+      "timestamp": 44701.0758259
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX IF NOT EXISTS idx_clients_identity ON clients(name COLLATE NOCASE, whatsapp)",
+      "location": "database.py:226(__init__)",
+      "elapsed_ms": 0.047599998652003706,
+      "timestamp": 44701.0759298
+    },
+    {
+      "sql": "PRAGMA table_info(clients)",
+      "location": "database.py:231(__init__)",
+      "elapsed_ms": 0.04489999992074445,
+      "timestamp": 44701.0760313
+    },
+    {
+      "sql": "PRAGMA table_info(orders)",
+      "location": "database.py:234(__init__)",
+      "elapsed_ms": 0.05660000169882551,
+      "timestamp": 44701.0761564
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)",
+      "location": "database.py:262(__init__)",
+      "elapsed_ms": 0.04489999992074445,
+      "timestamp": 44701.076297
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_orders_date ON orders(order_date DESC)",
+      "location": "database.py:263(__init__)",
+      "elapsed_ms": 0.04520000220509246,
+      "timestamp": 44701.0764012
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS order_jobs ( id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL, title TEXT NOT NULL DEFAULT 'Trabajo', material TEXT DEFAULT '', size TEXT DEFAULT '', quantity INTEGER NOT NULL DEFAULT 1, subtotal REAL NOT NULL DEFAULT 0, discount_percent REAL NOT NULL DEFAULT 0, extra_ser",
+      "location": "database.py:267(__init__)",
+      "elapsed_ms": 0.05469999450724572,
+      "timestamp": 44701.0765241
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_order_jobs_order ON order_jobs(order_id, sort_order, id)",
+      "location": "database.py:282(__init__)",
+      "elapsed_ms": 0.04690000059781596,
+      "timestamp": 44701.0766317
+    },
+    {
+      "sql": "PRAGMA table_info(order_jobs)",
+      "location": "database.py:286(__init__)",
+      "elapsed_ms": 0.05280000186758116,
+      "timestamp": 44701.0767439
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS cost_rules ( id INTEGER PRIMARY KEY, name TEXT NOT NULL, condition TEXT DEFAULT '', material TEXT DEFAULT '', -- Materia Prima: puede ser % del precio O fijo + por unidad cost_mp_mode TEXT DEFAULT 'percent', cost_mp_percent REAL DEFAULT 0, cost_mp_fixed REAL DEFAULT 0, cos",
+      "location": "database.py:297(__init__)",
+      "elapsed_ms": 0.06739999662386253,
+      "timestamp": 44701.0769012
+    },
+    {
+      "sql": "PRAGMA table_info(cost_rules)",
+      "location": "database.py:327(__init__)",
+      "elapsed_ms": 0.05070000042906031,
+      "timestamp": 44701.0770118
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS order_designs ( order_id INTEGER NOT NULL, image_path TEXT NOT NULL, quantity INTEGER DEFAULT 1, size_cm REAL DEFAULT 5.9, rotation INTEGER DEFAULT 0, PRIMARY KEY(order_id, image_path), FOREIGN KEY(order_id) REFERENCES orders(id) )",
+      "location": "database.py:330(__init__)",
+      "elapsed_ms": 0.047900000936351717,
+      "timestamp": 44701.077138
+    },
+    {
+      "sql": "PRAGMA table_info(order_designs)",
+      "location": "database.py:338(__init__)",
+      "elapsed_ms": 0.04649999755201861,
+      "timestamp": 44701.0772424
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS order_drafts ( order_id INTEGER PRIMARY KEY, draft_json TEXT NOT NULL, saved_at TEXT NOT NULL, FOREIGN KEY(order_id) REFERENCES orders(id) )",
+      "location": "database.py:341(__init__)",
+      "elapsed_ms": 0.04549999721348286,
+      "timestamp": 44701.0773564
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS order_events ( id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL, event_type TEXT NOT NULL, message TEXT NOT NULL, data_json TEXT DEFAULT '', created_at TEXT NOT NULL, FOREIGN KEY(order_id) REFERENCES orders(id) )",
+      "location": "database.py:348(__init__)",
+      "elapsed_ms": 0.046600005589425564,
+      "timestamp": 44701.0774643
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_order_events_order ON order_events(order_id, id DESC)",
+      "location": "database.py:356(__init__)",
+      "elapsed_ms": 0.047299996367655694,
+      "timestamp": 44701.07757
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS order_payments ( id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL, amount REAL NOT NULL, method TEXT DEFAULT '', note TEXT DEFAULT '', paid_at TEXT NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY(order_id) REFERENCES orders(id) )",
+      "location": "database.py:359(__init__)",
+      "elapsed_ms": 0.04730000364361331,
+      "timestamp": 44701.077679
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_order_payments_order ON order_payments(order_id, paid_at DESC)",
+      "location": "database.py:367(__init__)",
+      "elapsed_ms": 0.04669999907491729,
+      "timestamp": 44701.0777865
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS order_previews ( id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL, plancha_id INTEGER, preview_path TEXT NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY(order_id) REFERENCES orders(id), FOREIGN KEY(plancha_id) REFERENCES plancha_projects(id) )",
+      "location": "database.py:370(__init__)",
+      "elapsed_ms": 0.04739999712910503,
+      "timestamp": 44701.0778936
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_order_previews_order ON order_previews(order_id, created_at DESC)",
+      "location": "database.py:378(__init__)",
+      "elapsed_ms": 0.045900000259280205,
+      "timestamp": 44701.0779973
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS design_preparations ( id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL, original_path TEXT NOT NULL, work_path TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'En edición', source_modified REAL DEFAULT 0, work_modified REAL DEFAULT 0, created_at TEXT NOT NULL, updated_",
+      "location": "database.py:383(__init__)",
+      "elapsed_ms": 0.05249999958323315,
+      "timestamp": 44701.0781197
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_design_preparations_order ON design_preparations(order_id, id DESC)",
+      "location": "database.py:394(__init__)",
+      "elapsed_ms": 0.047299996367655694,
+      "timestamp": 44701.0782259
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS collections ( id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE, description TEXT DEFAULT '', created_at TEXT NOT NULL )",
+      "location": "database.py:397(__init__)",
+      "elapsed_ms": 0.04579999949783087,
+      "timestamp": 44701.0783313
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS image_collections ( image_path TEXT NOT NULL, collection_id INTEGER NOT NULL, PRIMARY KEY(image_path, collection_id), FOREIGN KEY(collection_id) REFERENCES collections(id) )",
+      "location": "database.py:403(__init__)",
+      "elapsed_ms": 0.049700000090524554,
+      "timestamp": 44701.0784434
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS price_rules ( id INTEGER PRIMARY KEY, material TEXT DEFAULT '', size TEXT DEFAULT '', min_quantity INTEGER DEFAULT 1, price REAL NOT NULL, extra_service TEXT DEFAULT '', discount_percent REAL DEFAULT 0, active INTEGER DEFAULT 1, price_mode TEXT DEFAULT 'fijo', pack_quantit",
+      "location": "database.py:410(__init__)",
+      "elapsed_ms": 0.049299997044727206,
+      "timestamp": 44701.0785541
+    },
+    {
+      "sql": "PRAGMA table_info(price_rules)",
+      "location": "database.py:419(__init__)",
+      "elapsed_ms": 0.053099996875971556,
+      "timestamp": 44701.0786669
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_price_rules_catalog ON price_rules(catalog_key)",
+      "location": "database.py:443(__init__)",
+      "elapsed_ms": 0.0470000013592653,
+      "timestamp": 44701.0787965
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS plancha_projects ( id INTEGER PRIMARY KEY, order_id INTEGER, name TEXT NOT NULL, client_color TEXT DEFAULT '', material TEXT DEFAULT '', project_json TEXT NOT NULL, approval_status TEXT DEFAULT 'Borrador', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(ord",
+      "location": "database.py:444(__init__)",
+      "elapsed_ms": 0.054700001783203334,
+      "timestamp": 44701.0789165
+    },
+    {
+      "sql": "PRAGMA table_info(plancha_projects)",
+      "location": "database.py:452(__init__)",
+      "elapsed_ms": 0.0543000060133636,
+      "timestamp": 44701.0790293
+    },
+    {
+      "sql": "UPDATE plancha_projects SET production_status = CASE WHEN COALESCE(final_png_path, '') = '' AND COALESCE(project_path, '') = '' THEN 'borrador' WHEN COALESCE(final_png_path, '') = '' THEN 'guardada' WHEN print_status = 'Impresa' THEN 'impresa' ELSE 'lista' END WHERE production_status = 'borrador' OR",
+      "location": "database.py:480(__init__)",
+      "elapsed_ms": 2.446900005452335,
+      "timestamp": 44701.0816295
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS continuous_productions ( id INTEGER PRIMARY KEY, name TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'Hoja', width_cm REAL NOT NULL DEFAULT 21, length_cm REAL NOT NULL DEFAULT 29.7, material TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'Pendiente', production_json TEXT NOT NUL",
+      "location": "database.py:491(__init__)",
+      "elapsed_ms": 0.021599997126031667,
+      "timestamp": 44701.0817218
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_continuous_productions_status ON continuous_productions(status, updated_at DESC)",
+      "location": "database.py:500(__init__)",
+      "elapsed_ms": 0.0109999964479357,
+      "timestamp": 44701.0817936
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS app_settings ( setting_key TEXT PRIMARY KEY, setting_value TEXT NOT NULL, updated_at TEXT NOT NULL )",
+      "location": "database.py:511(__init__)",
+      "elapsed_ms": 0.007399998139590025,
+      "timestamp": 44701.081861
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS print_jobs ( id INTEGER PRIMARY KEY, plancha_id INTEGER NOT NULL, order_id INTEGER, parent_job_id INTEGER, user_name TEXT DEFAULT '', printer_name TEXT NOT NULL, configuration_json TEXT NOT NULL, copies INTEGER NOT NULL DEFAULT 1, priority INTEGER NOT NULL DEFAULT 0, deliv",
+      "location": "database.py:517(__init__)",
+      "elapsed_ms": 0.014999997802078724,
+      "timestamp": 44701.0820051
+    },
+    {
+      "sql": "PRAGMA table_info(print_jobs)",
+      "location": "database.py:530(__init__)",
+      "elapsed_ms": 0.01819999306462705,
+      "timestamp": 44701.0820839
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_print_jobs_status ON print_jobs(status, priority DESC, created_at)",
+      "location": "database.py:533(__init__)",
+      "elapsed_ms": 0.010299998393747956,
+      "timestamp": 44701.082173
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS print_history ( id INTEGER PRIMARY KEY, print_job_id INTEGER NOT NULL, plancha_id INTEGER NOT NULL, order_id INTEGER, user_name TEXT DEFAULT '', printer_name TEXT NOT NULL, configuration_json TEXT NOT NULL, copies INTEGER NOT NULL, status TEXT NOT NULL, message TEXT DEFAUL",
+      "location": "database.py:534(__init__)",
+      "elapsed_ms": 0.009999996109399945,
+      "timestamp": 44701.0822406
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS variable_cost_models ( id INTEGER PRIMARY KEY, name TEXT NOT NULL, product_id INTEGER DEFAULT NULL, product_name TEXT DEFAULT '', category TEXT DEFAULT '', active INTEGER DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL )",
+      "location": "database.py:544(__init__)",
+      "elapsed_ms": 0.009900002623908222,
+      "timestamp": 44701.0823065
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS variable_cost_components ( id INTEGER PRIMARY KEY, model_id INTEGER NOT NULL, name TEXT NOT NULL DEFAULT '', category TEXT DEFAULT '', origin TEXT DEFAULT 'manual', source_id INTEGER DEFAULT NULL, calc_mode TEXT DEFAULT 'per_unit', quantity REAL DEFAULT 0, unit_value REAL ",
+      "location": "database.py:556(__init__)",
+      "elapsed_ms": 0.01460000203223899,
+      "timestamp": 44701.0823804
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_vcm_product ON variable_cost_models(product_id)",
+      "location": "database.py:578(__init__)",
+      "elapsed_ms": 0.008100003469735384,
+      "timestamp": 44701.0824429
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_vcc_model ON variable_cost_components(model_id)",
+      "location": "database.py:579(__init__)",
+      "elapsed_ms": 0.007099995855242014,
+      "timestamp": 44701.082503
+    },
+    {
+      "sql": "PRAGMA table_info(variable_cost_models)",
+      "location": "database.py:582(__init__)",
+      "elapsed_ms": 0.012999997125007212,
+      "timestamp": 44701.0825702
+    },
+    {
+      "sql": "PRAGMA table_info(variable_cost_components)",
+      "location": "database.py:590(__init__)",
+      "elapsed_ms": 0.01340000017080456,
+      "timestamp": 44701.0826471
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_vcm_product_key ON variable_cost_models(product_key)",
+      "location": "database.py:600(__init__)",
+      "elapsed_ms": 0.006800000846851617,
+      "timestamp": 44701.0827304
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_vcm_active ON variable_cost_models(active)",
+      "location": "database.py:601(__init__)",
+      "elapsed_ms": 0.006599999323952943,
+      "timestamp": 44701.0827904
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_vcc_source ON variable_cost_components(source_id)",
+      "location": "database.py:602(__init__)",
+      "elapsed_ms": 0.007700000423938036,
+      "timestamp": 44701.0828534
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_vcc_active ON variable_cost_components(active)",
+      "location": "database.py:603(__init__)",
+      "elapsed_ms": 0.006400005077011883,
+      "timestamp": 44701.0829111
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX IF NOT EXISTS idx_vcm_unique_active_key ON variable_cost_models(product_key) WHERE active = 1 AND product_key != ''",
+      "location": "database.py:605(__init__)",
+      "elapsed_ms": 0.008600000001024455,
+      "timestamp": 44701.082973
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS app_events ( id INTEGER PRIMARY KEY AUTOINCREMENT, event_uuid TEXT NOT NULL UNIQUE, event_type TEXT NOT NULL, priority TEXT NOT NULL DEFAULT 'normal', title TEXT NOT NULL, message TEXT NOT NULL, entity_type TEXT, entity_id INTEGER, payload_json TEXT, created_at TEXT NOT NU",
+      "location": "database.py:611(__init__)",
+      "elapsed_ms": 0.008900002285372466,
+      "timestamp": 44701.0830366
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_app_events_type ON app_events(event_type, created_at DESC)",
+      "location": "database.py:626(__init__)",
+      "elapsed_ms": 0.007799993909429759,
+      "timestamp": 44701.0831009
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_app_events_processed ON app_events(processed, created_at DESC)",
+      "location": "database.py:627(__init__)",
+      "elapsed_ms": 0.007000002369750291,
+      "timestamp": 44701.0831614
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS notification_outbox ( id INTEGER PRIMARY KEY AUTOINCREMENT, event_uuid TEXT NOT NULL, channel TEXT NOT NULL DEFAULT 'push', recipient_id TEXT, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, next_attempt_at TEXT, sent_at TEXT, ",
+      "location": "database.py:628(__init__)",
+      "elapsed_ms": 0.00979999458650127,
+      "timestamp": 44701.0832756
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_outbox_status ON notification_outbox(status, next_attempt_at)",
+      "location": "database.py:643(__init__)",
+      "elapsed_ms": 0.011799995263572782,
+      "timestamp": 44701.0833631
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS mobile_devices ( id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, device_name TEXT, platform TEXT NOT NULL, push_token TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1, last_seen_at TEXT, created_at TEXT NOT NULL )",
+      "location": "database.py:644(__init__)",
+      "elapsed_ms": 0.00960000033956021,
+      "timestamp": 44701.0834382
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX IF NOT EXISTS idx_mobile_devices_token ON mobile_devices(push_token)",
+      "location": "database.py:656(__init__)",
+      "elapsed_ms": 0.007700000423938036,
+      "timestamp": 44701.0835031
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS device_notification_prefs ( id INTEGER PRIMARY KEY AUTOINCREMENT, device_id INTEGER NOT NULL, event_type TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, FOREIGN KEY(device_id) REFERENCES mobile_devices(id), UNIQUE(device_id, event_type) )",
+      "location": "database.py:657(__init__)",
+      "elapsed_ms": 0.011399999493733048,
+      "timestamp": 44701.0835731
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS pairing_codes ( id INTEGER PRIMARY KEY AUTOINCREMENT, code_hash TEXT NOT NULL UNIQUE, installation_id TEXT NOT NULL DEFAULT 'studio-principal', used INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, expires_at TEXT NOT NULL )",
+      "location": "database.py:668(__init__)",
+      "elapsed_ms": 0.008499999239575118,
+      "timestamp": 44701.0836389
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS production_stage_history ( id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER NOT NULL, order_id INTEGER NOT NULL, old_stage TEXT, new_stage TEXT NOT NULL, device_id INTEGER, device_name TEXT, operator_name TEXT, source TEXT NOT NULL DEFAULT 'mobile', notes TEXT DEFAULT ",
+      "location": "database.py:679(__init__)",
+      "elapsed_ms": 0.012700002116616815,
+      "timestamp": 44701.083717
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_production_history_job ON production_stage_history(job_id, changed_at DESC)",
+      "location": "database.py:697(__init__)",
+      "elapsed_ms": 0.008299997716676444,
+      "timestamp": 44701.0837878
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_production_history_order ON production_stage_history(order_id, changed_at DESC)",
+      "location": "database.py:698(__init__)",
+      "elapsed_ms": 0.007599999662488699,
+      "timestamp": 44701.0838524
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_production_history_device ON production_stage_history(device_id, changed_at DESC)",
+      "location": "database.py:699(__init__)",
+      "elapsed_ms": 0.007099995855242014,
+      "timestamp": 44701.0839163
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX IF NOT EXISTS idx_notification_outbox_event_device ON notification_outbox(event_uuid, recipient_id, channel)",
+      "location": "database.py:701(__init__)",
+      "elapsed_ms": 0.007499998901039362,
+      "timestamp": 44701.0839785
+    },
+    {
+      "sql": "SELECT id, client, whatsapp FROM orders WHERE client_id IS NULL",
+      "location": "database.py:917(_migrate_order_clients)",
+      "elapsed_ms": 0.057000004744622856,
+      "timestamp": 44701.0841235
+    },
+    {
+      "sql": "SELECT orders.* FROM orders LEFT JOIN order_jobs ON order_jobs.order_id = orders.id WHERE order_jobs.id IS NULL",
+      "location": "database.py:819(_migrate_order_jobs)",
+      "elapsed_ms": 0.1021999996737577,
+      "timestamp": 44701.0843093
+    },
+    {
+      "sql": "PRAGMA table_info(mobile_devices)",
+      "location": "database.py:927(_migrate_mobile_devices)",
+      "elapsed_ms": 0.013199998647905886,
+      "timestamp": 44701.0843883
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX IF NOT EXISTS idx_mobile_devices_session ON mobile_devices(session_token_hash)",
+      "location": "database.py:942(_migrate_mobile_devices)",
+      "elapsed_ms": 0.009000003046821803,
+      "timestamp": 44701.0844694
+    },
+    {
+      "sql": "PRAGMA table_info(pairing_codes)",
+      "location": "database.py:947(_migrate_pairing_codes)",
+      "elapsed_ms": 0.01290000363951549,
+      "timestamp": 44701.0845423
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_orders_updated_id ON orders(updated_at, id)",
+      "location": "database.py:981(_migrate_sync_indexes)",
+      "elapsed_ms": 0.007400005415547639,
+      "timestamp": 44701.0846145
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_order_jobs_updated_id ON order_jobs(updated_at, id)",
+      "location": "database.py:984(_migrate_sync_indexes)",
+      "elapsed_ms": 0.006900001608300954,
+      "timestamp": 44701.0846772
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_clients_updated_id ON clients(updated_at, id)",
+      "location": "database.py:987(_migrate_sync_indexes)",
+      "elapsed_ms": 0.006499998562503606,
+      "timestamp": 44701.084743
+    },
+    {
+      "sql": "SELECT setting_value FROM app_settings WHERE setting_key = ?",
+      "location": "database.py:2923(app_setting)",
+      "elapsed_ms": 0.03340000694151968,
+      "timestamp": 44701.0848475
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS app_events ( id INTEGER PRIMARY KEY AUTOINCREMENT, event_uuid TEXT NOT NULL UNIQUE, event_type TEXT NOT NULL, priority TEXT NOT NULL DEFAULT 'normal', title TEXT NOT NULL, message TEXT NOT NULL, entity_type TEXT, entity_id INTEGER, payload_json TEXT, created_at TEXT NOT NU",
+      "location": "event_repository.py:26(create_tables)",
+      "elapsed_ms": 0.07829999958630651,
+      "timestamp": 44701.0853654
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_app_events_type ON app_events(event_type, created_at DESC)",
+      "location": "event_repository.py:41(create_tables)",
+      "elapsed_ms": 0.05680000322172418,
+      "timestamp": 44701.0854955
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_app_events_processed ON app_events(processed, created_at DESC)",
+      "location": "event_repository.py:44(create_tables)",
+      "elapsed_ms": 0.05219999729888514,
+      "timestamp": 44701.0856174
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS notification_outbox ( id INTEGER PRIMARY KEY AUTOINCREMENT, event_uuid TEXT NOT NULL, channel TEXT NOT NULL DEFAULT 'push', recipient_id TEXT, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, next_attempt_at TEXT, sent_at TEXT, ",
+      "location": "event_repository.py:47(create_tables)",
+      "elapsed_ms": 0.04239999543642625,
+      "timestamp": 44701.0857251
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_outbox_status ON notification_outbox(status, next_attempt_at)",
+      "location": "event_repository.py:62(create_tables)",
+      "elapsed_ms": 0.040700004319660366,
+      "timestamp": 44701.0858249
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX IF NOT EXISTS idx_notification_outbox_event_device ON notification_outbox(event_uuid, recipient_id, channel)",
+      "location": "event_repository.py:66(create_tables)",
+      "elapsed_ms": 0.04020000051241368,
+      "timestamp": 44701.0859246
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS mobile_devices ( id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, device_name TEXT, platform TEXT NOT NULL, push_token TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1, last_seen_at TEXT, created_at TEXT NOT NULL )",
+      "location": "event_repository.py:70(create_tables)",
+      "elapsed_ms": 0.040899998566601425,
+      "timestamp": 44701.0860261
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX IF NOT EXISTS idx_mobile_devices_token ON mobile_devices(push_token)",
+      "location": "event_repository.py:82(create_tables)",
+      "elapsed_ms": 0.04020000051241368,
+      "timestamp": 44701.0861253
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS device_notification_prefs ( id INTEGER PRIMARY KEY AUTOINCREMENT, device_id INTEGER NOT NULL, event_type TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, FOREIGN KEY(device_id) REFERENCES mobile_devices(id), UNIQUE(device_id, event_type) )",
+      "location": "event_repository.py:86(create_tables)",
+      "elapsed_ms": 0.040099999750964344,
+      "timestamp": 44701.0862262
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS pairing_codes ( id INTEGER PRIMARY KEY AUTOINCREMENT, code_hash TEXT NOT NULL UNIQUE, installation_id TEXT NOT NULL DEFAULT 'studio-principal', used INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, expires_at TEXT NOT NULL )",
+      "location": "event_repository.py:97(create_tables)",
+      "elapsed_ms": 0.04069999704370275,
+      "timestamp": 44701.0863269
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS production_stage_history ( id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER NOT NULL, order_id INTEGER NOT NULL, old_stage TEXT, new_stage TEXT NOT NULL, device_id INTEGER, device_name TEXT, operator_name TEXT, source TEXT NOT NULL DEFAULT 'mobile', notes TEXT DEFAULT ",
+      "location": "event_repository.py:108(create_tables)",
+      "elapsed_ms": 0.0408000050811097,
+      "timestamp": 44701.086429
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_production_history_job ON production_stage_history(job_id, changed_at DESC)",
+      "location": "event_repository.py:126(create_tables)",
+      "elapsed_ms": 0.041399995097890496,
+      "timestamp": 44701.0865279
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_production_history_order ON production_stage_history(order_id, changed_at DESC)",
+      "location": "event_repository.py:129(create_tables)",
+      "elapsed_ms": 0.039699996705166996,
+      "timestamp": 44701.0866245
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_production_history_device ON production_stage_history(device_id, changed_at DESC)",
+      "location": "event_repository.py:132(create_tables)",
+      "elapsed_ms": 0.03949999518226832,
+      "timestamp": 44701.0867235
+    },
+    {
+      "sql": "SELECT orders.*, COALESCE(clients.name, orders.client) AS client_name, COALESCE(clients.client_type, 'Particular') AS client_type, COALESCE(metrics.design_count, 0) AS design_count, COALESCE(metrics.assigned_quantity, 0) AS assigned_quantity, COALESCE(metrics.confirmed_count, 0) AS confirmed_count, ",
+      "location": "database.py:1063(orders)",
+      "elapsed_ms": 0.7135999985621311,
+      "timestamp": 44701.892417
+    }
+  ],
+  "duplicates": [
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS app_events ( id INTEGER PRIMARY KEY AUTOINCREMENT, event_uuid TEXT NOT NULL UNIQUE, event_type TEXT NOT NULL, priority TEXT NOT NULL DEFAULT 'normal', title TEXT NOT NULL, message TEXT NOT NULL, entity_type TEXT, entity_id INTEGER, payload_json TEXT, created_at TEXT NOT NU",
+      "count": 2,
+      "total_ms": 0.08720000187167898
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_app_events_type ON app_events(event_type, created_at DESC)",
+      "count": 2,
+      "total_ms": 0.06459999713115394
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_app_events_processed ON app_events(processed, created_at DESC)",
+      "count": 2,
+      "total_ms": 0.05919999966863543
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS notification_outbox ( id INTEGER PRIMARY KEY AUTOINCREMENT, event_uuid TEXT NOT NULL, channel TEXT NOT NULL DEFAULT 'push', recipient_id TEXT, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, next_attempt_at TEXT, sent_at TEXT, ",
+      "count": 2,
+      "total_ms": 0.05219999002292752
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_outbox_status ON notification_outbox(status, next_attempt_at)",
+      "count": 2,
+      "total_ms": 0.05249999958323315
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS mobile_devices ( id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, device_name TEXT, platform TEXT NOT NULL, push_token TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1, last_seen_at TEXT, created_at TEXT NOT NULL )",
+      "count": 2,
+      "total_ms": 0.050499998906161636
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX IF NOT EXISTS idx_mobile_devices_token ON mobile_devices(push_token)",
+      "count": 2,
+      "total_ms": 0.047900000936351717
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS device_notification_prefs ( id INTEGER PRIMARY KEY AUTOINCREMENT, device_id INTEGER NOT NULL, event_type TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, FOREIGN KEY(device_id) REFERENCES mobile_devices(id), UNIQUE(device_id, event_type) )",
+      "count": 2,
+      "total_ms": 0.05149999924469739
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS pairing_codes ( id INTEGER PRIMARY KEY AUTOINCREMENT, code_hash TEXT NOT NULL UNIQUE, installation_id TEXT NOT NULL DEFAULT 'studio-principal', used INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, expires_at TEXT NOT NULL )",
+      "count": 2,
+      "total_ms": 0.04919999628327787
+    },
+    {
+      "sql": "CREATE TABLE IF NOT EXISTS production_stage_history ( id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER NOT NULL, order_id INTEGER NOT NULL, old_stage TEXT, new_stage TEXT NOT NULL, device_id INTEGER, device_name TEXT, operator_name TEXT, source TEXT NOT NULL DEFAULT 'mobile', notes TEXT DEFAULT ",
+      "count": 2,
+      "total_ms": 0.05350000719772652
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_production_history_job ON production_stage_history(job_id, changed_at DESC)",
+      "count": 2,
+      "total_ms": 0.04969999281456694
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_production_history_order ON production_stage_history(order_id, changed_at DESC)",
+      "count": 2,
+      "total_ms": 0.047299996367655694
+    },
+    {
+      "sql": "CREATE INDEX IF NOT EXISTS idx_production_history_device ON production_stage_history(device_id, changed_at DESC)",
+      "count": 2,
+      "total_ms": 0.046599991037510335
+    },
+    {
+      "sql": "CREATE UNIQUE INDEX IF NOT EXISTS idx_notification_outbox_event_device ON notification_outbox(event_uuid, recipient_id, channel)",
+      "count": 2,
+      "total_ms": 0.04769999941345304
+    }
+  ],
+  "by_function": [
+    {
+      "location": "database.py:100(__init__)",
+      "count": 1,
+      "total_ms": 1.3314000025275163
+    },
+    {
+      "location": "database.py:106(__init__)",
+      "count": 1,
+      "total_ms": 0.11949999316129833
+    },
+    {
+      "location": "database.py:139(__init__)",
+      "count": 1,
+      "total_ms": 0.07000000186963007
+    },
+    {
+      "location": "database.py:140(__init__)",
+      "count": 1,
+      "total_ms": 0.06299999949987978
+    },
+    {
+      "location": "database.py:148(__init__)",
+      "count": 1,
+      "total_ms": 0.052600000344682485
+    },
+    {
+      "location": "database.py:149(__init__)",
+      "count": 1,
+      "total_ms": 0.04870000702794641
+    },
+    {
+      "location": "database.py:150(__init__)",
+      "count": 1,
+      "total_ms": 0.04719999560620636
+    },
+    {
+      "location": "database.py:151(__init__)",
+      "count": 1,
+      "total_ms": 0.04980000085197389
+    },
+    {
+      "location": "database.py:152(__init__)",
+      "count": 1,
+      "total_ms": 0.04810000245925039
+    },
+    {
+      "location": "database.py:160(__init__)",
+      "count": 1,
+      "total_ms": 0.047900000936351717
+    },
+    {
+      "location": "database.py:161(__init__)",
+      "count": 1,
+      "total_ms": 0.04799999442184344
+    },
+    {
+      "location": "database.py:168(__init__)",
+      "count": 1,
+      "total_ms": 0.04690000059781596
+    },
+    {
+      "location": "database.py:175(__init__)",
+      "count": 1,
+      "total_ms": 0.04949999856762588
+    },
+    {
+      "location": "database.py:185(__init__)",
+      "count": 1,
+      "total_ms": 0.04909999552182853
+    },
+    {
+      "location": "database.py:188(__init__)",
+      "count": 1,
+      "total_ms": 0.04730000364361331
+    },
+    {
+      "location": "database.py:195(__init__)",
+      "count": 1,
+      "total_ms": 0.04650000482797623
+    },
+    {
+      "location": "database.py:196(__init__)",
+      "count": 1,
+      "total_ms": 0.04739999712910503
+    },
+    {
+      "location": "database.py:205(__init__)",
+      "count": 1,
+      "total_ms": 0.045000000682193786
+    },
+    {
+      "location": "database.py:206(__init__)",
+      "count": 1,
+      "total_ms": 0.04839999746764079
+    },
+    {
+      "location": "database.py:219(__init__)",
+      "count": 1,
+      "total_ms": 0.04479999915929511
+    },
+    {
+      "location": "database.py:226(__init__)",
+      "count": 1,
+      "total_ms": 0.047599998652003706
+    },
+    {
+      "location": "database.py:231(__init__)",
+      "count": 1,
+      "total_ms": 0.04489999992074445
+    },
+    {
+      "location": "database.py:234(__init__)",
+      "count": 1,
+      "total_ms": 0.05660000169882551
+    },
+    {
+      "location": "database.py:262(__init__)",
+      "count": 1,
+      "total_ms": 0.04489999992074445
+    },
+    {
+      "location": "database.py:263(__init__)",
+      "count": 1,
+      "total_ms": 0.04520000220509246
+    },
+    {
+      "location": "database.py:267(__init__)",
+      "count": 1,
+      "total_ms": 0.05469999450724572
+    },
+    {
+      "location": "database.py:282(__init__)",
+      "count": 1,
+      "total_ms": 0.04690000059781596
+    },
+    {
+      "location": "database.py:286(__init__)",
+      "count": 1,
+      "total_ms": 0.05280000186758116
+    },
+    {
+      "location": "database.py:297(__init__)",
+      "count": 1,
+      "total_ms": 0.06739999662386253
+    },
+    {
+      "location": "database.py:327(__init__)",
+      "count": 1,
+      "total_ms": 0.05070000042906031
+    },
+    {
+      "location": "database.py:330(__init__)",
+      "count": 1,
+      "total_ms": 0.047900000936351717
+    },
+    {
+      "location": "database.py:338(__init__)",
+      "count": 1,
+      "total_ms": 0.04649999755201861
+    },
+    {
+      "location": "database.py:341(__init__)",
+      "count": 1,
+      "total_ms": 0.04549999721348286
+    },
+    {
+      "location": "database.py:348(__init__)",
+      "count": 1,
+      "total_ms": 0.046600005589425564
+    },
+    {
+      "location": "database.py:356(__init__)",
+      "count": 1,
+      "total_ms": 0.047299996367655694
+    },
+    {
+      "location": "database.py:359(__init__)",
+      "count": 1,
+      "total_ms": 0.04730000364361331
+    },
+    {
+      "location": "database.py:367(__init__)",
+      "count": 1,
+      "total_ms": 0.04669999907491729
+    },
+    {
+      "location": "database.py:370(__init__)",
+      "count": 1,
+      "total_ms": 0.04739999712910503
+    },
+    {
+      "location": "database.py:378(__init__)",
+      "count": 1,
+      "total_ms": 0.045900000259280205
+    },
+    {
+      "location": "database.py:383(__init__)",
+      "count": 1,
+      "total_ms": 0.05249999958323315
+    },
+    {
+      "location": "database.py:394(__init__)",
+      "count": 1,
+      "total_ms": 0.047299996367655694
+    },
+    {
+      "location": "database.py:397(__init__)",
+      "count": 1,
+      "total_ms": 0.04579999949783087
+    },
+    {
+      "location": "database.py:403(__init__)",
+      "count": 1,
+      "total_ms": 0.049700000090524554
+    },
+    {
+      "location": "database.py:410(__init__)",
+      "count": 1,
+      "total_ms": 0.049299997044727206
+    },
+    {
+      "location": "database.py:419(__init__)",
+      "count": 1,
+      "total_ms": 0.053099996875971556
+    },
+    {
+      "location": "database.py:443(__init__)",
+      "count": 1,
+      "total_ms": 0.0470000013592653
+    },
+    {
+      "location": "database.py:444(__init__)",
+      "count": 1,
+      "total_ms": 0.054700001783203334
+    },
+    {
+      "location": "database.py:452(__init__)",
+      "count": 1,
+      "total_ms": 0.0543000060133636
+    },
+    {
+      "location": "database.py:480(__init__)",
+      "count": 1,
+      "total_ms": 2.446900005452335
+    },
+    {
+      "location": "database.py:491(__init__)",
+      "count": 1,
+      "total_ms": 0.021599997126031667
+    },
+    {
+      "location": "database.py:500(__init__)",
+      "count": 1,
+      "total_ms": 0.0109999964479357
+    },
+    {
+      "location": "database.py:511(__init__)",
+      "count": 1,
+      "total_ms": 0.007399998139590025
+    },
+    {
+      "location": "database.py:517(__init__)",
+      "count": 1,
+      "total_ms": 0.014999997802078724
+    },
+    {
+      "location": "database.py:530(__init__)",
+      "count": 1,
+      "total_ms": 0.01819999306462705
+    },
+    {
+      "location": "database.py:533(__init__)",
+      "count": 1,
+      "total_ms": 0.010299998393747956
+    },
+    {
+      "location": "database.py:534(__init__)",
+      "count": 1,
+      "total_ms": 0.009999996109399945
+    },
+    {
+      "location": "database.py:544(__init__)",
+      "count": 1,
+      "total_ms": 0.009900002623908222
+    },
+    {
+      "location": "database.py:556(__init__)",
+      "count": 1,
+      "total_ms": 0.01460000203223899
+    },
+    {
+      "location": "database.py:578(__init__)",
+      "count": 1,
+      "total_ms": 0.008100003469735384
+    },
+    {
+      "location": "database.py:579(__init__)",
+      "count": 1,
+      "total_ms": 0.007099995855242014
+    },
+    {
+      "location": "database.py:582(__init__)",
+      "count": 1,
+      "total_ms": 0.012999997125007212
+    },
+    {
+      "location": "database.py:590(__init__)",
+      "count": 1,
+      "total_ms": 0.01340000017080456
+    },
+    {
+      "location": "database.py:600(__init__)",
+      "count": 1,
+      "total_ms": 0.006800000846851617
+    },
+    {
+      "location": "database.py:601(__init__)",
+      "count": 1,
+      "total_ms": 0.006599999323952943
+    },
+    {
+      "location": "database.py:602(__init__)",
+      "count": 1,
+      "total_ms": 0.007700000423938036
+    },
+    {
+      "location": "database.py:603(__init__)",
+      "count": 1,
+      "total_ms": 0.006400005077011883
+    },
+    {
+      "location": "database.py:605(__init__)",
+      "count": 1,
+      "total_ms": 0.008600000001024455
+    },
+    {
+      "location": "database.py:611(__init__)",
+      "count": 1,
+      "total_ms": 0.008900002285372466
+    },
+    {
+      "location": "database.py:626(__init__)",
+      "count": 1,
+      "total_ms": 0.007799993909429759
+    },
+    {
+      "location": "database.py:627(__init__)",
+      "count": 1,
+      "total_ms": 0.007000002369750291
+    },
+    {
+      "location": "database.py:628(__init__)",
+      "count": 1,
+      "total_ms": 0.00979999458650127
+    },
+    {
+      "location": "database.py:643(__init__)",
+      "count": 1,
+      "total_ms": 0.011799995263572782
+    },
+    {
+      "location": "database.py:644(__init__)",
+      "count": 1,
+      "total_ms": 0.00960000033956021
+    },
+    {
+      "location": "database.py:656(__init__)",
+      "count": 1,
+      "total_ms": 0.007700000423938036
+    },
+    {
+      "location": "database.py:657(__init__)",
+      "count": 1,
+      "total_ms": 0.011399999493733048
+    },
+    {
+      "location": "database.py:668(__init__)",
+      "count": 1,
+      "total_ms": 0.008499999239575118
+    },
+    {
+      "location": "database.py:679(__init__)",
+      "count": 1,
+      "total_ms": 0.012700002116616815
+    },
+    {
+      "location": "database.py:697(__init__)",
+      "count": 1,
+      "total_ms": 0.008299997716676444
+    },
+    {
+      "location": "database.py:698(__init__)",
+      "count": 1,
+      "total_ms": 0.007599999662488699
+    },
+    {
+      "location": "database.py:699(__init__)",
+      "count": 1,
+      "total_ms": 0.007099995855242014
+    },
+    {
+      "location": "database.py:701(__init__)",
+      "count": 1,
+      "total_ms": 0.007499998901039362
+    },
+    {
+      "location": "database.py:917(_migrate_order_clients)",
+      "count": 1,
+      "total_ms": 0.057000004744622856
+    },
+    {
+      "location": "database.py:819(_migrate_order_jobs)",
+      "count": 1,
+      "total_ms": 0.1021999996737577
+    },
+    {
+      "location": "database.py:927(_migrate_mobile_devices)",
+      "count": 1,
+      "total_ms": 0.013199998647905886
+    },
+    {
+      "location": "database.py:942(_migrate_mobile_devices)",
+      "count": 1,
+      "total_ms": 0.009000003046821803
+    },
+    {
+      "location": "database.py:947(_migrate_pairing_codes)",
+      "count": 1,
+      "total_ms": 0.01290000363951549
+    },
+    {
+      "location": "database.py:981(_migrate_sync_indexes)",
+      "count": 1,
+      "total_ms": 0.007400005415547639
+    },
+    {
+      "location": "database.py:984(_migrate_sync_indexes)",
+      "count": 1,
+      "total_ms": 0.006900001608300954
+    },
+    {
+      "location": "database.py:987(_migrate_sync_indexes)",
+      "count": 1,
+      "total_ms": 0.006499998562503606
+    },
+    {
+      "location": "database.py:2923(app_setting)",
+      "count": 1,
+      "total_ms": 0.03340000694151968
+    },
+    {
+      "location": "event_repository.py:26(create_tables)",
+      "count": 1,
+      "total_ms": 0.07829999958630651
+    },
+    {
+      "location": "event_repository.py:41(create_tables)",
+      "count": 1,
+      "total_ms": 0.05680000322172418
+    },
+    {
+      "location": "event_repository.py:44(create_tables)",
+      "count": 1,
+      "total_ms": 0.05219999729888514
+    },
+    {
+      "location": "event_repository.py:47(create_tables)",
+      "count": 1,
+      "total_ms": 0.04239999543642625
+    },
+    {
+      "location": "event_repository.py:62(create_tables)",
+      "count": 1,
+      "total_ms": 0.040700004319660366
+    },
+    {
+      "location": "event_repository.py:66(create_tables)",
+      "count": 1,
+      "total_ms": 0.04020000051241368
+    },
+    {
+      "location": "event_repository.py:70(create_tables)",
+      "count": 1,
+      "total_ms": 0.040899998566601425
+    },
+    {
+      "location": "event_repository.py:82(create_tables)",
+      "count": 1,
+      "total_ms": 0.04020000051241368
+    },
+    {
+      "location": "event_repository.py:86(create_tables)",
+      "count": 1,
+      "total_ms": 0.040099999750964344
+    },
+    {
+      "location": "event_repository.py:97(create_tables)",
+      "count": 1,
+      "total_ms": 0.04069999704370275
+    },
+    {
+      "location": "event_repository.py:108(create_tables)",
+      "count": 1,
+      "total_ms": 0.0408000050811097
+    },
+    {
+      "location": "event_repository.py:126(create_tables)",
+      "count": 1,
+      "total_ms": 0.041399995097890496
+    },
+    {
+      "location": "event_repository.py:129(create_tables)",
+      "count": 1,
+      "total_ms": 0.039699996705166996
+    },
+    {
+      "location": "event_repository.py:132(create_tables)",
+      "count": 1,
+      "total_ms": 0.03949999518226832
+    },
+    {
+      "location": "database.py:1063(orders)",
+      "count": 1,
+      "total_ms": 0.7135999985621311
+    }
+  ]
+}

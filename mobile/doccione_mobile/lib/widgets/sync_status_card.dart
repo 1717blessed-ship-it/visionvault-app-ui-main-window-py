@@ -109,27 +109,34 @@ class _SyncStatusCardState extends State<SyncStatusCard> {
 
       if (mounted) {
         setState(() {
-          _isSyncing = false;
           _lastResult = result;
           
           if (result.isSuccess) {
             _syncStatus = 'Sincronización completada';
-            _showSuccess(result);
-            // Call the callback if provided
-            widget.onSyncCompleted?.call();
           } else {
             _syncStatus = 'Error en sincronización';
-            _showError(result.error ?? 'Error desconocido');
           }
         });
+
+        if (result.isSuccess) {
+          _showSuccess(result);
+          widget.onSyncCompleted?.call();
+        } else {
+          _showError(result.error ?? 'Error desconocido');
+        }
       }
     } catch (e) {
       if (mounted) {
         setState(() {
-          _isSyncing = false;
           _syncStatus = 'Error: ${e.toString()}';
         });
         _showError(e.toString());
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isSyncing = false;
+        });
       }
     }
   }

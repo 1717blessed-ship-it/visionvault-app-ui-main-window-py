@@ -79,10 +79,10 @@ class Order {
 
   factory Order.fromMap(Map<String, dynamic> map) {
     return Order(
-      id: map['id'] as String,
+      id: map['id'].toString(),
       orderNumber: map['order_number'] as String?,
-      jobId: map['job_id'] as String?,
-      clientId: map['client_id'] as String?,
+      jobId: map['job_id']?.toString(),
+      clientId: map['client_id']?.toString(),
       client: map['client'] as String?,
       whatsapp: map['whatsapp'] as String?,
       status: map['status'] as String?,
@@ -90,7 +90,7 @@ class Order {
       size: map['size'] as String?,
       quantity: map['quantity'] as int?,
       deliveryDate: map['delivery_date'] as String?,
-      printPriority: map['print_priority'] as String?,
+      printPriority: map['print_priority']?.toString(),
       isArchived: map['is_archived'] == 1,
       observations: map['observations'] as String?,
       orderConcept: map['order_concept'] as String?,

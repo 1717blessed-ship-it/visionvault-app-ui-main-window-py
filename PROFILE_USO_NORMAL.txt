@@ -1,0 +1,44 @@
+         701 function calls in 0.271 seconds
+
+   Ordered by: cumulative time
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+      420    0.162    0.000    0.162    0.000 {method 'execute' of 'sqlite3.Connection' objects}
+        5    0.000    0.000    0.139    0.028 C:\Users\Win 10\Documents\Codex\2026-07-13\visionvault-app-ui-main-window-py\app\database\database.py:3105(search)
+        5    0.105    0.021    0.106    0.021 C:\Users\Win 10\Documents\Codex\2026-07-13\visionvault-app-ui-main-window-py\app\database\database.py:3312(all_images)
+        5    0.001    0.000    0.022    0.004 C:\Users\Win 10\Documents\Codex\2026-07-13\visionvault-app-ui-main-window-py\app\database\database.py:47(__init__)
+       10    0.000    0.000    0.003    0.000 C:\Users\Win 10\Documents\Codex\2026-07-13\visionvault-app-ui-main-window-py\app\database\database.py:943(orders)
+        5    0.001    0.000    0.001    0.000 {built-in method _sqlite3.connect}
+        5    0.000    0.000    0.001    0.000 C:\Users\Win 10\Documents\Codex\2026-07-13\visionvault-app-ui-main-window-py\app\events\event_repository.py:241(recent_events)
+        5    0.000    0.000    0.001    0.000 C:\Users\Win 10\Documents\Codex\2026-07-13\visionvault-app-ui-main-window-py\app\database\database.py:992(pending_orders)
+        5    0.000    0.000    0.001    0.000 C:\Users\Win 10\Documents\Codex\2026-07-13\visionvault-app-ui-main-window-py\app\database\database.py:1584(order_summaries)
+        5    0.000    0.000    0.001    0.000 C:\Users\Win 10\Documents\Codex\2026-07-13\visionvault-app-ui-main-window-py\app\database\database.py:834(_migrate_mobile_devices)
+        5    0.000    0.000    0.001    0.000 C:\Users\Win 10\Documents\Codex\2026-07-13\visionvault-app-ui-main-window-py\app\database\database.py:724(_migrate_order_jobs)
+        5    0.000    0.000    0.001    0.000 C:\Users\Win 10\Documents\Codex\2026-07-13\visionvault-app-ui-main-window-py\app\database\database.py:903(_migrate_sync_indexes)
+        5    0.000    0.000    0.001    0.000 C:\Users\Win 10\Documents\Codex\2026-07-13\visionvault-app-ui-main-window-py\app\database\database.py:861(_migrate_pairing_codes)
+        5    0.000    0.000    0.000    0.000 C:\Users\Win 10\Documents\Codex\2026-07-13\visionvault-app-ui-main-window-py\app\database\database.py:822(_migrate_order_clients)
+        5    0.000    0.000    0.000    0.000 C:\Users\Win 10\Documents\Codex\2026-07-13\visionvault-app-ui-main-window-py\app\database\database.py:2018(install_doccione_price_catalog)
+        5    0.000    0.000    0.000    0.000 C:\Users\Win 10\Documents\Codex\2026-07-13\visionvault-app-ui-main-window-py\app\database\database.py:2846(app_setting)
+        5    0.000    0.000    0.000    0.000 C:\Python313\Lib\functools.py:544(decorating_function)
+        5    0.000    0.000    0.000    0.000 C:\Users\Win 10\Documents\Codex\2026-07-13\visionvault-app-ui-main-window-py\app\database\database.py:3059(_query_parts)
+        5    0.000    0.000    0.000    0.000 C:\Python313\Lib\functools.py:36(update_wrapper)
+       20    0.000    0.000    0.000    0.000 {method 'fetchone' of 'sqlite3.Cursor' objects}
+       10    0.000    0.000    0.000    0.000 {method 'isoformat' of 'datetime.datetime' objects}
+       40    0.000    0.000    0.000    0.000 {built-in method builtins.getattr}
+        1    0.000    0.000    0.000    0.000 {method 'disable' of '_lsprof.Profiler' objects}
+        5    0.000    0.000    0.000    0.000 C:\Python313\Lib\functools.py:504(lru_cache)
+       10    0.000    0.000    0.000    0.000 {built-in method now}
+       15    0.000    0.000    0.000    0.000 {method 'append' of 'list' objects}
+        5    0.000    0.000    0.000    0.000 {method 'split' of 'str' objects}
+       15    0.000    0.000    0.000    0.000 {method 'fetchall' of 'sqlite3.Cursor' objects}
+       15    0.000    0.000    0.000    0.000 {method 'join' of 'str' objects}
+        5    0.000    0.000    0.000    0.000 {method 'update' of 'dict' objects}
+       10    0.000    0.000    0.000    0.000 {built-in method builtins.setattr}
+        5    0.000    0.000    0.000    0.000 {method 'lower' of 'str' objects}
+       10    0.000    0.000    0.000    0.000 {method 'strip' of 'str' objects}
+        5    0.000    0.000    0.000    0.000 {method 'extend' of 'list' objects}
+        5    0.000    0.000    0.000    0.000 {method 'commit' of 'sqlite3.Connection' objects}
+        5    0.000    0.000    0.000    0.000 {built-in method builtins.isinstance}
+        5    0.000    0.000    0.000    0.000 C:\Users\Win 10\Documents\Codex\2026-07-13\visionvault-app-ui-main-window-py\app\events\event_repository.py:21(__init__)
+
+

@@ -34,6 +34,37 @@ from app.workflow.timeline import (
 
 logger = logging.getLogger(__name__)
 
+# ── Helpers para routing de ordenes ─────────────────────────────────────────
+# /api/v1/mobile/orders/{id}/status  →  (order_id, "/status")
+_ORDER_V1_PREFIX = "/api/v1/mobile/orders/"
+
+def _match_order_route(path: str, suffix: str) -> bool:
+    return path.startswith(_ORDER_V1_PREFIX) and path.endswith(suffix)
+
+def _extract_order_id(path: str, suffix: str) -> int | None:
+    """Extrae el order_id de una ruta /api/v1/mobile/orders/{id}/<suffix>."""
+    prefix_len = len(_ORDER_V1_PREFIX)
+    remainder = path[prefix_len:]                       # "{id}/suffix"
+    parts = remainder.split("/")
+    if len(parts) == 2 and parts[0].isdigit() and parts[1] == suffix[1:]:
+        return int(parts[0])
+    return None
+
+def _match_order_job_route(path: str) -> bool:
+    """True si path = /api/v1/mobile/orders/{oid}/jobs/{jid}."""
+    if not path.startswith(_ORDER_V1_PREFIX):
+        return False
+    remainder = path[len(_ORDER_V1_PREFIX):]
+    parts = remainder.split("/")
+    return len(parts) == 3 and parts[1] == "jobs" and parts[0].isdigit() and parts[2].isdigit()
+
+def _extract_order_job_ids(path: str) -> tuple[int, int] | None:
+    remainder = path[len(_ORDER_V1_PREFIX):]
+    parts = remainder.split("/")
+    if len(parts) == 3 and parts[1] == "jobs" and parts[0].isdigit() and parts[2].isdigit():
+        return int(parts[0]), int(parts[2])
+    return None
+
 
 # Whitelist de tipos de eventos permitidos para preferencias de notificaciones
 ALLOWED_NOTIFICATION_EVENT_TYPES: Final[frozenset[str]] = frozenset({
@@ -146,12 +177,12 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         """Maneja requests POST."""
         parsed = urlparse(self.path)
-        
+
         # Validar autenticación
         device = self._validate_auth()
         if not device:
             return
-        
+
         # Rutas legacy
         if parsed.path.startswith("/api/mobile/jobs/") and parsed.path.endswith("/stage"):
             job_id = parsed.path.split("/")[-2]
@@ -168,6 +199,47 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
                 self._send_error(400, "Invalid job ID")
         elif parsed.path == "/api/v1/mobile/device/preferences":
             self._update_device_preferences(device)
+        elif _match_order_route(parsed.path, "/deliver"):
+            order_id = _extract_order_id(parsed.path, "/deliver")
+            if order_id is not None:
+                self._mark_delivered(order_id, device)
+            else:
+                self._send_error(400, "Invalid order ID")
+        elif _match_order_route(parsed.path, "/payments"):
+            order_id = _extract_order_id(parsed.path, "/payments")
+            if order_id is not None:
+                self._register_payment(order_id, device)
+            else:
+                self._send_error(400, "Invalid order ID")
+        else:
+            self._send_error(404, "Endpoint not found")
+
+    def do_PATCH(self) -> None:
+        """Maneja requests PATCH para actualizaciones parciales."""
+        parsed = urlparse(self.path)
+
+        device = self._validate_auth()
+        if not device:
+            return
+
+        if _match_order_route(parsed.path, "/status"):
+            order_id = _extract_order_id(parsed.path, "/status")
+            if order_id is not None:
+                self._update_order_status(order_id, device)
+            else:
+                self._send_error(400, "Invalid order ID")
+        elif _match_order_route(parsed.path, "/priority"):
+            order_id = _extract_order_id(parsed.path, "/priority")
+            if order_id is not None:
+                self._update_order_priority(order_id, device)
+            else:
+                self._send_error(400, "Invalid order ID")
+        elif _match_order_job_route(parsed.path):
+            ids = _extract_order_job_ids(parsed.path)
+            if ids is not None:
+                self._update_job_fields(*ids, device)
+            else:
+                self._send_error(400, "Invalid order or job ID")
         else:
             self._send_error(404, "Endpoint not found")
 
@@ -442,6 +514,288 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
         except Exception as e:
             logger.error("Error changing job stage: %s", e)
             self._send_error(500, f"Error changing job stage: {e}")
+
+    # ── Quick-edit handlers ────────────────────────────────────────────────
+
+    def _read_json_body(self) -> dict | None:
+        """Lee y parsea el body JSON de un request, con validaciones comunes."""
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length == 0:
+            self._send_error(400, "Request body is required")
+            return None
+        if content_length > 10000:
+            self._send_error(413, "Request body too large (max 10KB)")
+            return None
+        try:
+            return json.loads(self.rfile.read(content_length).decode("utf-8"))
+        except json.JSONDecodeError:
+            self._send_error(400, "Invalid JSON body")
+            return None
+
+    def _update_order_status(self, order_id: int, device: dict[str, Any]) -> None:
+        """PATCH /api/v1/mobile/orders/{id}/status — Cambia el estado general."""
+        data = self._read_json_body()
+        if data is None:
+            return
+        new_status = data.get("status", "").strip()
+        if not new_status:
+            self._send_error(400, "status field is required")
+            return
+        if len(new_status) > 50:
+            self._send_error(400, "status too long (max 50 characters)")
+            return
+        valid_statuses = {"Pendiente", "En producción", "Finalizado", "Entregado", "Archivado"}
+        if new_status not in valid_statuses:
+            self._send_error(400, f"Invalid status. Valid options: {', '.join(sorted(valid_statuses))}")
+            return
+        try:
+            order_check = self.event_repo.conn.execute(
+                "SELECT id, is_archived FROM orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            if not order_check:
+                self._send_error(404, f"Order {order_id} not found")
+                return
+            if order_check["is_archived"]:
+                self._send_error(400, "Cannot modify an archived order")
+                return
+            self.event_repo.conn.execute(
+                "UPDATE orders SET status = ?, updated_at = datetime('now') WHERE id = ?",
+                (new_status, order_id),
+            )
+            self.event_repo.conn.execute(
+                """INSERT INTO order_events(order_id, event_type, message, data_json, created_at)
+                   VALUES(?, 'status.changed', ?, ?, datetime('now'))""",
+                (order_id, f"Estado actualizado a: {new_status}", json.dumps({"source": "mobile", "device_id": device["id"]})),
+            )
+            self.event_repo.conn.commit()
+            row = self.event_repo.conn.execute(
+                "SELECT id, status, updated_at FROM orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            self._send_json_response(200, {"success": True, "order": dict(row)})
+        except Exception as e:
+            logger.error("Error updating order status: %s", e)
+            self._send_error(500, f"Error updating order status: {e}")
+
+    def _update_order_priority(self, order_id: int, device: dict[str, Any]) -> None:
+        """PATCH /api/v1/mobile/orders/{id}/priority — Cambia la prioridad."""
+        data = self._read_json_body()
+        if data is None:
+            return
+        priority = data.get("print_priority")
+        if priority is None:
+            self._send_error(400, "print_priority field is required")
+            return
+        try:
+            priority = int(priority)
+        except (TypeError, ValueError):
+            self._send_error(400, "print_priority must be an integer (0-4)")
+            return
+        if priority < 0 or priority > 4:
+            self._send_error(400, "print_priority must be between 0 and 4")
+            return
+        try:
+            order_check = self.event_repo.conn.execute(
+                "SELECT id, is_archived FROM orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            if not order_check:
+                self._send_error(404, f"Order {order_id} not found")
+                return
+            if order_check["is_archived"]:
+                self._send_error(400, "Cannot modify an archived order")
+                return
+            self.event_repo.conn.execute(
+                "UPDATE orders SET print_priority = ?, updated_at = datetime('now') WHERE id = ?",
+                (priority, order_id),
+            )
+            self.event_repo.conn.execute(
+                """INSERT INTO order_events(order_id, event_type, message, data_json, created_at)
+                   VALUES(?, 'priority.changed', ?, ?, datetime('now'))""",
+                (order_id, f"Prioridad actualizada a: {priority}", json.dumps({"source": "mobile", "device_id": device["id"]})),
+            )
+            self.event_repo.conn.commit()
+            row = self.event_repo.conn.execute(
+                "SELECT id, print_priority, updated_at FROM orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            self._send_json_response(200, {"success": True, "order": dict(row)})
+        except Exception as e:
+            logger.error("Error updating order priority: %s", e)
+            self._send_error(500, f"Error updating order priority: {e}")
+
+    def _update_job_fields(self, order_id: int, job_id: int, device: dict[str, Any]) -> None:
+        """PATCH /api/v1/mobile/orders/{oid}/jobs/{jid} — Modifica cantidad/tamaño."""
+        data = self._read_json_body()
+        if data is None:
+            return
+        quantity = data.get("quantity")
+        size = data.get("size")
+        if quantity is None and size is None:
+            self._send_error(400, "At least one of 'quantity' or 'size' is required")
+            return
+        try:
+            order_check = self.event_repo.conn.execute(
+                "SELECT id, is_archived FROM orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            if not order_check:
+                self._send_error(404, f"Order {order_id} not found")
+                return
+            if order_check["is_archived"]:
+                self._send_error(400, "Cannot modify an archived order")
+                return
+            job_check = self.event_repo.conn.execute(
+                "SELECT id FROM order_jobs WHERE id = ? AND order_id = ?", (job_id, order_id)
+            ).fetchone()
+            if not job_check:
+                self._send_error(404, f"Job {job_id} not found in order {order_id}")
+                return
+            set_clauses, params = [], []
+            if quantity is not None:
+                q = max(1, int(quantity))
+                set_clauses.append("quantity = ?")
+                params.append(q)
+            if size is not None:
+                s = str(size).strip()[:20]
+                set_clauses.append("size = ?")
+                params.append(s)
+            set_clauses.append("updated_at = datetime('now')")
+            params.append(job_id)
+            self.event_repo.conn.execute(
+                f"UPDATE order_jobs SET {', '.join(set_clauses)} WHERE id = ?", params,
+            )
+            # Recalcular resumen del pedido
+            jobs = [dict(r) for r in self.event_repo.conn.execute(
+                "SELECT * FROM order_jobs WHERE order_id = ? ORDER BY sort_order, id", (order_id,)
+            )]
+            if jobs:
+                total_qty = sum(max(1, int(j.get("quantity") or 1)) for j in jobs)
+                self.event_repo.conn.execute(
+                    "UPDATE orders SET quantity = ?, updated_at = datetime('now') WHERE id = ?",
+                    (total_qty, order_id),
+                )
+            self.event_repo.conn.execute(
+                """INSERT INTO order_events(order_id, event_type, message, data_json, created_at)
+                   VALUES(?, 'job.updated', ?, ?, datetime('now'))""",
+                (order_id, f"Trabajo #{job_id} actualizado", json.dumps({"source": "mobile", "job_id": job_id, "device_id": device["id"]})),
+            )
+            self.event_repo.conn.commit()
+            row = self.event_repo.conn.execute(
+                "SELECT id, quantity, size, updated_at FROM order_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            self._send_json_response(200, {"success": True, "job": dict(row)})
+        except Exception as e:
+            logger.error("Error updating job fields: %s", e)
+            self._send_error(500, f"Error updating job: {e}")
+
+    def _register_payment(self, order_id: int, device: dict[str, Any]) -> None:
+        """POST /api/v1/mobile/orders/{id}/payments — Registra un cobro."""
+        data = self._read_json_body()
+        if data is None:
+            return
+        amount = data.get("amount")
+        if amount is None:
+            self._send_error(400, "amount field is required")
+            return
+        try:
+            amount = round(float(amount), 2)
+        except (TypeError, ValueError):
+            self._send_error(400, "amount must be a number")
+            return
+        if amount <= 0:
+            self._send_error(400, "amount must be greater than zero")
+            return
+        method = str(data.get("method", "")).strip()[:50]
+        note = str(data.get("note", "")).strip()[:200]
+        try:
+            order_check = self.event_repo.conn.execute(
+                "SELECT id, is_archived FROM orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            if not order_check:
+                self._send_error(404, f"Order {order_id} not found")
+                return
+            if order_check["is_archived"]:
+                self._send_error(400, "Cannot modify an archived order")
+                return
+            now_str = datetime.now().isoformat(timespec="seconds")
+            self.event_repo.conn.execute(
+                """INSERT INTO order_payments(order_id, amount, method, note, paid_at, created_at)
+                   VALUES(?, ?, ?, ?, ?, ?)""",
+                (order_id, amount, method, note, now_str, now_str),
+            )
+            # Recalcular financials
+            paid = self.event_repo.conn.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM order_payments WHERE order_id = ?", (order_id,)
+            ).fetchone()[0]
+            order_row = self.event_repo.conn.execute(
+                "SELECT price, discount_percent, budget_total FROM orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            budget_total = float(order_row["budget_total"] or 0) if order_row else 0.0
+            payment_status = "Pagado" if budget_total > 0 and (budget_total - float(paid)) <= 0.009 else ("Seña recibida" if paid else "Pendiente")
+            self.event_repo.conn.execute(
+                "UPDATE orders SET paid_amount = ?, payment_status = ?, updated_at = ? WHERE id = ?",
+                (float(paid), payment_status, now_str, order_id),
+            )
+            self.event_repo.conn.execute(
+                """INSERT INTO order_events(order_id, event_type, message, data_json, created_at)
+                   VALUES(?, 'payment.received', ?, ?, ?)""",
+                (order_id, f"Cobro registrado: ${amount:,.2f}" + (f" · {method}" if method else ""), json.dumps({"amount": amount, "method": method, "source": "mobile", "device_id": device["id"]}), now_str),
+            )
+            self.event_repo.conn.commit()
+            self._send_json_response(200, {
+                "success": True,
+                "payment": {"amount": amount, "method": method, "paid_at": now_str},
+                "financials": {"budget_total": budget_total, "paid_amount": float(paid), "payment_status": payment_status},
+            })
+        except Exception as e:
+            logger.error("Error registering payment: %s", e)
+            self._send_error(500, f"Error registering payment: {e}")
+
+    def _mark_delivered(self, order_id: int, device: dict[str, Any]) -> None:
+        """POST /api/v1/mobile/orders/{id}/deliver — Marca pedido como entregado."""
+        try:
+            order_check = self.event_repo.conn.execute(
+                "SELECT id, status, is_archived FROM orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            if not order_check:
+                self._send_error(404, f"Order {order_id} not found")
+                return
+            if order_check["is_archived"]:
+                self._send_error(400, "Cannot modify an archived order")
+                return
+            old_status = order_check["status"]
+            now_str = datetime.now().isoformat(timespec="seconds")
+            with self.event_repo.conn:
+                self.event_repo.conn.execute(
+                    "UPDATE order_jobs SET status = 'Entregado', updated_at = ? WHERE order_id = ?",
+                    (now_str, order_id),
+                )
+                self.event_repo.conn.execute(
+                    "UPDATE orders SET status = 'Entregado', updated_at = ? WHERE id = ?",
+                    (now_str, order_id),
+                )
+            self.event_repo.conn.execute(
+                """INSERT INTO order_events(order_id, event_type, message, data_json, created_at)
+                   VALUES(?, 'order.delivered', ?, ?, ?)""",
+                (order_id, f"Pedido marcado como Entregado (anterior: {old_status})", json.dumps({"source": "mobile", "old_status": old_status, "device_id": device["id"]}), now_str),
+            )
+            self.event_repo.conn.commit()
+            try:
+                self.event_bus.publish(
+                    event_type="order.delivered",
+                    title="Pedido entregado",
+                    message=f"Pedido #{order_id} marcado como Entregado",
+                    priority="high",
+                    entity_type="order",
+                    entity_id=order_id,
+                    payload={"old_status": old_status, "device_id": device["id"]},
+                )
+            except Exception:
+                pass
+            row = self.event_repo.conn.execute(
+                "SELECT id, status, updated_at FROM orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            self._send_json_response(200, {"success": True, "order": dict(row)})
+        except Exception as e:
+            logger.error("Error marking order delivered: %s", e)
+            self._send_error(500, f"Error marking order delivered: {e}")
 
     def _get_stages(self) -> None:
         """Obtiene el catálogo completo de etapas desde fuente oficial."""

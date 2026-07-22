@@ -1,16 +1,20 @@
 import 'package:flutter/material.dart';
 import 'package:doccione_mobile/database/database_helper.dart';
 import 'package:doccione_mobile/database/orders_repository.dart';
+import 'package:doccione_mobile/database/server_config_repository.dart';
 import 'package:doccione_mobile/models/order_with_details.dart';
 import 'package:doccione_mobile/widgets/order_card.dart';
 import 'package:doccione_mobile/screens/order_detail_screen.dart';
+import 'package:doccione_mobile/services/quick_edit_api_client.dart';
 
 class OrdersListScreen extends StatefulWidget {
   final String? initialStatus;
+  final String? sessionToken;
 
   const OrdersListScreen({
     super.key,
     this.initialStatus,
+    this.sessionToken,
   });
 
   @override
@@ -21,7 +25,8 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
   final DatabaseHelper _dbHelper = DatabaseHelper();
   late final OrdersRepository _ordersRepo;
   final TextEditingController _searchController = TextEditingController();
-  
+  QuickEditApiClient? _quickEditClient;
+
   List<OrderWithDetails> _orders = [];
   bool _isLoading = true;
   bool _isSyncing = false;
@@ -45,7 +50,22 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
     super.initState();
     _ordersRepo = OrdersRepository(_dbHelper);
     _selectedStatus = widget.initialStatus;
+    _initQuickEditClient();
     _loadOrders();
+  }
+
+  Future<void> _initQuickEditClient() async {
+    if (widget.sessionToken == null) return;
+    final repo = ServerConfigRepository(_dbHelper);
+    final config = await repo.getConfig();
+    if (mounted) {
+      setState(() {
+        _quickEditClient = QuickEditApiClient(
+          baseUrl: config.baseUrl,
+          authToken: widget.sessionToken,
+        );
+      });
+    }
   }
 
   @override
@@ -236,7 +256,9 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
                                   MaterialPageRoute(
                                     builder: (context) => OrderDetailScreen(
                                       orderDetails: orderDetails,
-                                      onContactWhatsApp: null, // TODO: Implement WhatsApp integration
+                                      onContactWhatsApp: null,
+                                      apiClient: _quickEditClient,
+                                      onRefresh: () => _loadOrders(),
                                     ),
                                   ),
                                 );

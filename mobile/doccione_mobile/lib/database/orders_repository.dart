@@ -16,11 +16,11 @@ class OrdersRepository {
   OrdersRepository(this._dbHelper);
 
   /// Upsert a single order (insert or update if exists)
-  Future<void> upsertOrder(Map<String, dynamic> orderData) async {
-    final db = await _dbHelper.database;
+  Future<void> upsertOrder(Map<String, dynamic> orderData, {Transaction? txn}) async {
+    final executor = txn ?? await _dbHelper.database;
     final order = Order.fromMap(orderData);
-    
-    await db.insert(
+
+    await executor.insert(
       'orders',
       order.toMap(),
       conflictAlgorithm: ConflictAlgorithm.replace,
@@ -28,9 +28,9 @@ class OrdersRepository {
   }
 
   /// Upsert multiple orders in a batch operation
-  Future<void> upsertOrders(List<Map<String, dynamic>> ordersData) async {
-    final db = await _dbHelper.database;
-    final batch = db.batch();
+  Future<void> upsertOrders(List<Map<String, dynamic>> ordersData, {Transaction? txn}) async {
+    final executor = txn ?? await _dbHelper.database;
+    final batch = executor.batch();
 
     for (final orderData in ordersData) {
       final order = Order.fromMap(orderData);

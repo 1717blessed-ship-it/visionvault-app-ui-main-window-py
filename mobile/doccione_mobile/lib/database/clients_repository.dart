@@ -9,11 +9,11 @@ class ClientsRepository {
   ClientsRepository(this._dbHelper);
 
   /// Upsert a single client (insert or update if exists)
-  Future<void> upsertClient(Map<String, dynamic> clientData) async {
-    final db = await _dbHelper.database;
+  Future<void> upsertClient(Map<String, dynamic> clientData, {Transaction? txn}) async {
+    final executor = txn ?? await _dbHelper.database;
     final client = Client.fromMap(clientData);
-    
-    await db.insert(
+
+    await executor.insert(
       'clients',
       client.toMap(),
       conflictAlgorithm: ConflictAlgorithm.replace,
@@ -21,9 +21,9 @@ class ClientsRepository {
   }
 
   /// Upsert multiple clients in a batch operation
-  Future<void> upsertClients(List<Map<String, dynamic>> clientsData) async {
-    final db = await _dbHelper.database;
-    final batch = db.batch();
+  Future<void> upsertClients(List<Map<String, dynamic>> clientsData, {Transaction? txn}) async {
+    final executor = txn ?? await _dbHelper.database;
+    final batch = executor.batch();
 
     for (final clientData in clientsData) {
       final client = Client.fromMap(clientData);

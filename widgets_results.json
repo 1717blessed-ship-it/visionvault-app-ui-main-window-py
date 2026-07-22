@@ -1,0 +1,30 @@
+{
+  "import_time_ms": 114.6,
+  "app_init_time_ms": 1596.1,
+  "total_widgets": 330,
+  "widget_types": {
+    "Label": 110,
+    "Toplevel": 1,
+    "Frame": 107,
+    "TButton": 36,
+    "TCombobox": 5,
+    "Button": 6,
+    "TEntry": 3,
+    "Canvas": 9,
+    "TScrollbar": 7,
+    "TFrame": 15,
+    "TNotebook": 2,
+    "TLabel": 9,
+    "TProgressbar": 3,
+    "Menu": 4,
+    "TPanedwindow": 1,
+    "TRadiobutton": 10,
+    "Treeview": 1,
+    "TScale": 1
+  },
+  "after_callbacks": -1,
+  "memory_current_mb": 9.62,
+  "memory_peak_mb": 10.81,
+  "scanned_dirs_count": 0,
+  "scanned_dirs_sample": []
+}

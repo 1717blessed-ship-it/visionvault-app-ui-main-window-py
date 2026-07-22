@@ -29,7 +29,7 @@ class OrderCard extends StatelessWidget {
                 children: [
                   // Order number
                   Text(
-                    '#${order.orderNumber ?? order.id.substring(0, 8)}',
+                    '#${order.orderNumber ?? (order.id.length > 8 ? order.id.substring(0, 8) : order.id)}',
                     style: Theme.of(context).textTheme.titleMedium?.copyWith(
                           fontWeight: FontWeight.bold,
                         ),

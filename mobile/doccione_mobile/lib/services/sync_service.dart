@@ -104,22 +104,17 @@ class SyncService {
     );
     httpStopwatch.stop();
 
-    // Parse response
+    // Parse response — backend contract:
+    // { snapshot_until, complete, next_cursor, entities: { X: { items, has_more } } }
     final parseStopwatch = Stopwatch()..start();
-    final snapshotId = response['snapshot_id'] as String;
+    final snapshotId = response['snapshot_until'] as String;
     final nextCursor = response['next_cursor'] as String?;
     final complete = response['complete'] as bool;
-    final data = response['data'] as Map<String, dynamic>;
+    final entities = response['entities'] as Map<String, dynamic>;
 
-    final jobs = (data['jobs'] as List<dynamic>?)
-            ?.cast<Map<String, dynamic>>() ??
-        [];
-    final orders = (data['orders'] as List<dynamic>?)
-            ?.cast<Map<String, dynamic>>() ??
-        [];
-    final clients = (data['clients'] as List<dynamic>?)
-            ?.cast<Map<String, dynamic>>() ??
-        [];
+    final jobs = _extractEntityItems(entities, 'jobs');
+    final orders = _extractEntityItems(entities, 'orders');
+    final clients = _extractEntityItems(entities, 'clients');
     parseStopwatch.stop();
 
     // Database transaction
@@ -127,29 +122,24 @@ class SyncService {
     final db = await _dbHelper.database;
 
     await db.transaction((txn) async {
-      // Create temporary database helper for transaction
-      final txnDbHelper = _TransactionDatabaseHelper(txn);
-
-      // Process each entity type within transaction
+      // Process each entity type within transaction, using the txn handle
       if (_handlers.containsKey('jobs') && jobs.isNotEmpty) {
-        await _handlers['jobs']!.process(jobs);
+        await _handlers['jobs']!.process(jobs, txn: txn);
       }
 
       if (_handlers.containsKey('orders') && orders.isNotEmpty) {
-        await _handlers['orders']!.process(orders);
+        await _handlers['orders']!.process(orders, txn: txn);
       }
 
       if (_handlers.containsKey('clients') && clients.isNotEmpty) {
-        await _handlers['clients']!.process(clients);
+        await _handlers['clients']!.process(clients, txn: txn);
       }
 
-      // Update sync state within transaction
+      // Update sync state within the same transaction
       if (complete) {
-        // Sync completed - clear cursor and update snapshot
-        await _syncStateRepo.completeSync(snapshotId);
+        await _syncStateRepo.completeSync(snapshotId, txn: txn);
       } else if (nextCursor != null) {
-        // More pages to sync - save cursor
-        await _syncStateRepo.setCurrentNextCursor(nextCursor);
+        await _syncStateRepo.setCurrentNextCursor(nextCursor, txn: txn);
       }
     });
     dbStopwatch.stop();
@@ -242,13 +232,24 @@ class SyncService {
       );
     }
   }
-}
 
-/// Helper class to wrap a transaction for DatabaseHelper interface
-class _TransactionDatabaseHelper {
-  final Transaction _transaction;
+  /// Extract items from entities[type].items and coerce int IDs to String.
+  List<Map<String, dynamic>> _extractEntityItems(
+      Map<String, dynamic> entities, String type) {
+    final entity = entities[type] as Map<String, dynamic>?;
+    if (entity == null) return [];
+    final items = entity['items'] as List<dynamic>? ?? [];
+    return items.map((item) => _coerceIdTypes(item as Map<String, dynamic>)).toList();
+  }
 
-  _TransactionDatabaseHelper(this._transaction);
-
-  Transaction get transaction => _transaction;
+  /// Convert int ID fields to String for model compatibility.
+  Map<String, dynamic> _coerceIdTypes(Map<String, dynamic> item) {
+    final map = Map<String, dynamic>.from(item);
+    for (final key in ['id', 'order_id', 'client_id', 'job_id']) {
+      if (map[key] is int) {
+        map[key] = map[key].toString();
+      }
+    }
+    return map;
+  }
 }
