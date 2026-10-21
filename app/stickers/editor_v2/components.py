@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
@@ -269,6 +270,8 @@ class ThumbnailTray(tk.Frame):
         self.window = self.canvas.create_window(0, 0, anchor="nw", window=self.inner)
         self.inner.bind("<Configure>", lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self._photos = []
+        self._thumbnail_cache = OrderedDict()
+        self._thumbnail_cache_limit = 256
         self._signature = None
         self.canvas.bind("<Shift-MouseWheel>", self._horizontal_wheel)
         self.canvas.bind("<MouseWheel>", self._horizontal_wheel)
@@ -325,15 +328,26 @@ class ThumbnailTray(tk.Frame):
         self.on_select(index, event, context=True)
         self.menu.tk_popup(event.x_root, event.y_root)
 
-    @staticmethod
-    def _thumbnail(job):
+    def _thumbnail(self, job):
         path = PipelineViewAdapter.preview_source(job, "Final").path
         if not path:
             return None
         try:
-            with Image.open(path) as source:
+            source_path = Path(path)
+            stat = source_path.stat()
+            key = (str(source_path.resolve()), stat.st_mtime_ns, stat.st_size)
+            cached = self._thumbnail_cache.get(key)
+            if cached is not None:
+                self._thumbnail_cache.move_to_end(key)
+                return cached
+            with Image.open(source_path) as source:
                 image = source.convert("RGBA").copy()
             image.thumbnail((58, 78), Image.Resampling.LANCZOS)
-            return ImageTk.PhotoImage(image)
+            photo = ImageTk.PhotoImage(image, master=self.canvas)
+            self._thumbnail_cache[key] = photo
+            self._thumbnail_cache.move_to_end(key)
+            while len(self._thumbnail_cache) > self._thumbnail_cache_limit:
+                self._thumbnail_cache.popitem(last=False)
+            return photo
         except Exception:
             return None

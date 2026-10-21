@@ -188,6 +188,31 @@ def test_space_pan_temporarily_overrides_active_brush():
     assert state.zoom == 2 and state.fitted is False
 
 
+def test_thumbnail_cache_avoids_decoding_again_when_only_selection_changes(tmp_path, monkeypatch):
+    import tkinter as tk
+    from PIL import Image
+    from app.stickers.editor_v2.components import ThumbnailTray
+
+    master = tmp_path / "master.png"
+    Image.new("RGBA", (600, 600), "red").save(master)
+    result = SimpleNamespace(artifacts={"master": str(master)}, quality_status="Listo")
+    batch = [{"source_path": str(master), "status": "Procesado", "result": result}]
+    root = tk._default_root or tk.Tk(); root.withdraw()
+    tray = ThumbnailTray(root, lambda *_: None)
+    real_open = Image.open
+    calls = []
+
+    def counted_open(*args, **kwargs):
+        calls.append(args[0])
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr("app.stickers.editor_v2.components.Image.open", counted_open)
+    tray.refresh(batch, set())
+    tray.refresh(batch, {0})
+    assert len(calls) == 1
+    tray.destroy()
+
+
 def test_review_export_and_send_keep_the_job_open(tmp_path, monkeypatch):
     import tkinter as tk
     from PIL import Image
