@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 from pathlib import Path
@@ -40,12 +41,18 @@ def production_contract(run: Path) -> dict:
 
 
 def main() -> None:
-    base_report = json.loads((BASE / "acceptance_metrics.json").read_text(encoding="utf-8"))
-    opt_report = json.loads((OPT / "acceptance_metrics.json").read_text(encoding="utf-8"))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--baseline", type=Path, default=BASE)
+    parser.add_argument("--candidate", type=Path, default=OPT)
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+    base_root, candidate_root = args.baseline.resolve(), args.candidate.resolve()
+    base_report = json.loads((base_root / "acceptance_metrics.json").read_text(encoding="utf-8"))
+    opt_report = json.loads((candidate_root / "acceptance_metrics.json").read_text(encoding="utf-8"))
     comparisons = []
     all_equal = True
     for before, after in zip(base_report["items"], opt_report["items"], strict=True):
-        before_dir, after_dir = run_dir(BASE, before), run_dir(OPT, after)
+        before_dir, after_dir = run_dir(base_root, before), run_dir(candidate_root, after)
         before_files = {path.name: path for path in before_dir.iterdir() if path.is_file()}
         after_files = {path.name: path for path in after_dir.iterdir() if path.is_file()}
         common = sorted(before_files.keys() & after_files.keys())
@@ -65,14 +72,16 @@ def main() -> None:
             "differences": [name for name, equal in raster.items() if not equal],
         })
     report = {
-        "baseline": "sticker-studio-v2.0.0", "candidate": "2.0.1-performance",
+        "baseline": base_root.name, "candidate": candidate_root.name,
         "items": len(comparisons), "all_raster_outputs_equal": all_equal,
         "all_input_hashes_equal": all(row["input_sha256_equal"] for row in comparisons),
         "all_quality_states_equal": all(row["route_quality_equal"] for row in comparisons),
         "all_production_contracts_equal": all(row["production_contract_equal"] for row in comparisons),
         "comparisons": comparisons,
     }
-    (OPT / "binary_comparison.json").write_text(
+    output = args.output or candidate_root / "binary_comparison.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({key: value for key, value in report.items() if key != "comparisons"}, ensure_ascii=False))
     if not all_equal or not report["all_production_contracts_equal"]:
