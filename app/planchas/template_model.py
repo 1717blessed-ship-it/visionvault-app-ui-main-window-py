@@ -18,7 +18,10 @@ from pathlib import Path
 # horizontales. Las celdas se calculan con el margen y la separación reales,
 # nunca con porcentajes visuales aproximados.
 REGULAR_PATTERNS: dict[str, dict[str, object]] = {
-    "circular_4x5": {"title": "Circular / cuadrado", "detail": "4 columnas · 5 filas", "columns": 4, "rows": 5},
+    "circular_4x5": {"title": "Redondo 20", "detail": "20 stickers · 4 columnas · 5 filas", "columns": 4, "rows": 5, "shape": "circle"},
+    "round_3x4": {"title": "Redondo grande", "detail": "3 columnas · 4 filas", "columns": 3, "rows": 4, "shape": "circle"},
+    "round_4x6": {"title": "Redondo estándar", "detail": "4 columnas · 6 filas", "columns": 4, "rows": 6, "shape": "circle"},
+    "round_5x7": {"title": "Redondo chico", "detail": "5 columnas · 7 filas", "columns": 5, "rows": 7, "shape": "circle"},
     "vertical_5x5": {"title": "Vertical estándar", "detail": "5 columnas · 5 filas", "columns": 5, "rows": 5},
     "vertical_6x5": {"title": "Vertical fino", "detail": "6 columnas · 5 filas", "columns": 6, "rows": 5},
     "vertical_8x5": {"title": "Vertical extra fino", "detail": "8 columnas · 5 filas", "columns": 8, "rows": 5},
@@ -65,6 +68,7 @@ class TemplateCell:
     offset_x: float = 0.0
     offset_y: float = 0.0
     rotation: int = 0
+    shape: str = "rectangle"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -101,16 +105,55 @@ class RegularTemplateProject:
         separación de 0,08 cm. Así la última celda llega exactamente al
         límite seguro sin recortes ni franjas ocultas.
         """
-        usable_width = A4_WIDTH_CM - margin_cm * 2 - gap_cm * (columns - 1)
-        usable_height = A4_HEIGHT_CM - margin_cm * 2 - gap_cm * (rows - 1)
+        # Reservar un epsilon evita perder la tolerancia por redondeo binario
+        # al convertir las medidas a coordenadas normalizadas.
+        effective_gap = gap_cm + 1e-10
+        usable_width = A4_WIDTH_CM - margin_cm * 2 - effective_gap * (columns - 1)
+        usable_height = A4_HEIGHT_CM - margin_cm * 2 - effective_gap * (rows - 1)
         cell_width_cm = usable_width / columns
         cell_height_cm = usable_height / rows
         return [
             TemplateCell(
-                x=(margin_cm + column * (cell_width_cm + gap_cm)) / A4_WIDTH_CM,
-                y=(margin_cm + row * (cell_height_cm + gap_cm)) / A4_HEIGHT_CM,
+                x=(margin_cm + column * (cell_width_cm + effective_gap)) / A4_WIDTH_CM,
+                y=(margin_cm + row * (cell_height_cm + effective_gap)) / A4_HEIGHT_CM,
                 width=cell_width_cm / A4_WIDTH_CM,
                 height=cell_height_cm / A4_HEIGHT_CM,
+            )
+            for row in range(rows)
+            for column in range(columns)
+        ]
+
+    @staticmethod
+    def circle_cells_for(rows: int, columns: int, margin_cm: float = REGULAR_MARGIN_CM,
+                         gap_cm: float = REGULAR_GAP_CM) -> list[TemplateCell]:
+        """Crea casillas físicamente cuadradas para stickers redondos.
+
+        El diámetro se limita por el ancho imprimible. La separación vertical
+        restante se reparte de forma uniforme, manteniendo margen de seguridad
+        y evitando que un círculo se convierta en óvalo en A4.
+        """
+        usable_width = A4_WIDTH_CM - margin_cm * 2 - gap_cm * (columns - 1)
+        diameter_cm = usable_width / columns
+        vertical_space = A4_HEIGHT_CM - margin_cm * 2 - diameter_cm * rows
+        vertical_gap_cm = vertical_space / (rows - 1) if rows > 1 else 0.0
+        if vertical_gap_cm < gap_cm:
+            # Caso poco habitual: limitar por alto y conservar la separación.
+            diameter_cm = (A4_HEIGHT_CM - margin_cm * 2 - gap_cm * (rows - 1)) / rows
+            # Evitar que la conversión a coordenadas normalizadas redondee
+            # una separación nominal de 0,08 cm a 0,0799999999 y deje la
+            # plantilla apenas por debajo del margen de seguridad.
+            vertical_gap_cm = gap_cm + 1e-10
+            horizontal_space = A4_WIDTH_CM - margin_cm * 2 - diameter_cm * columns
+            horizontal_gap_cm = horizontal_space / (columns - 1) if columns > 1 else 0.0
+        else:
+            horizontal_gap_cm = gap_cm
+        return [
+            TemplateCell(
+                x=(margin_cm + column * (diameter_cm + horizontal_gap_cm)) / A4_WIDTH_CM,
+                y=(margin_cm + row * (diameter_cm + vertical_gap_cm)) / A4_HEIGHT_CM,
+                width=diameter_cm / A4_WIDTH_CM,
+                height=diameter_cm / A4_HEIGHT_CM,
+                shape="circle",
             )
             for row in range(rows)
             for column in range(columns)
@@ -119,7 +162,15 @@ class RegularTemplateProject:
     @classmethod
     def pattern_cells(cls, pattern_id: str) -> list[TemplateCell]:
         pattern = REGULAR_PATTERNS.get(pattern_id, REGULAR_PATTERNS["circular_4x5"])
-        return cls.cells_for(int(pattern["rows"]), int(pattern["columns"]))
+        shape = str(pattern.get("shape", "rectangle"))
+        cells = (
+            cls.circle_cells_for(int(pattern["rows"]), int(pattern["columns"]))
+            if shape == "circle"
+            else cls.cells_for(int(pattern["rows"]), int(pattern["columns"]))
+        )
+        for cell in cells:
+            cell.shape = shape
+        return cells
 
     @staticmethod
     def cell_ratio(pattern_id: str) -> float:

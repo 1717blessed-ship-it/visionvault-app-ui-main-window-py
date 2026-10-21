@@ -1,19 +1,39 @@
 """Preparación no destructiva y revisión de stickers."""
 
-from app.stickers.pipeline import (
+from app.stickers.models import (
     ImageCase,
+    BorderTreatment,
+    ImageAnalysis,
+    JobHistoryEntry,
+    JobStatus,
+    MaskCandidate,
+    ProcessingDecision,
     ProcessingMode,
-    QualityPreset,
     ProcessingProfile,
+    QualityPreset,
+    StickerMasks,
+    StickerResult,
+)
+from app.stickers.pipeline import (
+    ClassifyResult,
     ProcessingResult,
     StickerProcessor,
 )
 
 __all__ = [
     "ImageCase",
+    "BorderTreatment",
+    "ImageAnalysis",
+    "JobHistoryEntry",
+    "JobStatus",
+    "MaskCandidate",
+    "ProcessingDecision",
     "ProcessingMode",
-    "QualityPreset",
     "ProcessingProfile",
+    "QualityPreset",
+    "StickerMasks",
+    "StickerResult",
+    "ClassifyResult",
     "ProcessingResult",
     "StickerProcessor",
 ]

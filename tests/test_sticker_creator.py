@@ -17,6 +17,23 @@ class _Value:
 
 
 class StickerCreatorContracts(unittest.TestCase):
+    def test_mask_editor_restore_opened_mask_discards_only_mask_changes(self):
+        editor = MaskEditor.__new__(MaskEditor)
+        editor.mask = Image.new("L", (20, 20), 255)
+        editor._opened_mask = editor.mask.copy()
+        ImageDraw.Draw(editor.mask).ellipse((4, 4, 15, 15), fill=0)
+        editor._undo_stack = [{"patches": []}]
+        editor._active_stroke = None
+        editor._lasso_points = [(1, 1), (4, 4)]
+        editor._render_after = None
+        editor.end_stroke = lambda: None
+        editor.render = lambda: None
+
+        self.assertEqual(editor.restore_opened_mask(confirm=False), "break")
+        self.assertEqual(editor.mask.getextrema(), (255, 255))
+        self.assertEqual(editor._undo_stack, [])
+        self.assertEqual(editor._lasso_points, [])
+
     def test_mask_editor_ctrl_z_restores_the_whole_last_stroke(self):
         editor = MaskEditor.__new__(MaskEditor)
         editor.original = Image.new("RGBA", (80, 80), (220, 40, 60, 255))
@@ -43,7 +60,7 @@ class StickerCreatorContracts(unittest.TestCase):
         self.assertEqual(editor.mask.getpixel((42, 30)), 255)
         self.assertEqual(editor._undo_stack, [])
 
-    def test_transparent_holes_inside_png_are_filled_with_opaque_white(self):
+    def test_transparent_png_holes_survive_separately_from_white_substrate(self):
         with tempfile.TemporaryDirectory() as folder:
             source = Path(folder) / "anillo.png"
             image = Image.new("RGBA", (420, 420), (0, 0, 0, 0))
@@ -53,14 +70,18 @@ class StickerCreatorContracts(unittest.TestCase):
             image.save(source)
 
             result = StickerProcessor(Path(folder) / "work").process(source)
-            self.assertTrue(result.analysis["png_holes_filled_white"])
+            # New explicit requirement: negative space belongs to visual alpha;
+            # the physical white substrate may remain solid independently.
+            self.assertFalse(result.analysis["png_holes_filled_white"])
             with Image.open(result.artifacts["mask"]) as mask:
                 alpha = mask.convert("L")
-                self.assertEqual(alpha.getpixel((210, 210)), 255)
+                self.assertEqual(alpha.getpixel((210, 210)), 0)
                 self.assertEqual(alpha.getpixel((5, 5)), 0)
             with Image.open(result.artifacts["clean"]) as clean:
                 center = clean.convert("RGBA").getpixel((clean.width // 2, clean.height // 2))
-                self.assertEqual(center, (255, 255, 255, 255))
+                self.assertEqual(center[3], 0)
+            with Image.open(result.artifacts["native_printable_base"]) as base:
+                self.assertEqual(base.getpixel((base.width // 2, base.height // 2)), 255)
 
     def test_transparent_holes_are_not_filled_for_non_png_sources(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -174,6 +195,41 @@ class StickerCreatorContracts(unittest.TestCase):
         self.assertEqual(alpha.getpixel((50, 50)), 255)
         self.assertTrue(StickerProcessor._has_white_outer_border(image, alpha))
 
+    def test_isolated_small_component_is_removed_but_nearby_detail_is_preserved(self):
+        alpha = Image.new("L", (300, 300), 0)
+        draw = ImageDraw.Draw(alpha)
+        draw.rectangle((45, 45, 220, 230), fill=255)
+        draw.ellipse((228, 120, 238, 130), fill=255)  # detalle cercano
+        draw.ellipse((268, 250, 286, 268), fill=255)  # fragmento aislado
+
+        cleaned, removed = StickerProcessor._remove_isolated_components(alpha)
+
+        self.assertEqual(cleaned.getpixel((277, 259)), 0)
+        self.assertEqual(cleaned.getpixel((233, 125)), 255)
+        self.assertEqual(len(removed), 1)
+
+    def test_detached_caption_above_the_design_is_preserved(self):
+        alpha = Image.new("L", (300, 300), 0)
+        draw = ImageDraw.Draw(alpha)
+        draw.rectangle((45, 105, 220, 260), fill=255)  # main design
+        draw.rectangle((110, 42, 145, 78), fill=255)   # caption character
+
+        cleaned, removed = StickerProcessor._remove_isolated_components(alpha)
+
+        self.assertEqual(cleaned.getpixel((128, 60)), 255)
+        self.assertEqual(removed, [])
+
+    def test_tiny_background_speck_is_removed_even_near_the_design(self):
+        alpha = Image.new("L", (300, 300), 0)
+        draw = ImageDraw.Draw(alpha)
+        draw.rectangle((45, 45, 220, 230), fill=255)
+        draw.rectangle((225, 125, 227, 127), fill=255)  # 9 px of residue
+
+        cleaned, removed = StickerProcessor._remove_isolated_components(alpha)
+
+        self.assertEqual(cleaned.getpixel((226, 126)), 0)
+        self.assertEqual(len(removed), 1)
+
     def test_final_sticker_is_exact_570_cm_and_covers_gray_halo(self):
         with tempfile.TemporaryDirectory() as folder:
             source = Path(folder) / "halo.png"
@@ -195,7 +251,7 @@ class StickerCreatorContracts(unittest.TestCase):
                 self.assertIsNotNone(visible)
                 # El halo gris del original queda cubierto por la banda blanca interna.
                 gray_pixels = sum(
-                    1 for red, green, blue, alpha in rgba.getdata()
+                    1 for red, green, blue, alpha in rgba.get_flattened_data()
                     if alpha > 240 and 90 <= red <= 190 and abs(red - green) < 3 and abs(green - blue) < 3
                 )
                 self.assertEqual(gray_pixels, 0)
@@ -252,6 +308,83 @@ class StickerCreatorContracts(unittest.TestCase):
                     800 / 340,
                     delta=.02,
                 )
+
+    def test_rectangular_selection_keeps_its_horizontal_orientation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "banner.png"
+            image = Image.new("RGBA", (820, 360), (30, 120, 220, 255))
+            image.save(source)
+
+            result = StickerProcessor(Path(folder) / "work").process(
+                source, preserve_full_image=True, preserve_orientation=True)
+
+            self.assertFalse(result.analysis["rotated_to_vertical"])
+            self.assertEqual(result.analysis["orientation"], "Horizontal")
+            with Image.open(result.artifacts["silhouette"]) as silhouette:
+                self.assertGreater(silhouette.width, silhouette.height)
+
+    def test_visual_classification_keeps_principal_type_and_observable_traits(self):
+        processor = StickerProcessor.__new__(StickerProcessor)
+        image = Image.new("RGBA", (240, 240), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((45, 55, 195, 185), fill=(40, 120, 220, 255))
+        # Transición alfa real: debe describirse como rasgo y no como una
+        # supuesta probabilidad de clasificación.
+        draw.rectangle((100, 55, 140, 185), fill=(255, 80, 160, 120))
+
+        result = processor.classify(image)
+
+        self.assertEqual(result.detected_types[0], result.sticker_type)
+        self.assertTrue(result.classification_features["real_transparency"])
+        self.assertTrue(result.classification_features["semi_transparency"])
+        self.assertIn("semitransparencias", result.detected_types)
+        self.assertNotIn("confidence", result.classification_features)
+
+    def test_full_image_creation_mode_applies_a_circular_alpha_without_cropping_content(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "postal.png"
+            image = Image.new("RGB", (520, 340), (35, 100, 190))
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((0, 180, 520, 340), fill=(30, 155, 75))
+            draw.ellipse((205, 60, 315, 170), fill=(255, 205, 60))
+            image.save(source)
+
+            result = StickerProcessor(Path(folder) / "work").process(
+                source,
+                creation_mode="Sticker de imagen completa",
+                full_image_shape="Circular",
+            )
+
+            self.assertEqual(result.analysis["creation_mode"], "Sticker de imagen completa")
+            self.assertEqual(result.analysis["full_image_shape"], "Circular")
+            self.assertEqual(result.analysis["sticker_type"], "imagen_completa")
+            with Image.open(result.artifacts["mask"]) as mask:
+                alpha = mask.convert("L")
+                self.assertEqual(alpha.getpixel((0, 0)), 0)
+                self.assertGreater(alpha.getpixel((alpha.width // 2, alpha.height // 2)), 240)
+
+    def test_multi_object_mode_exports_masks_and_can_keep_selected_objects(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "dos_objetos.png"
+            image = Image.new("RGBA", (420, 300), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(image)
+            draw.rounded_rectangle((35, 80, 175, 230), radius=24, fill=(30, 115, 220, 255))
+            draw.ellipse((265, 90, 385, 210), fill=(230, 55, 90, 255))
+            image.save(source)
+
+            result = StickerProcessor(Path(folder) / "work").process(
+                source,
+                creation_mode="Sticker de múltiples objetos",
+                selected_component_ids=[2],
+            )
+
+            components = result.analysis["object_components"]
+            self.assertEqual(len(components), 2)
+            self.assertEqual([item["id"] for item in components if item["selected"]], [2])
+            for item in components:
+                self.assertTrue(Path(item["artifact"]).exists())
+            self.assertIn("object_mask_1", result.artifacts)
+            self.assertIn("object_mask_2", result.artifacts)
 
 
 if __name__ == "__main__":

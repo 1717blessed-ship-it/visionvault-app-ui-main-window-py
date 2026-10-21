@@ -13,13 +13,20 @@ from __future__ import annotations
 import math
 import time
 from collections import deque
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
 from PIL import Image
+
+# Importar estructuras comunes desde models.py
+from app.stickers.models import (
+    ImageAnalysis,
+    MaskCandidate,
+    ProcessingDecision,
+    StickerMasks,
+)
 
 # Pesos de scoring deterministas para fase 1.
 WEIGHTS = {
@@ -37,67 +44,6 @@ CONFIDENCE_THRESHOLDS = {
 MIN_SUBJECT_AREA_RATIO = 0.001
 MAX_RECTANGULARITY_RATIO = 0.96
 MAX_FULL_IMAGE_RATIO = 0.95
-
-
-@dataclass(slots=True)
-class ImageAnalysis:
-    width: int
-    height: int
-    dpi: tuple[int, int] | None
-    has_transparency: bool
-    transparency_ratio: float
-    format: str
-    mode: str
-    is_png: bool
-    case_hypothesis: str
-    bg_color: tuple[int, int, int]
-
-
-@dataclass(slots=True)
-class MaskCandidate:
-    """Representa una hipótesis de máscara candidata.
-
-    Convención de la máscara binaria (`mask`):
-      - 255 (o True) = diseño conservado (foreground).
-      - 0 (o False) = fondo eliminado (background).
-    """
-    name: str
-    mask: np.ndarray
-    status: str = "raw"
-    score: float = 0.0
-    confidence: float = 0.0
-    scores: dict[str, float] = field(default_factory=dict)
-    warnings: list[str] = field(default_factory=list)
-    diagnostics: dict[str, Any] = field(default_factory=dict)
-    duration_ms: int = 0
-    is_raw: bool = True
-    needs_postprocessing: bool = True
-    is_postprocessed: bool = False
-    discard_reason: str | None = None
-
-    def pil_mask(self):
-        return Image.fromarray(self.mask.astype(np.uint8), mode="L")
-
-
-@dataclass(slots=True)
-class ProcessingDecision:
-    selected_method: str
-    score: float
-    confidence: float
-    requires_review: bool
-    warnings: list[str]
-    candidate_scores: dict[str, float]
-    candidates: list[str]
-
-
-@dataclass(slots=True)
-class StickerMasks:
-    subject_mask: Any | None = None
-    print_mask: Any | None = None
-    white_base_mask: Any | None = None
-    cut_mask: Any | None = None
-    registration_mask: Any | None = None
-    protection_mask: Any | None = None
 
 
 class MaskCandidateError(ValueError):

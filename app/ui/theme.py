@@ -23,6 +23,9 @@ class Palette:
     text: str = "#F2F2F2"
     muted: str = "#B5B5BA"
     disabled: str = "#73737A"
+    primary: str = "#174B8A"
+    primary_active: str = "#2465B5"
+    primary_dark: str = "#102F59"
     wine: str = "#6E1730"
     wine_active: str = "#8A1F3D"
     wine_dark: str = "#42101F"
@@ -38,6 +41,140 @@ class Palette:
 COLORS = Palette()
 UI_FONT = "Segoe UI"
 IDENTITY_FONT = "Bahnschrift SemiCondensed"
+
+
+@dataclass(frozen=True)
+class Typography:
+    screen_title: int = 30
+    section_title: int = 20
+    subtitle: int = 13
+    body: int = 10
+    auxiliary: int = 9
+    metric: int = 16
+
+
+@dataclass(frozen=True)
+class Spacing:
+    xs: int = 4
+    sm: int = 8
+    md: int = 12
+    lg: int = 16
+    xl: int = 24
+    control_y: int = 7
+
+
+TYPE = Typography()
+SPACE = Spacing()
+
+
+# Las siguientes métricas son objetivos del sistema visual, no instrucciones
+# automáticas de tamaño. Cada componente futuro deberá traducirlas según use
+# Tkinter, ttk, Canvas o imágenes.
+@dataclass(frozen=True)
+class ComponentSizes:
+    button_height_px: int = 32
+    compact_button_height_px: int = 28
+    input_height_px: int = 32
+    compact_input_height_px: int = 28
+    toolbar_height_px: int = 44
+    tab_height_px: int = 36
+    table_row_height_px: int = 30
+
+
+@dataclass(frozen=True)
+class IconSizes:
+    small_px: int = 14
+    normal_px: int = 16
+    toolbar_px: int = 18
+    large_px: int = 20
+
+
+@dataclass(frozen=True)
+class BorderRadius:
+    none_px: int = 0
+    small_px: int = 4
+    medium_px: int = 6
+    large_px: int = 8
+
+
+@dataclass(frozen=True)
+class SemanticColors:
+    surface: str = COLORS.panel
+    surface_elevated: str = COLORS.panel_elevated
+    field: str = COLORS.field
+    border: str = COLORS.border
+    text: str = COLORS.text
+    text_muted: str = COLORS.muted
+    text_disabled: str = COLORS.disabled
+    action_primary: str = COLORS.primary
+    action_secondary: str = COLORS.panel_elevated
+    action_danger: str = COLORS.error
+    selection: str = COLORS.info
+    success: str = COLORS.success
+    warning: str = COLORS.warning
+    error: str = COLORS.error
+
+
+@dataclass(frozen=True)
+class ButtonRoles:
+    primary: str = "Primary.TButton"
+    secondary: str = "Secondary.TButton"
+    danger: str = "Danger.TButton"
+    warning: str = "Warning.TButton"
+    default: str = "TButton"
+
+
+@dataclass(frozen=True)
+class CardMetrics:
+    padding_x: int = SPACE.lg
+    padding_y: int = SPACE.md
+    section_gap: int = SPACE.xl
+    border_width_px: int = 1
+
+
+@dataclass(frozen=True)
+class FieldMetrics:
+    label_gap: int = SPACE.xs
+    field_gap: int = SPACE.sm
+    horizontal_padding: int = SPACE.sm
+    vertical_padding_px: int = 6
+
+
+@dataclass(frozen=True)
+class DialogMetrics:
+    content_padding: int = SPACE.xl
+    section_gap: int = SPACE.lg
+    action_gap: int = SPACE.sm
+    minimum_width_px: int = 360
+
+
+@dataclass(frozen=True)
+class ToolbarMetrics:
+    group_gap: int = SPACE.md
+    button_gap: int = SPACE.xs
+    padding_x: int = SPACE.lg
+    padding_y: int = SPACE.sm
+
+
+@dataclass(frozen=True)
+class LayoutMetrics:
+    compact_gap: int = SPACE.xs
+    related_gap: int = SPACE.sm
+    control_gap: int = SPACE.md
+    section_gap: int = SPACE.xl
+    page_padding: int = SPACE.lg
+
+
+SIZES = ComponentSizes()
+ICONS = IconSizes()
+RADIUS = BorderRadius()
+SEMANTIC_COLORS = SemanticColors()
+BUTTON_ROLES = ButtonRoles()
+CARD = CardMetrics()
+FIELD = FieldMetrics()
+DIALOG = DialogMetrics()
+TOOLBAR = ToolbarMetrics()
+LAYOUT = LayoutMetrics()
 
 
 def format_currency(value: float | int | None) -> str:
@@ -187,7 +324,11 @@ def apply_ttk_theme(root) -> ttk.Style:
     style.configure(".", background=COLORS.background, foreground=COLORS.text, font=(UI_FONT, 10))
     style.configure("TFrame", background=COLORS.background)
     style.configure("TLabel", background=COLORS.background, foreground=COLORS.text)
-    style.configure("Title.TLabel", background=COLORS.background, foreground=COLORS.text, font=(IDENTITY_FONT, 30, "bold"))
+    style.configure("Title.TLabel", background=COLORS.background, foreground=COLORS.text, font=(IDENTITY_FONT, TYPE.screen_title, "bold"))
+    # Escala específica para los encabezados de módulos: evita que cada vista
+    # defina su propio tamaño y conserva una jerarquía visual predecible.
+    style.configure("CommercialTitle.TLabel", background=COLORS.background, foreground=COLORS.text,
+                    font=(IDENTITY_FONT, TYPE.section_title, "bold"))
     style.configure("Module.TLabel", background=COLORS.background, foreground=COLORS.wine_active, font=(IDENTITY_FONT, 10, "bold"))
     style.configure("Tag.TLabel", background=COLORS.background, foreground=COLORS.wine_active, font=(IDENTITY_FONT, 10, "bold"))
     style.configure("Muted.TLabel", background=COLORS.background, foreground=COLORS.muted)
@@ -198,19 +339,36 @@ def apply_ttk_theme(root) -> ttk.Style:
     style.configure("Card.TFrame", background=COLORS.panel, relief="flat", borderwidth=0)
     style.configure("Card.TLabel", background=COLORS.panel, foreground=COLORS.text)
 
-    style.configure("TButton", background=COLORS.panel_elevated, foreground=COLORS.text, bordercolor=COLORS.border,
-                    relief="flat", borderwidth=0, padding=(12, 7), font=(UI_FONT, 10, "bold"))
+    # Controles compactos pero claros: todos comparten altura, borde y estados
+    # visibles para evitar que cada pantalla se sienta como una app distinta.
+    style.configure("TButton", background=COLORS.panel_elevated, foreground=COLORS.text, bordercolor=COLORS.border_strong,
+                    relief="flat", borderwidth=1, focuscolor=COLORS.primary_active, padding=(SPACE.md, SPACE.control_y), font=(UI_FONT, TYPE.body, "bold"))
     style.map("TButton", background=[("active", COLORS.border_strong), ("pressed", COLORS.background_secondary)],
               foreground=[("disabled", COLORS.disabled)])
-    style.configure("Primary.TButton", background=COLORS.wine, foreground=COLORS.text, bordercolor=COLORS.wine,
-                    padding=(13, 7), font=(UI_FONT, 10, "bold"))
-    style.map("Primary.TButton", background=[("active", COLORS.wine_active), ("pressed", COLORS.wine_dark)])
-    style.configure("Secondary.TButton", background=COLORS.panel_elevated, foreground=COLORS.text, bordercolor=COLORS.border,
-                    padding=(12, 7), font=(UI_FONT, 10, "bold"))
+    style.configure("Primary.TButton", background=COLORS.primary, foreground=COLORS.text, bordercolor=COLORS.primary,
+                    padding=(13, SPACE.control_y), font=(UI_FONT, TYPE.body, "bold"))
+    style.map("Primary.TButton", background=[("active", COLORS.primary_active), ("pressed", COLORS.primary_dark)])
+    style.configure("Secondary.TButton", background=COLORS.panel_elevated, foreground=COLORS.text, bordercolor=COLORS.border_strong,
+                    padding=(SPACE.md, SPACE.control_y), font=(UI_FONT, TYPE.body, "bold"))
     style.map("Secondary.TButton", background=[("active", COLORS.border_strong), ("pressed", COLORS.background_secondary)])
-    style.configure("Danger.TButton", background=COLORS.wine_dark, foreground=COLORS.text, bordercolor=COLORS.wine,
-                    padding=(12, 7), font=(UI_FONT, 10, "bold"))
-    style.map("Danger.TButton", background=[("active", COLORS.wine), ("pressed", "#2B0A14")])
+    style.configure("Warning.TButton", background=COLORS.warning, foreground=COLORS.background, bordercolor=COLORS.warning,
+                    padding=(SPACE.md, SPACE.control_y), font=(UI_FONT, TYPE.body, "bold"))
+    style.map("Warning.TButton", background=[("active", "#E2A53D"), ("pressed", "#8F5D16")])
+    style.configure("Danger.TButton", background=COLORS.error, foreground=COLORS.text, bordercolor=COLORS.error,
+                    padding=(SPACE.md, SPACE.control_y), font=(UI_FONT, TYPE.body, "bold"))
+    style.map("Danger.TButton", background=[("active", "#DD6170"), ("pressed", "#8F2C3A")])
+
+    # Alias semánticos: permiten que los módulos nuevos sean explícitos sin
+    # romper las referencias históricas a TButton/Primary.TButton.
+    style.configure("Doccione.TLabel", background=COLORS.background, foreground=COLORS.text, font=(UI_FONT, TYPE.body))
+    style.configure("Title.Doccione.TLabel", background=COLORS.background, foreground=COLORS.text, font=(IDENTITY_FONT, TYPE.screen_title, "bold"))
+    style.configure("Subtitle.Doccione.TLabel", background=COLORS.background, foreground=COLORS.muted, font=(UI_FONT, TYPE.subtitle))
+    style.configure("Doccione.TFrame", background=COLORS.background)
+    style.configure("Doccione.TButton", background=COLORS.panel_elevated, foreground=COLORS.text, bordercolor=COLORS.border_strong, padding=(SPACE.md, SPACE.control_y), font=(UI_FONT, TYPE.body, "bold"))
+    style.configure("Primary.Doccione.TButton", background=COLORS.primary, foreground=COLORS.text, bordercolor=COLORS.primary, padding=(13, SPACE.control_y), font=(UI_FONT, TYPE.body, "bold"))
+    style.map("Primary.Doccione.TButton", background=[("active", COLORS.primary_active), ("pressed", COLORS.primary_dark)])
+    style.configure("Secondary.Doccione.TButton", background=COLORS.panel_elevated, foreground=COLORS.text, bordercolor=COLORS.border_strong, padding=(SPACE.md, SPACE.control_y), font=(UI_FONT, TYPE.body, "bold"))
+    style.configure("Danger.Doccione.TButton", background=COLORS.error, foreground=COLORS.text, bordercolor=COLORS.error, padding=(SPACE.md, SPACE.control_y), font=(UI_FONT, TYPE.body, "bold"))
 
     style.configure("TEntry", fieldbackground=COLORS.field, foreground=COLORS.text, insertcolor=COLORS.text,
                     bordercolor=COLORS.border, lightcolor=COLORS.wine_active, darkcolor=COLORS.border,
@@ -222,9 +380,27 @@ def apply_ttk_theme(root) -> ttk.Style:
     style.map("TCombobox", fieldbackground=[("readonly", COLORS.field)], bordercolor=[("focus", COLORS.wine_active)])
     style.configure("TSpinbox", fieldbackground=COLORS.field, foreground=COLORS.text, insertcolor=COLORS.text,
                     arrowcolor=COLORS.text, bordercolor=COLORS.border, padding=(7, 5))
+    style.map("TSpinbox", bordercolor=[("focus", COLORS.wine_active)], fieldbackground=[("disabled", COLORS.background_secondary)])
+
+    style.configure("TMenubutton", background=COLORS.panel_elevated, foreground=COLORS.text,
+                    bordercolor=COLORS.border_strong, padding=(10, 6), font=(UI_FONT, 10, "bold"))
+    style.map("TMenubutton", background=[("active", COLORS.border_strong), ("pressed", COLORS.background_secondary)])
+    style.configure("TRadiobutton", background=COLORS.background, foreground=COLORS.text,
+                    indicatorcolor=COLORS.panel_elevated, indicatormargin=4, padding=(4, 3))
+    style.map("TRadiobutton", foreground=[("disabled", COLORS.disabled)], indicatorcolor=[("selected", COLORS.wine_active)])
+    style.configure("TCheckbutton", background=COLORS.background, foreground=COLORS.text,
+                    indicatorcolor=COLORS.panel_elevated, indicatormargin=4, padding=(4, 3))
+    style.map("TCheckbutton", foreground=[("disabled", COLORS.disabled)], indicatorcolor=[("selected", COLORS.wine_active)])
 
     style.configure("TScrollbar", background=COLORS.panel_elevated, troughcolor=COLORS.background_secondary,
                     arrowcolor=COLORS.muted, bordercolor=COLORS.border)
+    style.map("TScrollbar", background=[("active", COLORS.border_strong), ("pressed", COLORS.wine_active)])
+    style.configure("Horizontal.TScale", background=COLORS.panel, troughcolor=COLORS.background_secondary,
+                    sliderlength=18, bordercolor=COLORS.border_strong)
+    style.map("Horizontal.TScale", background=[("active", COLORS.wine_active)])
+    style.configure("Vertical.TScale", background=COLORS.panel, troughcolor=COLORS.background_secondary,
+                    sliderlength=18, bordercolor=COLORS.border_strong)
+    style.map("Vertical.TScale", background=[("active", COLORS.wine_active)])
     style.configure("TNotebook", background=COLORS.background, borderwidth=0, tabmargins=(0, 0, 0, 0))
     style.configure("TNotebook.Tab", background=COLORS.panel, foreground=COLORS.muted, padding=(14, 8),
                     font=(UI_FONT, 10, "bold"))
@@ -235,7 +411,9 @@ def apply_ttk_theme(root) -> ttk.Style:
     style.configure("Main.TNotebook", background=COLORS.background, borderwidth=0, tabmargins=(0, 0, 0, 0))
     style.layout("Main.TNotebook.Tab", [])
     style.configure("TSeparator", background=COLORS.border)
-    style.configure("TCheckbutton", background=COLORS.panel, foreground=COLORS.text, font=(UI_FONT, 10))
+    style.configure("TLabelframe", background=COLORS.panel, bordercolor=COLORS.border_strong, relief="flat", borderwidth=1)
+    style.configure("TLabelframe.Label", background=COLORS.panel, foreground=COLORS.wine_active, font=(UI_FONT, 9, "bold"))
+    style.configure("TPanedwindow", background=COLORS.background, sashwidth=7, sashrelief="flat")
 
     style.configure("Treeview", background=COLORS.panel, fieldbackground=COLORS.panel, foreground=COLORS.text,
                     rowheight=30, bordercolor=COLORS.border, font=(UI_FONT, 10))
@@ -243,7 +421,14 @@ def apply_ttk_theme(root) -> ttk.Style:
     style.configure("Treeview.Heading", background=COLORS.panel_elevated, foreground=COLORS.text,
                     relief="flat", padding=(8, 8), font=(UI_FONT, 10, "bold"))
     style.map("Treeview.Heading", background=[("active", COLORS.border_strong)])
+    style.configure("Doccione.Treeview", background=COLORS.panel, fieldbackground=COLORS.panel, foreground=COLORS.text,
+                    rowheight=30, bordercolor=COLORS.border, font=(UI_FONT, TYPE.body))
+    style.configure("Doccione.TEntry", fieldbackground=COLORS.field, foreground=COLORS.text, padding=(SPACE.sm, 6))
+    style.configure("Doccione.TCombobox", fieldbackground=COLORS.field, foreground=COLORS.text, padding=(7, 5))
+    style.configure("Doccione.TNotebook", background=COLORS.background, borderwidth=0)
     style.configure("Horizontal.TProgressbar", background=COLORS.wine_active, troughcolor=COLORS.panel_elevated,
+                    bordercolor=COLORS.border, lightcolor=COLORS.wine_active, darkcolor=COLORS.wine)
+    style.configure("Vertical.TProgressbar", background=COLORS.wine_active, troughcolor=COLORS.panel_elevated,
                     bordercolor=COLORS.border, lightcolor=COLORS.wine_active, darkcolor=COLORS.wine)
     return style
 
@@ -278,15 +463,15 @@ def configure_plancha_styles(root) -> None:
         # los valores visuales centrales sin involucrar lógica del editor.
         if shared == "Primary.TButton":
             style.configure(local, background=COLORS.wine, foreground=COLORS.text, bordercolor=COLORS.wine,
-                            padding=(12, 7), font=(UI_FONT, 10, "bold"))
+                            padding=(14, 10), font=(UI_FONT, 10, "bold"))
             style.map(local, background=[("active", COLORS.wine_active), ("pressed", COLORS.wine_dark)])
         elif shared == "Danger.TButton":
             style.configure(local, background=COLORS.wine_dark, foreground=COLORS.text, bordercolor=COLORS.wine,
-                            padding=(11, 7), font=(UI_FONT, 10, "bold"))
+                            padding=(14, 10), font=(UI_FONT, 10, "bold"))
             style.map(local, background=[("active", COLORS.wine), ("pressed", "#2B0A14")])
         else:
             style.configure(local, background=COLORS.panel_elevated, foreground=COLORS.text, bordercolor=COLORS.border,
-                            padding=(11, 7), font=(UI_FONT, 10, "bold"))
+                            padding=(14, 10), font=(UI_FONT, 10, "bold"))
             style.map(local, background=[("active", COLORS.border_strong), ("pressed", COLORS.background_secondary)])
 
     # Símbolos compactos para las barras de herramientas. El significado se
@@ -297,5 +482,5 @@ def configure_plancha_styles(root) -> None:
         ("Plancha.Icon.Danger.TButton", COLORS.wine_dark, COLORS.wine, "#2B0A14"),
     ):
         style.configure(local, background=background, foreground=COLORS.text, bordercolor=COLORS.border,
-                        padding=(7, 5), font=("Segoe UI Symbol", 12, "bold"))
+                        padding=(9, 7), font=("Segoe UI Symbol", 12, "bold"))
         style.map(local, background=[("active", active), ("pressed", pressed)], foreground=[("disabled", COLORS.disabled)])

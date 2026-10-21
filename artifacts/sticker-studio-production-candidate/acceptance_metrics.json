@@ -1,0 +1,335 @@
+{
+  "candidate": "2.0.0-rc.1",
+  "human_approval_performed": false,
+  "dataset": {
+    "count": 20,
+    "kind": "preserved_real_content_load_derivatives",
+    "minimum_pixels": 360000,
+    "maximum_pixels": 4000000
+  },
+  "functional": {
+    "successful": 20,
+    "errors": 0,
+    "master_export_identical": 20,
+    "cancellation_and_retry": {
+      "cancelled": true,
+      "retry_ok": true,
+      "retry_seconds": 3.8785
+    }
+  },
+  "performance": {
+    "open_20_seconds": 0.3316,
+    "processing_wall_seconds": 38.8602,
+    "processing_cpu_seconds": 57.7656,
+    "average_cpu_percent_one_core_equivalent": 148.6,
+    "switch_20_previews_seconds": 0.1025,
+    "average_switch_ms": 5.124,
+    "rss_before_mb": 45.26,
+    "peak_rss_mb": 462.27,
+    "rss_after_release_mb": 64.62,
+    "retained_delta_mb": 19.36
+  },
+  "items": [
+    {
+      "input": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-sprint15\\batch20\\inputs\\01_07_alta_resolucion_2000_original_2000x2000.png",
+      "input_sha256": "ba55a4a9a0938455c07580ef3dd80b1648e954415629025de0d1d8259430ab17",
+      "seconds": 4.4478,
+      "error": null,
+      "quality": "Revisar",
+      "master": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-production-candidate\\pipeline\\c8851b913ec5407c86ae82f2d2e33da9\\07_final_master.png",
+      "master_sha256": "c1313b70db571881bd4e0b20e604acf480e557f4c5167b4ed6a64d6d892e73d7",
+      "export_sha256": "c1313b70db571881bd4e0b20e604acf480e557f4c5167b4ed6a64d6d892e73d7",
+      "master_equals_export": true,
+      "master_size": [
+        673,
+        673
+      ]
+    },
+    {
+      "input": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-sprint15\\batch20\\inputs\\02_corazon_anatomico_clean_1225x1800.png",
+      "input_sha256": "e3762ab86bea9b9fcf6bd1baaa157bbd16d48f0cc26b2d01daa8bbf0ae0f8403",
+      "seconds": 3.6423,
+      "error": null,
+      "quality": "Error",
+      "master": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-production-candidate\\pipeline\\669146852c84477580c3471bcd61d73e\\07_final_master.png",
+      "master_sha256": "04ae1ea294cc30e48cda90e48b8554ace326b5355736599b7aeb80f1b9ec858e",
+      "export_sha256": "04ae1ea294cc30e48cda90e48b8554ace326b5355736599b7aeb80f1b9ec858e",
+      "master_equals_export": true,
+      "master_size": [
+        673,
+        673
+      ]
+    },
+    {
+      "input": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-sprint15\\batch20\\inputs\\03_hoja_clara_clean_1015x1600.png",
+      "input_sha256": "399b158b040d137c8c067060a89504cd22fde6cac3b95869546244edb893dfbe",
+      "seconds": 2.2328,
+      "error": null,
+      "quality": "Revisar",
+      "master": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-production-candidate\\pipeline\\51e9b55926d940c9944a115d0b30f89d\\07_final_master.png",
+      "master_sha256": "0ab8ff72562229ad88e3856727f82316cc044534cf9e0371bf3868264352b2bb",
+      "export_sha256": "0ab8ff72562229ad88e3856727f82316cc044534cf9e0371bf3868264352b2bb",
+      "master_equals_export": true,
+      "master_size": [
+        673,
+        673
+      ]
+    },
+    {
+      "input": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-sprint15\\batch20\\inputs\\04_estetoscopio_rosa_clean_806x1400.png",
+      "input_sha256": "e90f6a4d9525cd3a3a420325d3b7d7ae2ef9b6e0f9870d869536e1768bceb487",
+      "seconds": 1.417,
+      "error": null,
+      "quality": "Error",
+      "master": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-production-candidate\\pipeline\\11771a3d48d44a5d8b604b54bf53f0da\\07_final_master.png",
+      "master_sha256": "b540b38b6e14683d7d90176eb4ee372f292b22a6e722df3e5fd60d5c02425ee0",
+      "export_sha256": "b540b38b6e14683d7d90176eb4ee372f292b22a6e722df3e5fd60d5c02425ee0",
+      "master_equals_export": true,
+      "master_size": [
+        673,
+        673
+      ]
+    },
+    {
+      "input": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-sprint15\\batch20\\inputs\\05_rapunzel-flynn-corrected_1200x1200.png",
+      "input_sha256": "fef82a9dcf36c8d19158d6c33eb2f9ea1426a3b7e8213f1ee36f30e5b9a07640",
+      "seconds": 2.0758,
+      "error": null,
+      "quality": "Listo",
+      "master": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-production-candidate\\pipeline\\ea3bc371ccf649a2b5a052bedc95fd0c\\07_final_master.png",
+      "master_sha256": "00ea8a0bcb23077275c5be639d8ce62edfe33b63103d5752f7dd061ac50a7e31",
+      "export_sha256": "00ea8a0bcb23077275c5be639d8ce62edfe33b63103d5752f7dd061ac50a7e31",
+      "master_equals_export": true,
+      "master_size": [
+        673,
+        673
+      ]
+    },
+    {
+      "input": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-sprint15\\batch20\\inputs\\06_cinderella-prince-corrected_1000x1000.png",
+      "input_sha256": "761bdaeb09aae7012ea1270c8844bd8617367dec611222c1fb58d28a68d12a33",
+      "seconds": 1.4566,
+      "error": null,
+      "quality": "Listo",
+      "master": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-production-candidate\\pipeline\\4fa61b1937f64fe68818c495716080b4\\07_final_master.png",
+      "master_sha256": "9e3f462c8620a46b373c68fc3b42d6234ae0f992ab1964486cb337300112e21a",
+      "export_sha256": "9e3f462c8620a46b373c68fc3b42d6234ae0f992ab1964486cb337300112e21a",
+      "master_equals_export": true,
+      "master_size": [
+        673,
+        673
+      ]
+    },
+    {
+      "input": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-sprint15\\batch20\\inputs\\07_iconic-corrected_900x525.png",
+      "input_sha256": "3819b78ca35609b5cf99cff8034ac22daec4c4ff9b0de0832b6907991694c89e",
+      "seconds": 0.7922,
+      "error": null,
+      "quality": "Listo",
+      "master": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-production-candidate\\pipeline\\f2508bd47bc544d8a563657b1ab36425\\07_final_master.png",
+      "master_sha256": "296b0194d09b1455a4c7c982ab87723eeb7ce073e8e577e8c16a452138d4246d",
+      "export_sha256": "296b0194d09b1455a4c7c982ab87723eeb7ce073e8e577e8c16a452138d4246d",
+      "master_equals_export": true,
+      "master_size": [
+        673,
+        673
+      ]
+    },
+    {
+      "input": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-sprint15\\batch20\\inputs\\08_original_800x800.png",
+      "input_sha256": "2a59a3e4eccf5e5c8908dd6a3c59efd4c149e3e69933c458c6f7b40716c435f4",
+      "seconds": 2.1367,
+      "error": null,
+      "quality": "Revisar",
+      "master": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-production-candidate\\pipeline\\a271bb5a99fd4e05b3ebc1c35616cc03\\07_final_master.png",
+      "master_sha256": "ae004101a672e0c43ba168a3f87a743ce029a80c4735002b7d8a1d0739157e10",
+      "export_sha256": "ae004101a672e0c43ba168a3f87a743ce029a80c4735002b7d8a1d0739157e10",
+      "master_equals_export": true,
+      "master_size": [
+        673,
+        673
+      ]
+    },
+    {
+      "input": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-sprint15\\batch20\\inputs\\09_visual_support_600_OPAQUE_700x700.png",
+      "input_sha256": "cffad7352472d5b90fc0a242c8ea366001dc20560af146736d7498dacbde54ae",
+      "seconds": 0.9364,
+      "error": null,
+      "quality": "Revisar",
+      "master": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-production-candidate\\pipeline\\a68528e90b094bf2ab176532ab73430e\\07_final_master.png",
+      "master_sha256": "0b773534bfe25b2135a5c329e0d84abf67b4b15d5bd9808a91cac40729d61154",
+      "export_sha256": "0b773534bfe25b2135a5c329e0d84abf67b4b15d5bd9808a91cac40729d61154",
+      "master_equals_export": true,
+      "master_size": [
+        673,
+        673
+      ]
+    },
+    {
+      "input": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-sprint15\\batch20\\inputs\\10_04_transparencia_original_600x600.png",
+      "input_sha256": "064de330e88766d44cdbc7926a16d489df4f039c50223c4ebf6acee445e671b0",
+      "seconds": 0.4664,
+      "error": null,
+      "quality": "Revisar",
+      "master": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-production-candidate\\pipeline\\cf29751a8a7b464fbb7145ea9859dce6\\07_final_master.png",
+      "master_sha256": "429b45830c31b485977d8ed90aa4d160db2627b7f19f0ba7305c366b4ae8263a",
+      "export_sha256": "429b45830c31b485977d8ed90aa4d160db2627b7f19f0ba7305c366b4ae8263a",
+      "master_equals_export": true,
+      "master_size": [
+        673,
+        673
+      ]
+    },
+    {
+      "input": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-sprint15\\batch20\\inputs\\11_07_alta_resolucion_2000_original_2000x2000.png",
+      "input_sha256": "ba55a4a9a0938455c07580ef3dd80b1648e954415629025de0d1d8259430ab17",
+      "seconds": 4.1819,
+      "error": null,
+      "quality": "Revisar",
+      "master": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-production-candidate\\pipeline\\ac4ecdbc14cd49059a440026862b2836\\07_final_master.png",
+      "master_sha256": "c1313b70db571881bd4e0b20e604acf480e557f4c5167b4ed6a64d6d892e73d7",
+      "export_sha256": "c1313b70db571881bd4e0b20e604acf480e557f4c5167b4ed6a64d6d892e73d7",
+      "master_equals_export": true,
+      "master_size": [
+        673,
+        673
+      ]
+    },
+    {
+      "input": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-sprint15\\batch20\\inputs\\12_corazon_anatomico_clean_1225x1800.png",
+      "input_sha256": "e3762ab86bea9b9fcf6bd1baaa157bbd16d48f0cc26b2d01daa8bbf0ae0f8403",
+      "seconds": 3.3973,
+      "error": null,
+      "quality": "Error",
+      "master": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-production-candidate\\pipeline\\652c8e7752b345c8905b4b35ccccb2e3\\07_final_master.png",
+      "master_sha256": "04ae1ea294cc30e48cda90e48b8554ace326b5355736599b7aeb80f1b9ec858e",
+      "export_sha256": "04ae1ea294cc30e48cda90e48b8554ace326b5355736599b7aeb80f1b9ec858e",
+      "master_equals_export": true,
+      "master_size": [
+        673,
+        673
+      ]
+    },
+    {
+      "input": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-sprint15\\batch20\\inputs\\13_hoja_clara_clean_1015x1600.png",
+      "input_sha256": "399b158b040d137c8c067060a89504cd22fde6cac3b95869546244edb893dfbe",
+      "seconds": 2.2359,
+      "error": null,
+      "quality": "Revisar",
+      "master": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-production-candidate\\pipeline\\ad617c924bbe47e685f7c497c413ed6e\\07_final_master.png",
+      "master_sha256": "0ab8ff72562229ad88e3856727f82316cc044534cf9e0371bf3868264352b2bb",
+      "export_sha256": "0ab8ff72562229ad88e3856727f82316cc044534cf9e0371bf3868264352b2bb",
+      "master_equals_export": true,
+      "master_size": [
+        673,
+        673
+      ]
+    },
+    {
+      "input": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-sprint15\\batch20\\inputs\\14_estetoscopio_rosa_clean_806x1400.png",
+      "input_sha256": "e90f6a4d9525cd3a3a420325d3b7d7ae2ef9b6e0f9870d869536e1768bceb487",
+      "seconds": 1.4653,
+      "error": null,
+      "quality": "Error",
+      "master": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-production-candidate\\pipeline\\8147a10c7d5c47e89842269f81fc8473\\07_final_master.png",
+      "master_sha256": "b540b38b6e14683d7d90176eb4ee372f292b22a6e722df3e5fd60d5c02425ee0",
+      "export_sha256": "b540b38b6e14683d7d90176eb4ee372f292b22a6e722df3e5fd60d5c02425ee0",
+      "master_equals_export": true,
+      "master_size": [
+        673,
+        673
+      ]
+    },
+    {
+      "input": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-sprint15\\batch20\\inputs\\15_rapunzel-flynn-corrected_1200x1200.png",
+      "input_sha256": "fef82a9dcf36c8d19158d6c33eb2f9ea1426a3b7e8213f1ee36f30e5b9a07640",
+      "seconds": 2.1352,
+      "error": null,
+      "quality": "Listo",
+      "master": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-production-candidate\\pipeline\\bc64b6806a2f4df0914420cfbfd2164c\\07_final_master.png",
+      "master_sha256": "00ea8a0bcb23077275c5be639d8ce62edfe33b63103d5752f7dd061ac50a7e31",
+      "export_sha256": "00ea8a0bcb23077275c5be639d8ce62edfe33b63103d5752f7dd061ac50a7e31",
+      "master_equals_export": true,
+      "master_size": [
+        673,
+        673
+      ]
+    },
+    {
+      "input": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-sprint15\\batch20\\inputs\\16_cinderella-prince-corrected_1000x1000.png",
+      "input_sha256": "761bdaeb09aae7012ea1270c8844bd8617367dec611222c1fb58d28a68d12a33",
+      "seconds": 1.4994,
+      "error": null,
+      "quality": "Listo",
+      "master": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-production-candidate\\pipeline\\7f87fe2880494cf68c7884d1de4c4130\\07_final_master.png",
+      "master_sha256": "9e3f462c8620a46b373c68fc3b42d6234ae0f992ab1964486cb337300112e21a",
+      "export_sha256": "9e3f462c8620a46b373c68fc3b42d6234ae0f992ab1964486cb337300112e21a",
+      "master_equals_export": true,
+      "master_size": [
+        673,
+        673
+      ]
+    },
+    {
+      "input": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-sprint15\\batch20\\inputs\\17_iconic-corrected_900x525.png",
+      "input_sha256": "3819b78ca35609b5cf99cff8034ac22daec4c4ff9b0de0832b6907991694c89e",
+      "seconds": 0.8872,
+      "error": null,
+      "quality": "Listo",
+      "master": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-production-candidate\\pipeline\\1b232ae537d64c08a4696eb284af7504\\07_final_master.png",
+      "master_sha256": "296b0194d09b1455a4c7c982ab87723eeb7ce073e8e577e8c16a452138d4246d",
+      "export_sha256": "296b0194d09b1455a4c7c982ab87723eeb7ce073e8e577e8c16a452138d4246d",
+      "master_equals_export": true,
+      "master_size": [
+        673,
+        673
+      ]
+    },
+    {
+      "input": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-sprint15\\batch20\\inputs\\18_original_800x800.png",
+      "input_sha256": "2a59a3e4eccf5e5c8908dd6a3c59efd4c149e3e69933c458c6f7b40716c435f4",
+      "seconds": 2.2297,
+      "error": null,
+      "quality": "Revisar",
+      "master": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-production-candidate\\pipeline\\1c35e6edad484edda73973700b3d9f4e\\07_final_master.png",
+      "master_sha256": "ae004101a672e0c43ba168a3f87a743ce029a80c4735002b7d8a1d0739157e10",
+      "export_sha256": "ae004101a672e0c43ba168a3f87a743ce029a80c4735002b7d8a1d0739157e10",
+      "master_equals_export": true,
+      "master_size": [
+        673,
+        673
+      ]
+    },
+    {
+      "input": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-sprint15\\batch20\\inputs\\19_visual_support_600_OPAQUE_700x700.png",
+      "input_sha256": "cffad7352472d5b90fc0a242c8ea366001dc20560af146736d7498dacbde54ae",
+      "seconds": 0.8268,
+      "error": null,
+      "quality": "Revisar",
+      "master": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-production-candidate\\pipeline\\1abab100f4a14de1b94b98413540756c\\07_final_master.png",
+      "master_sha256": "0b773534bfe25b2135a5c329e0d84abf67b4b15d5bd9808a91cac40729d61154",
+      "export_sha256": "0b773534bfe25b2135a5c329e0d84abf67b4b15d5bd9808a91cac40729d61154",
+      "master_equals_export": true,
+      "master_size": [
+        673,
+        673
+      ]
+    },
+    {
+      "input": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-sprint15\\batch20\\inputs\\20_04_transparencia_original_600x600.png",
+      "input_sha256": "064de330e88766d44cdbc7926a16d489df4f039c50223c4ebf6acee445e671b0",
+      "seconds": 0.3972,
+      "error": null,
+      "quality": "Revisar",
+      "master": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\artifacts\\sticker-studio-production-candidate\\pipeline\\b3a3d130ba114dfa9651e4a342d919e8\\07_final_master.png",
+      "master_sha256": "429b45830c31b485977d8ed90aa4d160db2627b7f19f0ba7305c366b4ae8263a",
+      "export_sha256": "429b45830c31b485977d8ed90aa4d160db2627b7f19f0ba7305c366b4ae8263a",
+      "master_equals_export": true,
+      "master_size": [
+        673,
+        673
+      ]
+    }
+  ],
+  "decision": "PENDIENTE DE VALIDACIÓN HUMANA Y FÍSICA"
+}
