@@ -810,11 +810,11 @@ class StickerProcessor:
         # Para entradas opacas, el damero se detecta sin asumir que sea parte
         # del diseño. El detector exige sus dos bandas neutras en el perímetro.
         checkerboard = False
+        checker_alpha = None
         if not useful_alpha:
             try:
-                checkerboard = (
-                    StickerProcessor._checkerboard_exterior_alpha(rgba)
-                    is not None)
+                checker_alpha = StickerProcessor._checkerboard_exterior_alpha(rgba)
+                checkerboard = checker_alpha is not None
             except Exception:
                 pass
 
@@ -822,7 +822,6 @@ class StickerProcessor:
         foreground_isolated = bool(useful_alpha)
         if not useful_alpha and checkerboard:
             try:
-                checker_alpha = StickerProcessor._checkerboard_exterior_alpha(rgba)
                 foreground = np.asarray(checker_alpha, dtype=np.uint8) > 127
                 foreground_isolated = True
             except Exception:
@@ -873,9 +872,8 @@ class StickerProcessor:
         small = rgb.copy()
         small.thumbnail((192, 192))
         rgb_arr = np.asarray(small, dtype=np.uint8)
-        gray = np.asarray(small.convert("L"), dtype=np.uint8)
-        edge = np.asarray(small.convert("L").filter(ImageFilter.FIND_EDGES),
-                              dtype=np.uint8)
+        gray_image = small.convert("L")
+        edge = np.asarray(gray_image.filter(ImageFilter.FIND_EDGES), dtype=np.uint8)
         edge_density = float((edge > 38).mean())
         palette = small.convert("P", palette=1, colors=64).getcolors(192 * 192) or []
         palette_count = len(palette)
@@ -6289,7 +6287,7 @@ class StickerProcessor:
         # corrida. No reutiliza una máscara ya contraída ni toca los colores.
         selection_base_alpha = refined_alpha.copy()
         selection_base_path = output / "selection_alpha_original.png"
-        selection_base_alpha.save(selection_base_path, optimize=False)
+        shutil.copy2(border_treatment_mask_path, selection_base_path)
         artifacts["selection_alpha_original"] = str(selection_base_path)
         from .mask_contraction import offset_alpha_signed_distance
         selection_offset_mm = selection_contraction_mm - selection_expansion_mm
@@ -6349,10 +6347,10 @@ class StickerProcessor:
         # Se expone siempre la base previa a la contracción para que editar y
         # reprocesar no vuelva a contraer un resultado ya desplazado.
         editable_mask_path = output / "mask_editable.png"
-        selection_base_alpha.save(editable_mask_path, optimize=False)
+        shutil.copy2(selection_base_path, editable_mask_path)
         artifacts["mask_editable"] = str(editable_mask_path)
         editable_source_path = output / "source_editable.png"
-        rgba.save(editable_source_path, optimize=False)
+        shutil.copy2(loaded_temp, editable_source_path)
         artifacts["source_editable"] = str(editable_source_path)
         progress(48, "Verificando necesidad de padding transparente")
         # Check if we need to add padding for integrated backgrounds

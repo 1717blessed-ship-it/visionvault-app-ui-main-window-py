@@ -15,9 +15,14 @@ def exterior_regions(image, alpha):
     rgb = np.asarray(image.convert('RGB'), dtype=np.int16)
     a = np.asarray(alpha.convert('L'), dtype=np.uint8)
     visible = a > 12
-    neutral = rgb.max(2) - rgb.min(2) <= 20
-    white = neutral & (rgb.min(2) >= 235) & visible
-    grey = neutral & (rgb.min(2) >= 80) & (rgb.max(2) <= 230)
+    # Las reducciones por canal son costosas sobre originales grandes. El
+    # código anterior recalculaba exactamente los mismos min/max hasta cinco
+    # veces; conservar ambos arrays no cambia redondeos ni decisiones.
+    rgb_min = rgb.min(axis=2)
+    rgb_max = rgb.max(axis=2)
+    neutral = rgb_max - rgb_min <= 20
+    white = neutral & (rgb_min >= 235) & visible
+    grey = neutral & (rgb_min >= 80) & (rgb_max <= 230)
     passable = (~visible | grey).astype(np.uint8)
     count, labels = cv2.connectedComponents(passable, connectivity=8)
     seeds = np.unique(np.concatenate((labels[0], labels[-1], labels[:, 0], labels[:, -1])))
@@ -101,7 +106,7 @@ def confirmed_white_border(image, alpha):
     """Conservative rendering signal, not another visual/technical class."""
     candidate, _, info = exterior_regions(image, alpha)
     rgb = np.asarray(image.convert('RGB'), dtype=np.int16)
-    chromatic = (rgb.max(2)-rgb.min(2) > 40) & (np.asarray(alpha) > 127)
+    chromatic = (np.ptp(rgb, axis=2) > 40) & (np.asarray(alpha) > 127)
     ratio = info['white_edge_ratio']
     if candidate.any() and not info['ambiguous_pixels']:
         potential = np.asarray(alpha).copy()
