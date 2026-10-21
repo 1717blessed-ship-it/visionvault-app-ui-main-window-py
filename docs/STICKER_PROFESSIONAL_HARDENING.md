@@ -350,3 +350,12 @@ SHA-256 de sesión, preferencias y perfiles. El dictamen es **APROBADO PARA USO
 ASISTIDO**, no producción definitiva. Ver
 `docs/STICKER_STUDIO_PRODUCTIVE_ACCEPTANCE.md` y
 `docs/STICKER_STUDIO_PHYSICAL_ACCEPTANCE_FORM.md`.
+
+## Cierre funcional 2.0
+
+El 20 de octubre de 2026 el usuario declaró el desarrollo funcional finalizado
+y aceptado. No se continuarán nuevos sprints. Se preservan editor clásico,
+rutas A/B/C/D, perfiles, calibraciones, máscaras, configuraciones, sesiones y
+respaldos. Las validaciones físicas permanecen registradas como pendientes, sin
+atribuirles una homologación inexistente y sin bloquear el cierre funcional.
+Ver `docs/STICKER_STUDIO_2_FUNCTIONAL_CLOSURE.md`.

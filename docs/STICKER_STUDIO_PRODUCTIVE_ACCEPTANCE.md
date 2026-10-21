@@ -1,12 +1,15 @@
 # Sticker Studio 2.0 — aceptación productiva final
 
-Versión candidata: **2.0.0-rc.1**  
+Versión candidata preservada: **2.0.0-rc.1**  
+Versión funcional estable: **2.0.0**  
 Fecha: 20 de octubre de 2026  
-Estado global: **APROBADO PARA USO ASISTIDO**
+Estado de desarrollo: **FUNCIONALMENTE FINALIZADO Y ACEPTADO POR EL USUARIO**  
+Estado de homologación física: **PENDIENTE**
 
-Esta homologación congela nuevas funcionalidades. No se declara reemplazo total
-del editor clásico ni disponibilidad productiva sin asistencia hasta completar
-la aprobación visual P1 y la prueba física de impresión/corte.
+El usuario cerró el desarrollo funcional y congeló nuevas funcionalidades. El
+editor clásico se mantiene como respaldo. La inspección P1 y la prueba física
+continúan documentadas como validaciones independientes aún no homologadas; no
+se presentan como realizadas ni bloquean el cierre funcional solicitado.
 
 ## Tabla de aceptación
 
@@ -24,7 +27,8 @@ la aprobación visual P1 y la prueba física de impresión/corte.
 | Máscara real disco 421×421 | PENDIENTE DE VALIDACIÓN HUMANA | Candidata disponible; `human_approved` permanece `false`. |
 | Máscara real estrellas 600×600 | PENDIENTE DE VALIDACIÓN HUMANA | Candidata disponible; `human_approved` permanece `false`. |
 | Hoja A4, impresión y ScanNCut | PENDIENTE DE VALIDACIÓN HUMANA | PDF preparado; faltan impresión al 100 %, medición y corte físico. |
-| Sustitución definitiva del editor clásico | BLOQUEADO | Depende de aprobar los dos puntos anteriores. El retorno al editor clásico permanece disponible. |
+| Desarrollo funcional del editor V2 | APROBADO | Finalizado y aceptado expresamente por el usuario. |
+| Retiro del editor clásico | NO AUTORIZADO | Se conserva como mecanismo de respaldo. |
 
 ## Validación de 20 imágenes preservadas
 
@@ -129,14 +133,17 @@ La omisión corresponde al conjunto externo shield1.png…shield5.png ausente. L
 cuatro advertencias son `PytestReturnNotNoneWarning` históricas. Los scripts de
 homologación se compilaron y ejecutaron correctamente.
 
-## Decisión
+## Decisión de homologación técnica
 
-Sticker Studio 2.0 puede utilizarse en **modo asistido**, conservando el editor
-clásico como respaldo y exigiendo revisión humana antes de exportar casos
-ambiguos. El reemplazo definitivo del clásico permanece bloqueado hasta:
+El desarrollo funcional de Sticker Studio 2.0 queda cerrado y aceptado. Para los
+casos ambiguos se mantiene la revisión humana y el editor clásico continúa como
+respaldo. La homologación física formal permanece pendiente de:
 
 1. aprobación humana del disco 421×421 y estrellas 600×600;
 2. impresión A4 medida al 100 %;
 3. corte real con Brother ScanNCut X225;
 4. firma de aceptación del operador.
+
+Estas actividades no bloquean el cierre funcional, pero tampoco pueden darse
+por aprobadas sin evidencia.
 
