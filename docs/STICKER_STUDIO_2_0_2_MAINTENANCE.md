@@ -1,6 +1,7 @@
 # Sticker Studio 2.0.2 — mantenimiento de interfaz
 
-Fecha: 2026-10-21. Estado: candidato verificado; no publicado ni etiquetado.
+Fecha: 2026-10-21. Estado: candidato técnico verificado; promoción estable
+pendiente de validación interactiva humana. No publicado ni etiquetado.
 
 ## Base y alcance
 
@@ -113,3 +114,49 @@ funciones de prueba que retornan `bool`; no son fallos ni regresiones nuevas.
 
 Recomendación: **aceptar como candidato 2.0.2**. La suite general final quedó
 limpia, la mejora es material con 50–200 trabajos y no modifica producción.
+
+## Cierre de estabilización 2.0.2
+
+Commit candidato auditado: `011f38081fa549c8da32e27697894da750a10a33`.
+La rama `codex/sticker-studio-2.0.2-virtual-tray` contiene como ancestro a
+`codex/sticker-studio-performance-2.0.1` (`aa6142d`) y conserva intacta la
+etiqueta estable `sticker-studio-v2.0.0` (commit publicado por la etiqueta:
+`bd7f93bf0f5b063b95936769eb8f82e60b2daed1`). Los cinco commits entre 2.0.0
+y el candidato afectan únicamente Sticker Studio, sus pruebas, scripts de
+medición y esta documentación. Los cambios ajenos preexistentes del checkout
+no están incluidos en esos commits.
+
+Validación final repetida sobre el candidato:
+
+- Suite focalizada: **133 aprobadas y 3 subpruebas aprobadas** en 67,49 s.
+- Suite general: **1.180 aprobadas, 2 omitidas y 5 subpruebas aprobadas** en
+  239,31 s. Las cuatro advertencias históricas corresponden a pruebas que
+  retornan `bool`; no son fallos. La diferencia frente a la corrida previa de
+  1.181/1 es una omisión adicional dependiente del entorno.
+- Lote real: 20/20 procesados y comparados. Todos los masters, exportaciones,
+  máscaras y artefactos raster comunes conservaron SHA-256; también
+  coincidieron clasificación, calidad, rutas, dimensiones, DPI y contratos.
+- Matriz de operaciones: 18/18 resultados idénticos para disco 421x421 y
+  soporte opaco 600x600, incluyendo contracción, expansión, suavizado y los
+  tres tratamientos de borde.
+- Bandeja: 20/50/100/200 trabajos mantienen como máximo 11 tarjetas vivas;
+  selección y eliminación virtualizadas están cubiertas por regresión.
+- El bloqueo de revisión, envío y exportación durante un resultado provisional
+  tiene pruebas automatizadas y ningún preview puede publicarse.
+
+Validaciones humanas todavía requeridas antes de promover:
+
+1. Recorrido interactivo continuo en Windows del flujo completo (selección
+   múltiple, confirmación de eliminación, edición manual, deshacer/rehacer,
+   provisional/definitivo, recuperación, revisión y exportación). La
+   automatización abrió la aplicación, pero perdió control exclusivo de la
+   ventana por actividad simultánea en el escritorio; no se reutilizaron
+   coordenadas potencialmente obsoletas.
+2. Homologación visual P1 de los recortes problemáticos, mantenida por
+   separado y sin aprobación automática.
+3. Impresión y corte físicos, también documentados por separado.
+
+Dictamen: **candidato técnicamente aprobado, promoción estable pendiente de
+validación humana interactiva**. Por el criterio de aceptación acordado no se
+crea todavía `sticker-studio-v2.0.2`. La etiqueta 2.0.0, el editor clásico,
+los perfiles, las calibraciones y los respaldos permanecen disponibles.
