@@ -5,6 +5,7 @@ from __future__ import annotations
 import tkinter as tk
 import json
 import copy
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
@@ -54,9 +55,13 @@ class StickerStudioV2(StickerStudio):
         self._v2_dirty = False
         self._v2_store = SessionStore(Path("work/stickers/studio_v2_session.json"))
         self._v2_preview_after = None
+        self._v2_commit_after = None
         self._v2_preview_generation = 0
         self._v2_preview_future = None
         self._v2_preview_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sticker-preview")
+        self._v2_geometry_cache = OrderedDict()
+        self._v2_geometry_cache_bytes = 0
+        self._v2_geometry_cache_limit = 64 * 1024 * 1024
         self._v2_editor_state = tk.StringVar(value="Guardado")
         self._v2_mode = tk.StringVar(value="Final")
         self._v2_cut = tk.BooleanVar(value=False)
@@ -189,6 +194,8 @@ class StickerStudioV2(StickerStudio):
         self._v2_canvas.pack(fill="both", expand=True)
         self._v2_inspector = Inspector(
             workspace, self, self._apply_inspector, self._schedule_contraction_preview,
+            self._interactive_parameter_changed,
+            self._commit_interactive_preview,
             self._undo_edit, self._redo_edit, self._reset_edit,
             self._approve_mask_reference, self._review_current, self._send_to_processed)
         workspace.add(self._v2_inspector, minsize=260, width=280, stretch="never")
@@ -225,6 +232,12 @@ class StickerStudioV2(StickerStudio):
     def _process_current(self):
         if self.current_index is not None:
             self._start_filtered_batch([self.current_index])
+
+    def _process_index(self, index):
+        if 0 <= index < len(self.jobs):
+            self.jobs[index]["v2_running_parameter_state"] = self._current_parameter_state(
+                self.jobs[index])
+        super()._process_index(index)
 
     def _set_numeric_zoom(self):
         try:
@@ -334,6 +347,12 @@ class StickerStudioV2(StickerStudio):
         """Exporta exactamente el master mostrado, sin recomponer ni reescalar."""
         job = self.current_job()
         result = job.get("result") if job else None
+        if job and self._job_has_pending_parameters(job):
+            messagebox.showwarning(
+                "Cálculo pendiente",
+                "Esperá a que termine el master definitivo del ajuste actual antes de exportar.",
+                parent=self)
+            return
         if not job or not review_is_current(job):
             messagebox.showwarning(
                 "Falta revisión",
@@ -360,6 +379,11 @@ class StickerStudioV2(StickerStudio):
         if self._v2_selection.indices:
             return sorted(i for i in self._v2_selection.indices if i < len(self.jobs))
         return [] if self.current_index is None else [self.current_index]
+
+    def _job_has_pending_parameters(self, job):
+        if job is self.current_job():
+            return self._current_parameter_state(job) != self._visible_parameter_state(job)
+        return bool(job.get("v2_preview_active") or job.get("v2_pending_definitive"))
 
     def _start_filtered_batch(self, indices):
         eligible = [i for i in sorted(set(indices)) if 0 <= i < len(self.jobs)
@@ -444,7 +468,8 @@ class StickerStudioV2(StickerStudio):
 
     def _export_selected(self):
         indices = self._selected_indices()
-        exportable = [i for i in indices if review_is_current(self.jobs[i])]
+        exportable = [i for i in indices if review_is_current(self.jobs[i])
+                      and not self._job_has_pending_parameters(self.jobs[i])]
         if not exportable:
             messagebox.showwarning("Sin resultados", "La selección no contiene PNG finales exportables.", parent=self)
             return
@@ -495,7 +520,51 @@ class StickerStudioV2(StickerStudio):
             self._materialize_manual_mask(job)
             job.pop("v2_preview_active", None)
             self._save_v2_session()
+            if job.get("status") == "Procesando":
+                job["v2_pending_definitive"] = True
+                self.cancel_event.set()
+                self.status.set("Descartando cálculo anterior; se aplicará el ajuste más reciente…")
+                return
         self.reprocess_current()
+
+    def _interactive_parameter_changed(self):
+        """Respuesta rápida mientras se mueve; consolida tras una pausa real."""
+        self._schedule_contraction_preview()
+        if self._v2_commit_after is not None:
+            try:
+                self.after_cancel(self._v2_commit_after)
+            except tk.TclError:
+                pass
+        self._v2_commit_after = self.after(650, self._commit_interactive_preview)
+
+    def _commit_interactive_preview(self):
+        """Materializa sólo si el control visible difiere del master vigente."""
+        if self._v2_commit_after is not None:
+            try:
+                self.after_cancel(self._v2_commit_after)
+            except tk.TclError:
+                pass
+            self._v2_commit_after = None
+        job = self.current_job()
+        if job is None or self._current_parameter_state(job) == self._visible_parameter_state(job):
+            return
+        self._cancel_v2_preview()
+        self._v2_editor_state.set("Generando master definitivo…")
+        self._apply_inspector()
+
+    def _cancel_v2_preview(self):
+        self._v2_preview_generation += 1
+        if self._v2_preview_after is not None:
+            try:
+                self.after_cancel(self._v2_preview_after)
+            except tk.TclError:
+                pass
+            self._v2_preview_after = None
+        if self._v2_preview_future is not None and not self._v2_preview_future.done():
+            self._v2_preview_future.cancel()
+        job = self.current_job()
+        if job is not None:
+            job.pop("v2_preview_active", None)
 
     def _schedule_contraction_preview(self):
         if not hasattr(self, "_v2_canvas"):
@@ -533,9 +602,32 @@ class StickerStudioV2(StickerStudio):
         offset = job["v2_preview_contraction_mm"] - job["v2_preview_expansion_mm"]
         smoothing = job["v2_preview_smoothing_mm"]
         snapshot = copy.deepcopy(document)
-        future = self._v2_preview_executor.submit(snapshot.render, base, offset, dpi, smoothing)
+        future = self._v2_preview_executor.submit(
+            self._render_geometry_preview, snapshot, base, offset, dpi, smoothing)
         self._v2_preview_future = future
         self.after(20, lambda j=job, g=generation, f=future: self._poll_async_preview(j, g, f))
+
+    def _render_geometry_preview(self, document, base, offset, dpi, smoothing):
+        operations = tuple(
+            (stroke.tool, stroke.points, stroke.size_px, stroke.hardness, stroke.opacity)
+            for stroke in document.operations)
+        key = (document.base_sha256, document.width, document.height, operations,
+               float(offset), float(dpi), float(smoothing))
+        cached = self._v2_geometry_cache.get(key)
+        if cached is not None:
+            self._v2_geometry_cache.move_to_end(key)
+            mask, protection, report, _size = cached
+            return mask.copy(), protection.copy(), report
+        mask, protection, report = document.render(base, offset, dpi, smoothing)
+        size = mask.width * mask.height + protection.width * protection.height
+        self._v2_geometry_cache[key] = (mask.copy(), protection.copy(), report, size)
+        self._v2_geometry_cache_bytes = getattr(self, "_v2_geometry_cache_bytes", 0) + size
+        self._v2_geometry_cache.move_to_end(key)
+        limit = getattr(self, "_v2_geometry_cache_limit", 64 * 1024 * 1024)
+        while self._v2_geometry_cache_bytes > limit and len(self._v2_geometry_cache) > 1:
+            _old_key, (_mask, _protection, _report, old_size) = self._v2_geometry_cache.popitem(last=False)
+            self._v2_geometry_cache_bytes -= old_size
+        return mask, protection, report
 
     def _poll_async_preview(self, job, generation, future):
         """Consulta el worker desde Tk; ningún hilo secundario toca widgets."""
@@ -718,6 +810,16 @@ class StickerStudioV2(StickerStudio):
         super()._continue_queue()
 
     def _finish_result(self, index, result):
+        if 0 <= index < len(self.jobs):
+            job = self.jobs[index]
+            running = job.pop("v2_running_parameter_state", None)
+            if running is not None and running != self._current_parameter_state(job):
+                job["status"] = "Reprocesar"
+                job.pop("v2_pending_definitive", None)
+                self.cancel_event.clear()
+                self.status.set("Resultado obsoleto descartado; generando el master vigente…")
+                self.after(80, self.reprocess_current)
+                return
         viewed = self.current_index
         super()._finish_result(index, result)
         if 0 <= index < len(self.jobs):
@@ -733,8 +835,17 @@ class StickerStudioV2(StickerStudio):
         self._save_v2_session()
 
     def _finish_cancelled(self, index):
+        pending = (0 <= index < len(self.jobs)
+                   and self.jobs[index].pop("v2_pending_definitive", False))
+        if 0 <= index < len(self.jobs):
+            self.jobs[index].pop("v2_running_parameter_state", None)
         super()._finish_cancelled(index)
         self._v2_batch_filter = None
+        if pending:
+            self.cancel_event.clear()
+            self.jobs[index]["status"] = "Reprocesar"
+            self.after(80, self.reprocess_current)
+            self.status.set("Generando el master definitivo del ajuste más reciente…")
         self._save_v2_session()
 
     def add_paths(self, paths, run_queue: bool = True):
@@ -928,6 +1039,11 @@ class StickerStudioV2(StickerStudio):
     def _review_current(self):
         job = self.current_job()
         result = job.get("result") if job else None
+        if job and self._job_has_pending_parameters(job):
+            messagebox.showwarning(
+                "Cálculo pendiente",
+                "Esperá a que termine el master definitivo antes de revisarlo.", parent=self)
+            return False
         if not job or not result:
             messagebox.showwarning("Sin resultado", "Procesá el sticker antes de revisarlo.", parent=self)
             return False
@@ -943,6 +1059,11 @@ class StickerStudioV2(StickerStudio):
 
     def _send_to_processed(self):
         job = self.current_job()
+        if job and self._job_has_pending_parameters(job):
+            messagebox.showwarning(
+                "Cálculo pendiente",
+                "Esperá a que termine el master definitivo antes de enviarlo.", parent=self)
+            return False
         if not job or not review_is_current(job):
             messagebox.showwarning("Falta revisión", "Revisá el master actual antes de enviarlo.", parent=self)
             return False

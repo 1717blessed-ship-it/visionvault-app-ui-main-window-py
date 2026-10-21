@@ -81,7 +81,8 @@ class ToolRail(tk.Frame):
 
 
 class Inspector(tk.Frame):
-    def __init__(self, master, studio, on_apply, on_preview, on_undo, on_redo,
+    def __init__(self, master, studio, on_apply, on_preview, on_interactive,
+                 on_commit, on_undo, on_redo,
                  on_reset, on_approve_reference, on_review, on_send):
         super().__init__(master, background=COLORS.panel, width=280,
                          highlightthickness=1, highlightbackground=COLORS.border)
@@ -121,12 +122,13 @@ class Inspector(tk.Frame):
 
         section_label(self.content, "Configuración").pack(anchor="w", padx=14, pady=(18, 6))
         self._scale("Contraer selección (mm)", studio._v2_contraction_mm,
-                    0, 2, .1, on_preview)
+                    0, 2, .1, on_interactive, on_commit)
         self._scale("Expandir selección (mm)", studio._v2_expansion_mm,
-                    0, 2, .1, on_preview)
-        self._field("Borde blanco (mm)", studio._v2_border_mm)
+                    0, 2, .1, on_interactive, on_commit)
+        self._scale("Borde blanco (mm)", studio._v2_border_mm,
+                    0, 5, .01, on_interactive, on_commit)
         self._scale("Suavizado del borde (mm)", studio._v2_smoothing_mm,
-                    0, 1, .05, on_preview)
+                    0, 1, .05, on_interactive, on_commit)
         self._scale("Tamaño del pincel (px)", studio._v2_brush_size,
                     1, 160, 1, lambda: None)
         self._scale("Dureza", studio._v2_brush_hardness,
@@ -182,7 +184,7 @@ class Inspector(tk.Frame):
                  font=(UI_FONT, 8)).pack(anchor="w", padx=14, pady=(7, 2))
         ttk.Entry(self.content, textvariable=variable).pack(fill="x", padx=14)
 
-    def _scale(self, label, variable, lower, upper, resolution, command):
+    def _scale(self, label, variable, lower, upper, resolution, command, commit=None):
         row = tk.Frame(self.content, background=COLORS.panel)
         row.pack(fill="x", padx=14, pady=(7, 0))
         tk.Label(row, text=label, background=COLORS.panel, foreground=COLORS.muted,
@@ -201,6 +203,8 @@ class Inspector(tk.Frame):
                          foreground=COLORS.text, troughcolor=COLORS.field,
                          highlightthickness=0)
         scale.pack(fill="x", padx=14)
+        if commit is not None:
+            scale.bind("<ButtonRelease-1>", lambda _event: commit())
         def sync_value(*_args):
             try:
                 value.configure(text=f"{float(variable.get()):.2f}")
@@ -255,6 +259,10 @@ class Inspector(tk.Frame):
 
 
 class ThumbnailTray(tk.Frame):
+    CARD_WIDTH = 150
+    CARD_PITCH = 160
+    PRELOAD_CARDS = 2
+
     def __init__(self, master, on_select, on_remove=None, on_process=None):
         super().__init__(master, background=COLORS.panel, height=132,
                          highlightthickness=1, highlightbackground=COLORS.border)
@@ -262,17 +270,23 @@ class ThumbnailTray(tk.Frame):
         self.on_select = on_select
         self.on_remove, self.on_process = on_remove, on_process
         self.canvas = tk.Canvas(self, height=116, background=COLORS.panel, highlightthickness=0)
-        self.scroll = ttk.Scrollbar(self, orient="horizontal", command=self.canvas.xview)
-        self.canvas.configure(xscrollcommand=self.scroll.set)
+        self.scroll = ttk.Scrollbar(self, orient="horizontal", command=self._scroll_to)
+        self.canvas.configure(xscrollcommand=self._xview_changed)
         self.canvas.pack(fill="both", expand=True)
         self.scroll.pack(fill="x")
         self.inner = tk.Frame(self.canvas, background=COLORS.panel)
         self.window = self.canvas.create_window(0, 0, anchor="nw", window=self.inner)
-        self.inner.bind("<Configure>", lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self._photos = []
         self._thumbnail_cache = OrderedDict()
         self._thumbnail_cache_limit = 256
         self._signature = None
+        self._jobs = []
+        self._selected = set()
+        self._cards = {}
+        self._card_pool = []
+        self._thumbnail_queue = OrderedDict()
+        self._thumbnail_loader_after = None
+        self._render_after = None
+        self.canvas.bind("<Configure>", self._canvas_configured)
         self.canvas.bind("<Shift-MouseWheel>", self._horizontal_wheel)
         self.canvas.bind("<MouseWheel>", self._horizontal_wheel)
         self.menu = tk.Menu(self, tearoff=False)
@@ -281,52 +295,194 @@ class ThumbnailTray(tk.Frame):
 
     def _horizontal_wheel(self, event):
         self.canvas.xview_scroll(-1 if event.delta > 0 else 1, "units")
+        self._schedule_visible_render()
         return "break"
+
+    def _scroll_to(self, *args):
+        self.canvas.xview(*args)
+        self._schedule_visible_render()
+
+    def _xview_changed(self, first, last):
+        self.scroll.set(first, last)
+        self._schedule_visible_render()
+
+    def _canvas_configured(self, _event=None):
+        self._update_extent()
+        self._schedule_visible_render()
+
+    def _update_extent(self):
+        viewport = max(1, self.canvas.winfo_width())
+        width = max(viewport, len(self._jobs) * self.CARD_PITCH)
+        self.inner.configure(width=width, height=116)
+        self.canvas.itemconfigure(self.window, width=width, height=116)
+        self.canvas.configure(scrollregion=(0, 0, width, 116))
+
+    def _schedule_visible_render(self):
+        if self._render_after is not None:
+            return
+        self._render_after = self.after_idle(self._render_visible)
+
+    def _visible_indices(self):
+        if not self._jobs:
+            return range(0)
+        left = max(0.0, float(self.canvas.canvasx(0)))
+        right = left + max(1, self.canvas.winfo_width())
+        first = max(0, int(left // self.CARD_PITCH) - self.PRELOAD_CARDS)
+        last = min(len(self._jobs), int(right // self.CARD_PITCH) + self.PRELOAD_CARDS + 2)
+        return range(first, last)
 
     def refresh(self, jobs, selected):
         selected_set = set(selected if isinstance(selected, (set, list, tuple)) else
                            (() if selected is None else (selected,)))
-        signature = tuple((j.get("source_path"), j.get("status"), id(j.get("result")), j.get("error")) for j in jobs), tuple(sorted(selected_set))
-        if signature == self._signature:
+        signature = tuple((id(j), j.get("source_path"), j.get("status"),
+                           id(j.get("result")), j.get("error")) for j in jobs)
+        complete_signature = signature, tuple(sorted(selected_set))
+        if complete_signature == self._signature:
             return
-        self._signature = signature
-        for child in self.inner.winfo_children():
-            child.destroy()
-        self._photos.clear()
-        for index, job in enumerate(jobs):
-            active = index in selected_set
-            color = COLORS.primary_dark if active else COLORS.panel_elevated
-            card = tk.Frame(self.inner, width=150, height=102, background=color,
-                            highlightthickness=2 if active else 1,
-                            highlightbackground=COLORS.primary_active if active else COLORS.border)
-            card.pack(side="left", padx=5, pady=7)
-            card.pack_propagate(False)
-            photo = self._thumbnail(job)
-            if photo:
-                self._photos.append(photo)
-                label = tk.Label(card, image=photo, background=color)
-            else:
-                label = tk.Label(card, text="SIN VISTA", background=color,
-                                 foreground=COLORS.disabled, font=(UI_FONT, 8))
-            label.pack(side="left", padx=5, pady=5)
-            meta = tk.Frame(card, background=color)
-            meta.pack(fill="both", expand=True, padx=(0, 4), pady=5)
-            tk.Label(meta, text=Path(job.get("source_path", "")).name[:15], background=color,
-                     foreground=COLORS.text, font=(UI_FONT, 8, "bold")).pack(anchor="w")
-            status = DISPLAY_STATUS.get(job.get("status"), job.get("status", "Pendiente"))
-            tk.Label(meta, text=("⚠ " if job.get("status") == "Error" else "") + status, background=color,
-                     foreground=COLORS.warning if job.get("status") in {"Procesando", "Error"} else COLORS.muted,
-                     font=(UI_FONT, 8)).pack(anchor="w")
-            result = job.get("result")
-            tk.Label(meta, text=getattr(result, "quality_status", "—"), background=color,
-                     foreground=COLORS.muted, font=(UI_FONT, 8)).pack(anchor="w")
-            for widget in (card, label, meta, *meta.winfo_children()):
-                widget.bind("<Button-1>", lambda e, i=index: self.on_select(i, e))
-                widget.bind("<Button-3>", lambda e, i=index: self._context(e, i))
+        data_changed = self._signature is None or signature != self._signature[0]
+        position = self.canvas.xview()[0] if self._jobs else 0.0
+        self._signature = complete_signature
+        self._jobs = jobs
+        self._selected = selected_set
+        if data_changed:
+            self._drop_cards()
+        self._update_extent()
+        self.canvas.xview_moveto(position)
+        self._render_visible(force=True)
+
+    def _drop_cards(self):
+        for bundle in self._cards.values():
+            bundle["card"].place_forget()
+            bundle["photo"] = None
+            self._card_pool.append(bundle)
+        self._cards.clear()
+
+    def _render_visible(self, force=False):
+        self._render_after = None
+        wanted = set(self._visible_indices())
+        for index in set(self._cards) - wanted:
+            bundle = self._cards.pop(index)
+            bundle["card"].place_forget()
+            bundle["photo"] = None
+            self._card_pool.append(bundle)
+        for index in sorted(wanted):
+            bundle = self._cards.get(index)
+            if bundle is None:
+                bundle = self._create_card(index)
+                self._cards[index] = bundle
+                self._update_card(bundle, index)
+            elif force:
+                self._update_card(bundle, index)
+
+    def _create_card(self, index):
+        if self._card_pool:
+            bundle = self._card_pool.pop()
+            bundle["card"].place(x=index * self.CARD_PITCH + 5, y=7,
+                                 width=self.CARD_WIDTH, height=102)
+            return bundle
+        card = tk.Frame(self.inner, width=self.CARD_WIDTH, height=102)
+        card.place(x=index * self.CARD_PITCH + 5, y=7,
+                   width=self.CARD_WIDTH, height=102)
+        card.pack_propagate(False)
+        image = tk.Label(card, foreground=COLORS.disabled, font=(UI_FONT, 8))
+        image.pack(side="left", padx=5, pady=5)
+        meta = tk.Frame(card)
+        meta.pack(fill="both", expand=True, padx=(0, 4), pady=5)
+        name = tk.Label(meta, foreground=COLORS.text, font=(UI_FONT, 8, "bold"))
+        name.pack(anchor="w")
+        status = tk.Label(meta, font=(UI_FONT, 8))
+        status.pack(anchor="w")
+        quality = tk.Label(meta, foreground=COLORS.muted, font=(UI_FONT, 8))
+        quality.pack(anchor="w")
+        return {"card": card, "image": image, "meta": meta, "name": name,
+                "status": status, "quality": quality, "photo": None}
+
+    def _update_card(self, bundle, index):
+        job = self._jobs[index]
+        active = index in self._selected
+        color = COLORS.primary_dark if active else COLORS.panel_elevated
+        bundle["card"].place_configure(x=index * self.CARD_PITCH + 5)
+        bundle["card"].configure(
+            background=color, highlightthickness=2 if active else 1,
+            highlightbackground=COLORS.primary_active if active else COLORS.border)
+        for widget in (bundle["image"], bundle["meta"], bundle["name"],
+                       bundle["status"], bundle["quality"]):
+            widget.configure(background=color)
+        bundle["name"].configure(text=Path(job.get("source_path", "")).name[:15])
+        status = DISPLAY_STATUS.get(job.get("status"), job.get("status", "Pendiente"))
+        bundle["status"].configure(
+            text=("⚠ " if job.get("status") == "Error" else "") + status,
+            foreground=COLORS.warning if job.get("status") in {"Procesando", "Error"}
+            else COLORS.muted)
+        result = job.get("result")
+        bundle["quality"].configure(text=getattr(result, "quality_status", "—"))
+        photo = self._cached_thumbnail(job)
+        bundle["photo"] = photo
+        if photo:
+            bundle["image"].configure(image=photo, text="")
+        else:
+            bundle["image"].configure(image="", text="CARGANDO…")
+            self._queue_thumbnail(index, job)
+        widgets = (bundle["card"], bundle["image"], bundle["meta"],
+                   bundle["name"], bundle["status"], bundle["quality"])
+        for widget in widgets:
+            widget.bind("<Button-1>", lambda event, i=index: self.on_select(i, event))
+            widget.bind("<Button-3>", lambda event, i=index: self._context(event, i))
+
+    @property
+    def active_card_count(self):
+        return len(self._cards)
 
     def _context(self, event, index):
         self.on_select(index, event, context=True)
         self.menu.tk_popup(event.x_root, event.y_root)
+
+    @staticmethod
+    def _thumbnail_key(job):
+        path = PipelineViewAdapter.preview_source(job, "Final").path
+        if not path:
+            return None
+        source_path = Path(path)
+        stat = source_path.stat()
+        return str(source_path.resolve()), stat.st_mtime_ns, stat.st_size
+
+    def _cached_thumbnail(self, job):
+        try:
+            key = self._thumbnail_key(job)
+        except OSError:
+            return None
+        if key is None:
+            return None
+        cached = self._thumbnail_cache.get(key)
+        if cached is not None:
+            self._thumbnail_cache.move_to_end(key)
+        return cached
+
+    def _queue_thumbnail(self, index, job):
+        try:
+            key = self._thumbnail_key(job)
+        except OSError:
+            return
+        if key is None or key in self._thumbnail_cache:
+            return
+        self._thumbnail_queue[(key, index, id(job))] = (index, id(job), job)
+        if self._thumbnail_loader_after is None:
+            self._thumbnail_loader_after = self.after(1, self._load_next_thumbnail)
+
+    def _load_next_thumbnail(self):
+        self._thumbnail_loader_after = None
+        while self._thumbnail_queue:
+            _key, (index, identity, job) = self._thumbnail_queue.popitem(last=False)
+            if index >= len(self._jobs) or id(self._jobs[index]) != identity or index not in self._cards:
+                continue
+            photo = self._thumbnail(job)
+            bundle = self._cards.get(index)
+            if bundle is not None and id(self._jobs[index]) == identity:
+                bundle["photo"] = photo
+                bundle["image"].configure(image=photo or "", text="" if photo else "SIN VISTA")
+            break
+        if self._thumbnail_queue:
+            self._thumbnail_loader_after = self.after(1, self._load_next_thumbnail)
 
     def _thumbnail(self, job):
         path = PipelineViewAdapter.preview_source(job, "Final").path
@@ -334,8 +490,7 @@ class ThumbnailTray(tk.Frame):
             return None
         try:
             source_path = Path(path)
-            stat = source_path.stat()
-            key = (str(source_path.resolve()), stat.st_mtime_ns, stat.st_size)
+            key = self._thumbnail_key(job)
             cached = self._thumbnail_cache.get(key)
             if cached is not None:
                 self._thumbnail_cache.move_to_end(key)

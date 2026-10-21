@@ -212,6 +212,8 @@ class StickerCanvas(ttk.Frame):
         if border_mm > 0:
             import cv2
             import numpy as np
+            result = self._job.get("result")
+            dpi = float(getattr(result, "analysis", {}).get("source_processing_dpi") or 300)
             pixels = max(0, round(border_mm * dpi / 25.4))
             data = np.asarray(contracted, dtype=np.uint8)
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (pixels*2+1, pixels*2+1))

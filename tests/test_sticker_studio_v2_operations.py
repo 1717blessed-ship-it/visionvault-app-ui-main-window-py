@@ -208,9 +208,164 @@ def test_thumbnail_cache_avoids_decoding_again_when_only_selection_changes(tmp_p
 
     monkeypatch.setattr("app.stickers.editor_v2.components.Image.open", counted_open)
     tray.refresh(batch, set())
+    while tray._thumbnail_queue:
+        root.update()
     tray.refresh(batch, {0})
     assert len(calls) == 1
     tray.destroy()
+
+
+def test_thumbnail_tray_virtualizes_200_jobs_and_preserves_offscreen_selection(tmp_path):
+    import tkinter as tk
+    from PIL import Image
+    from app.stickers.editor_v2.components import ThumbnailTray
+
+    master = tmp_path / "master.png"
+    Image.new("RGBA", (80, 80), "red").save(master)
+    result = SimpleNamespace(artifacts={"master": str(master)}, quality_status="Listo")
+    batch = [{"source_path": f"{master}-{index}", "status": "Procesado", "result": result}
+             for index in range(200)]
+    # Todas las vistas apuntan al mismo master real para aislar el costo de widgets.
+    for job in batch:
+        job["source_path"] = str(master)
+    root = tk._default_root or tk.Tk(); root.withdraw()
+    host = tk.Toplevel(root); host.geometry("800x150+0+0")
+    tray = ThumbnailTray(host, lambda *_: None); tray.pack(fill="both", expand=True)
+    host.update()
+    tray.refresh(batch, {0, 199}); host.update()
+    assert tray.active_card_count < 15
+    assert tray._selected == {0, 199}
+    assert set(tray._cards).isdisjoint({199})
+
+    tray.canvas.xview_moveto(.95); tray._render_visible(); host.update_idletasks()
+    assert tray.active_card_count < 15
+    assert max(tray._cards) >= 190
+    assert tray._selected == {0, 199}
+    host.destroy()
+
+
+def test_virtual_tray_keeps_scroll_when_status_changes_and_survives_removal(tmp_path):
+    import tkinter as tk
+    from PIL import Image
+    from app.stickers.editor_v2.components import ThumbnailTray
+
+    master = tmp_path / "master.png"
+    Image.new("RGBA", (80, 80), "blue").save(master)
+    result = SimpleNamespace(artifacts={"master": str(master)}, quality_status="Listo")
+    batch = [{"source_path": str(master), "status": "Procesado", "result": result}
+             for _ in range(100)]
+    root = tk._default_root or tk.Tk(); root.withdraw()
+    host = tk.Toplevel(root); host.geometry("640x150+0+0")
+    tray = ThumbnailTray(host, lambda *_: None); tray.pack(fill="both", expand=True)
+    host.update(); tray.refresh(batch, {50}); host.update()
+    tray.canvas.xview_moveto(.55); tray._render_visible(); host.update_idletasks()
+    before = tray.canvas.xview()[0]
+    batch[55]["status"] = "Error"
+    tray.refresh(batch, {50}); host.update_idletasks()
+    assert abs(tray.canvas.xview()[0] - before) < .01
+    del batch[40:45]
+    tray.refresh(batch, {45}); host.update_idletasks()
+    assert tray.active_card_count < 15
+    assert all(index < len(batch) for index in tray._cards)
+    host.destroy()
+
+
+def test_geometry_preview_cache_is_exact_and_bounded():
+    from collections import OrderedDict
+    from PIL import Image
+    from app.stickers.editor_v2.window import StickerStudioV2
+
+    calls = []
+    report = SimpleNamespace()
+    document = SimpleNamespace(
+        base_sha256="base", width=32, height=32, operations=[],
+        render=lambda base, offset, dpi, smoothing: (
+            calls.append((offset, dpi, smoothing)) or base.copy(),
+            Image.new("L", base.size, 0), report))
+    owner = SimpleNamespace(_v2_geometry_cache=OrderedDict(), _v2_geometry_cache_bytes=0,
+                            _v2_geometry_cache_limit=2048)
+    base = Image.new("L", (32, 32), 255)
+    first = StickerStudioV2._render_geometry_preview(owner, document, base, .2, 300, .08)
+    second = StickerStudioV2._render_geometry_preview(owner, document, base, .2, 300, .08)
+    assert calls == [(.2, 300, .08)]
+    assert first[0].tobytes() == second[0].tobytes()
+    assert first[0] is not second[0]
+
+
+def test_obsolete_definitive_result_cannot_replace_newer_parameters(tmp_path, monkeypatch):
+    import tkinter as tk
+    from PIL import Image
+    from app.stickers.editor_v2.window import StickerStudioV2
+
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / "source.png"; master = tmp_path / "master.png"
+    Image.new("RGBA", (24, 24), "red").save(source)
+    Image.new("RGBA", (24, 24), "red").save(master)
+    previous = SimpleNamespace(artifacts={"master": str(master)}, analysis={}, quality_status="Listo")
+    obsolete = SimpleNamespace(artifacts={"master": str(master)}, analysis={}, quality_status="Listo")
+    root = tk._default_root or tk.Tk(); root.withdraw()
+    studio = StickerStudioV2(root, FakeDatabase())
+    studio.jobs = [{"source_path": str(source), "status": "Procesando", "result": previous,
+                    "selection_contraction_mm": .4, "selection_expansion_mm": 0.0,
+                    "selection_smoothing_mm": .08, "v2_running_parameter_state": {
+                        "border_mm": round(studio.profile.final_white_px / studio.profile.dpi * 25.4, 2),
+                        "quality": studio.profile.quality, "border_treatment": "Automático",
+                        "contraction_mm": .1, "expansion_mm": 0.0, "smoothing_mm": .08}}]
+    studio.current_index = 0
+    retried = []
+    monkeypatch.setattr(studio, "reprocess_current", lambda: retried.append(True))
+    studio._finish_result(0, obsolete)
+    assert studio.jobs[0]["result"] is previous
+    assert studio.jobs[0]["status"] == "Reprocesar"
+    studio.update(); studio.after(100, studio.quit); studio.mainloop()
+    assert retried == [True]
+    studio.destroy()
+
+
+def test_rapid_slider_changes_commit_only_latest_value(tmp_path, monkeypatch):
+    import tkinter as tk
+    from app.stickers.editor_v2.window import StickerStudioV2
+
+    monkeypatch.chdir(tmp_path)
+    root = tk._default_root or tk.Tk(); root.withdraw()
+    studio = StickerStudioV2(root, FakeDatabase())
+    commits = []
+    monkeypatch.setattr(studio, "_schedule_contraction_preview", lambda: None)
+    monkeypatch.setattr(studio, "_commit_interactive_preview", lambda: commits.append(True))
+    for _ in range(20):
+        studio._interactive_parameter_changed()
+    studio.after(720, studio.quit); studio.mainloop()
+    assert commits == [True]
+    studio.destroy()
+
+
+def test_pending_interactive_parameters_block_export(tmp_path, monkeypatch):
+    import tkinter as tk
+    from PIL import Image
+    from app.stickers.editor_v2.review import mark_reviewed
+    from app.stickers.editor_v2.window import StickerStudioV2
+
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / "source.png"; master = tmp_path / "master.png"
+    Image.new("RGBA", (24, 24), "red").save(source)
+    Image.new("RGBA", (24, 24), "red").save(master)
+    result = SimpleNamespace(artifacts={"master": str(master)}, analysis={}, quality_status="Listo")
+    root = tk._default_root or tk.Tk(); root.withdraw()
+    studio = StickerStudioV2(root, FakeDatabase())
+    job = {"source_path": str(source), "status": "Procesado", "result": result,
+           "selection_contraction_mm": 0.0, "selection_expansion_mm": 0.0,
+           "selection_smoothing_mm": .08}
+    studio.jobs = [job]; studio.current_index = 0
+    mark_reviewed(job)
+    studio._v2_contraction_mm.set(.3)
+    warnings = []
+    monkeypatch.setattr("app.stickers.editor_v2.window.messagebox.showwarning",
+                        lambda *args, **kwargs: warnings.append(args))
+    monkeypatch.setattr("app.stickers.editor_v2.window.filedialog.asksaveasfilename",
+                        lambda **kwargs: (_ for _ in ()).throw(AssertionError("No debe exportar")))
+    studio._export_final()
+    assert warnings and "pendiente" in warnings[0][0].lower()
+    studio.destroy()
 
 
 def test_review_export_and_send_keep_the_job_open(tmp_path, monkeypatch):
