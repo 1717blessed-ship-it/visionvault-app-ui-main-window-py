@@ -86,3 +86,29 @@ el índice no contenga cachés ni secretos y cada dominio funcional tenga un com
 revisable. La homologación física de impresión/corte y el piloto Android pueden
 seguir documentados como validaciones operativas externas sin bloquear el cierre
 del código, siempre que la versión no se promocione como homologada físicamente.
+
+## Actualización final
+
+**Estado: cierre técnico completado.** Las puertas anteriores quedaron resueltas
+en commits independientes y revisables:
+
+- `a7ff9dba`: higiene, CI y política del banco móvil externo;
+- `975f55ab`: aplicación Mobile y sincronización aislada con Desktop;
+- `fc79a94c`: Pedidos, Producción y Creador de Planchas;
+- `85d97296`: operaciones Desktop, búsqueda, mensajería y módulos comerciales;
+- `bcaaeba7`: geometría y regresiones visuales de Sticker Studio;
+- `9e0c0b03`: API Cloud aislada, Docker y migraciones;
+- `62606018`: arnés de pruebas, fixtures y recursos de runtime;
+- `6d3866f3`: clasificación de auxiliares históricos y configuración pública.
+
+La validación final de Cloud ejecutó 20 pruebas efectivas; el bloque final de
+contrato/producción ejecutó 33 pruebas y el smoke transaccional aprobó. Se
+mantienen los resultados globales ya registrados arriba: 1.412 pruebas Python
+aprobadas, 2 omitidas, 5 subtests aprobados; Flutter con 334 aprobadas, 1
+omitida y análisis estático limpio.
+
+El árbol terminó sin cambios ni archivos sin seguimiento visibles. Dos salidas
+locales generadas (métricas de aceptación y un log de importación) se preservaron
+de forma recuperable en `stash@{0}` y no forman parte del release. La advertencia
+de lectura sobre dos carpetas vendorizadas de Pillow responde a sus ACL locales;
+Git no registra eliminaciones ni modificaciones en ellas.
