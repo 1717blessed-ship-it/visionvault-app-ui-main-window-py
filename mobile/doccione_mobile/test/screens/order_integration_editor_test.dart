@@ -31,19 +31,6 @@ Future<void> capture(WidgetTester tester, String name) async {
   });
 }
 
-String flutterRootPath() {
-  var directory = File(Platform.resolvedExecutable).parent;
-  final executable = Platform.isWindows ? 'flutter.bat' : 'flutter';
-  while (directory.parent.path != directory.path) {
-    if (File('${directory.path}/bin/$executable').existsSync()) {
-      return directory.path;
-    }
-    directory = directory.parent;
-  }
-  throw StateError(
-      'Flutter SDK root not found from Platform.resolvedExecutable');
-}
-
 File readableSystemFont() {
   final candidates = [
     if (Platform.isWindows) 'C:/Windows/Fonts/segoeui.ttf',
@@ -75,12 +62,6 @@ void main() {
       final bytes = await readableSystemFont().readAsBytes();
       font.addFont(Future.value(ByteData.sublistView(bytes)));
       await font.load();
-      final icons = FontLoader('MaterialIcons');
-      final iconBytes = await File(
-              '${flutterRootPath()}/bin/cache/artifacts/material_fonts/materialicons-regular.otf')
-          .readAsBytes();
-      icons.addFont(Future.value(ByteData.sublistView(iconBytes)));
-      await icons.load();
     });
     await tester.pumpWidget(MaterialApp(
         theme: ThemeData(fontFamily: 'IntegrationReadable'),
