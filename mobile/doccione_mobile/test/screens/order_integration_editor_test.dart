@@ -31,8 +31,18 @@ Future<void> capture(WidgetTester tester, String name) async {
   });
 }
 
-String flutterRootPath() =>
-    File(Platform.resolvedExecutable).parent.parent.parent.parent.parent.path;
+String flutterRootPath() {
+  var directory = File(Platform.resolvedExecutable).parent;
+  final executable = Platform.isWindows ? 'flutter.bat' : 'flutter';
+  while (directory.parent.path != directory.path) {
+    if (File('${directory.path}/bin/$executable').existsSync()) {
+      return directory.path;
+    }
+    directory = directory.parent;
+  }
+  throw StateError(
+      'Flutter SDK root not found from Platform.resolvedExecutable');
+}
 
 File readableSystemFont() {
   final candidates = [

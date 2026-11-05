@@ -10,9 +10,15 @@ import 'package:doccione_mobile/models/order_draft.dart';
 import 'support/order_integration_fixture.dart';
 
 String flutterExecutablePath() {
-  final root =
-      File(Platform.resolvedExecutable).parent.parent.parent.parent.parent.path;
-  return '$root/bin/flutter${Platform.isWindows ? '.bat' : ''}';
+  var directory = File(Platform.resolvedExecutable).parent;
+  final executable = Platform.isWindows ? 'flutter.bat' : 'flutter';
+  while (directory.parent.path != directory.path) {
+    final candidate = File('${directory.path}/bin/$executable');
+    if (candidate.existsSync()) return candidate.path;
+    directory = directory.parent;
+  }
+  throw StateError(
+      'Flutter executable not found from Platform.resolvedExecutable');
 }
 
 void main() {
