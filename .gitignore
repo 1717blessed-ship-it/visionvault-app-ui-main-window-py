@@ -1,9 +1,15 @@
 # Firebase local configuration and credentials
 secrets/
+
+# Environment variables (API tokens, secrets)
+.env
 firebase-service-account.json
 **/firebase-service-account.json
 google-services.json
 **/google-services.json
+mobile/doccione_mobile/android/key.properties
+*.jks
+*.keystore
 
 # Python environments and caches
 .venv/
@@ -14,6 +20,12 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.pytest*/
+.pytest-*/
+.pytest_*/
+.codex_test_tmp/
+.test*/
+_test*/
 .cache/
 .mypy_cache/
 .ruff_cache/
@@ -28,6 +40,8 @@ __pycache__/
 
 # Logs and temporary files
 *.log
+*.xml
+test_results.json
 tmp_*.py
 test_output.log
 test_white_border_output.png
@@ -37,13 +51,34 @@ debug_open_studio.txt
 debug_processing.txt
 force_test_output.txt
 visionvault_db_inspect.json
+test_onboarding_fixed.py
+test_onboarding_*.py
 
 # Generated outputs
 outputs/
+output/
+output_*/
 work/
+artifacts/
+diagnostic_run/
+diagnostico_regresion/
+test_output/
+test_collage_output/
+test_collage_images/
 validation_output*/
 final_validation/
 diagnosis_etapa1/
+_perf_tmp/
+logs/
+backups/
+corrected_stickers/
+test_variants/
+test_collage_*/
+diagnostic_run/
+tmp/
+
+# Tunnel info (cambia cada vez que se ejecuta el script)
+onboarding_tunnel_info.txt
 
 # Builds and distributions
 build/
@@ -63,3 +98,28 @@ desktop.ini
 # Runtime vendored deps (permission-restricted)
 app/runtime/
 third_party/
+.pytest_runtime/
+runtime_deps/
+
+# Flutter/Gradle local state and generated transcripts
+**/.dart_tool/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.flutter_user_data/
+**/.gradle/
+**/.gradle-*/
+**/.flutter_sdk_local
+**/flutter_build_transcript.txt
+**/build_logs
+mobile/doccione_mobile/base-package.zip
+mobile/doccione_mobile/assets/sticker_bank/*
+!mobile/doccione_mobile/assets/sticker_bank/manifest.json
+mobile-sticker-bank-*.zip
+
+# Local UI/runtime state and ad-hoc recovery copies
+ui_settings.json
+*.corrupted
+*.backup
+*.backup-*
+diagnostic_sample.png
+diagnostico_regresion_or_fix.zip
