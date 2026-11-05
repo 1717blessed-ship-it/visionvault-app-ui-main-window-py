@@ -21,6 +21,22 @@ class NotificationsTests(unittest.TestCase):
         self.assertIn("client_name", payload)
         self.assertIn("reason", payload)
 
+    def test_delivered_order_is_never_urgent(self):
+        for status in ("Entregado", "Terminado"):
+            with self.subTest(status=status):
+                level, score, reason = calculate_priority(
+                    {
+                        "status": status,
+                        "delivery_date": "2000-01-01",
+                        "print_priority": 4,
+                    },
+                    estimated_work_minutes=600,
+                )
+
+                self.assertEqual(level, "Sin prisa")
+                self.assertEqual(score, 0)
+                self.assertEqual(reason, "Pedido entregado")
+
 
 class EventRepositoryTests(unittest.TestCase):
     def setUp(self):

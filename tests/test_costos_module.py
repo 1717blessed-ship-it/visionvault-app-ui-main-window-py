@@ -12,6 +12,7 @@ from costos.models.cost_rule import CostRule
 from costos.repositories.cost_rule_repository import CostRuleRepository
 from costos.services.cost_calculator import CostCalculator
 from costos.services.cost_rule_service import CostRuleService
+from costos.services.price_recommender import PriceRecommender
 from costos.validators.cost_rule_validator import CostRuleValidator
 
 
@@ -74,3 +75,23 @@ def test_validator_detects_missing_name_and_invalid_component_type():
 
     assert "El nombre de la regla es obligatorio" in errors
     assert "El tipo de cálculo no es válido" in errors
+
+
+def test_price_recommender_handles_percentage_costs():
+    rule = CostRule(name="Precio con comisión")
+    rule.add_component(CostComponent(name="Base", value_type="fixed", value=80.0))
+    rule.add_component(CostComponent(name="Comisión", value_type="percentage", value=10.0))
+
+    assert PriceRecommender.recommend(rule, margin_percent=20.0) == 114.29
+
+
+def test_service_filters_product_and_applies_conditions():
+    rule = CostRule(name="Vinilo mayorista", product_type="Vinilo")
+    rule.add_component(CostComponent(name="Fijo", value_type="fixed", value=10.0))
+    rule.add_condition(CostCondition(field="channel", operator="eq", value="mayorista"))
+    service = CostRuleService()
+    service.add_rule(rule)
+
+    assert service.calculate_for_context({"material": "Papel", "channel": "mayorista"}) == []
+    assert service.calculate_for_context({"material": "Vinilo", "channel": "minorista"}) == []
+    assert service.calculate_for_context({"material": "Vinilo", "channel": "mayorista"})[0]["cost_total"] == 10.0

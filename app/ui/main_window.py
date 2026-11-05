@@ -4983,7 +4983,7 @@ class VisionVaultApp(DndRoot):
         stage = get_current_stage(temp_order)
         progress = get_stage_progress(temp_order)
         
-        tab.timeline_status.set(f"{stage} · {int(progress * 100)}% completado")
+        tab.timeline_status.set(f"Estado del flujo: {stage} · no mide cantidades físicas")
         if hasattr(tab, "status_widget"):
             tab.status_widget.configure(values=order_statuses(temp_order))
         if hasattr(tab, "timeline_visual"):
@@ -4996,7 +4996,7 @@ class VisionVaultApp(DndRoot):
         from app.workflow.timeline import workflow_stages
         
         timeline_stages = format_timeline(order)
-        columns = min(6, len(timeline_stages))
+        columns = min(4, len(timeline_stages))
         for column in range(columns):
             timeline_visual.columnconfigure(column, weight=1, uniform="timeline")
 
@@ -5048,7 +5048,11 @@ class VisionVaultApp(DndRoot):
                             else f"Pedido #{order_id} aceptado para producción."
                         )
                         return
-                    self.database.update_order_status(order_id, stage)
+                    try:
+                        self.database.update_order_status(order_id, stage)
+                    except ValueError as error:
+                        messagebox.showwarning("Entrega no disponible", str(error), parent=self)
+                        return
                     tab = self.order_tabs.get(order_id)
                     if tab:
                         updated_order = self.database.order(order_id)
@@ -6630,7 +6634,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         
         values = {key: tk.StringVar(value=str(source.get(key, default))) for key, default in (
             ("title", ""), ("material", ""), ("size", ""), ("quantity", 1),
-            ("unit_kind", ""), ("discount_percent", 0), ("extra_services", 0), ("status", "Pendiente"),
+            ("unit_kind", ""), ("distribution_policy", "partial"), ("discount_percent", 0), ("extra_services", 0), ("status", "Pendiente"),
         )}
         # La prioridad se cobra como un servicio sobre el valor del producto.
         priority_service_var = tk.StringVar(value="Sin prioridad extra")
@@ -7161,6 +7165,11 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         unit_frame.grid(row=row, column=1, sticky="w", padx=(0, 16), pady=5)
         ttk.Radiobutton(unit_frame, text="Unidades / stickers", variable=values["unit_kind"], value="item").pack(anchor="w")
         ttk.Radiobutton(unit_frame, text="Hojas / planchas", variable=values["unit_kind"], value="sheet").pack(anchor="w")
+        ttk.Radiobutton(unit_frame, text="Distribución completa", variable=values["distribution_policy"], value="complete").pack(anchor="w")
+        ttk.Radiobutton(unit_frame, text="Distribución parcial permitida", variable=values["distribution_policy"], value="partial").pack(anchor="w")
+        if source.get("distribution_policy", "legacy") == "legacy" and source:
+            values["distribution_policy"].set("legacy")
+            ttk.Radiobutton(unit_frame, text="Conservar política histórica", variable=values["distribution_policy"], value="legacy").pack(anchor="w")
         tk.Label(unit_frame, text="Elegí cómo se vende este trabajo; no se deduce del archivo.",
                  background=COLORS.panel_elevated, foreground=COLORS.muted,
                  font=(UI_FONT, 8), wraplength=290, justify="left").pack(anchor="w")
@@ -7475,6 +7484,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 "size": values["size"].get(),
                 "quantity": int(values["quantity"].get() or 1),
                 "unit_kind": values["unit_kind"].get(),
+                "distribution_policy": values["distribution_policy"].get(),
                 "subtotal": subtotal_final,
                 "discount_percent": max(0, min(100, float(values["discount_percent"].get() or 0))),
                 "extra_services": round(extra, 2),
@@ -7536,10 +7546,23 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                     "title": values["title"].get().strip(), "material": material, "size": size,
                     "quantity": quantity, "subtotal": subtotal,
                     "unit_kind": values["unit_kind"].get(),
+                    "distribution_policy": values["distribution_policy"].get(),
                     "discount_percent": discount, "extra_services": extra,
                     "status": values["status"].get(),
                     "notes": notes.get("1.0", "end").strip(),
                 })
+                identity_changed = any(str(clean.get(key) or "") != str(source.get(key) or "")
+                                       for key in ("title", "material", "size", "quantity"))
+                if source.get("id") and not identity_changed and discount == float(source.get("discount_percent") or 0) and not priority_rate:
+                    clean["subtotal"] = float(source.get("subtotal") or 0)
+                if identity_changed or not source.get("id"):
+                    product = next((p for p in catalog_products if p.get("name") == clean["title"]), None)
+                    clean["product_id"] = product["id"] if product else None
+                    variant = self.database.connection.execute(
+                        "SELECT id FROM product_variants WHERE product_id=? AND active=1 AND material=? AND size=?",
+                        (clean["product_id"], material, size),
+                    ).fetchone()
+                    clean["variant_id"] = variant["id"] if variant else None
                 on_save(clean)
                 dialog.destroy()
             except Exception as error:
@@ -7657,7 +7680,10 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         top = ttk.Frame(tab, padding=(12, 12, 12, 5))
         top.pack(fill="x")
         tab.order_title = tk.StringVar(value=f"Pedido #{order_id} · {order.get('client_name') or order['client']}")
-        ttk.Label(top, textvariable=tab.order_title, style="Title.TLabel").pack(side="left")
+        title_label = ttk.Label(tab, textvariable=tab.order_title, font=(UI_FONT, 14, "bold"), wraplength=700)
+        title_label.pack(fill="x", before=top, padx=12, pady=(8, 0))
+        tab.bind("<Configure>", lambda event: title_label.configure(wraplength=max(220, event.width-32))
+                 if event.widget is tab else None, add="+")
         tab.order_saved = tk.StringVar(value="Guardado")
         ttk.Label(top, textvariable=tab.order_saved, style="Muted.TLabel").pack(side="right")
         ttk.Button(top, text="Guardar", command=lambda: self.flush_order_autosave(order_id)).pack(side="right", padx=(0, 8))
@@ -7682,6 +7708,24 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             "continuous": "Impresión continua",
         }[production_route]
         ttk.Button(top, text=production_label, command=lambda: self.open_plancha_for_order(order_id)).pack(side="right", padx=(0, 8))
+
+        # Keep every action reachable even with the sidebar open at 1040 px.
+        action_widgets = list(reversed(top.winfo_children()))
+        for widget in action_widgets:
+            widget.pack_forget()
+        def layout_order_actions(event=None):
+            width = max(180, top.winfo_width() - 24)
+            row = column = used = 0
+            for widget in action_widgets:
+                needed = widget.winfo_reqwidth() + 8
+                if used and used + needed > width:
+                    row += 1
+                    column = used = 0
+                widget.grid(row=row, column=column, sticky="w", padx=(0, 8), pady=2)
+                used += needed
+                column += 1
+        top.bind("<Configure>", layout_order_actions, add="+")
+        top.after_idle(layout_order_actions)
 
         workspace = ttk.Frame(tab)
         workspace.pack(fill="both", expand=True)
@@ -7713,9 +7757,9 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         # Etapa actual y progreso
         stage = get_current_stage(order)
         progress = get_stage_progress(order)
-        tab.timeline_status = tk.StringVar(value=f"{stage} · {int(progress * 100)}% completado")
+        tab.timeline_status = tk.StringVar(value=f"Estado del flujo: {stage} · no mide cantidades físicas")
         tk.Label(
-            timeline_panel, text="ETAPA ACTUAL", background=COLORS.panel,
+            timeline_panel, text="ESTADO DEL FLUJO · avance físico en el panel de producción", background=COLORS.panel,
             foreground=COLORS.muted, font=(IDENTITY_FONT, 8, "bold"),
         ).pack(anchor="w", padx=14)
         tk.Label(
@@ -8118,6 +8162,14 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         tab.order_products_placeholder = tk.Label(products_panel, text="Sin trabajos", background=COLORS.panel_elevated,
                               foreground=COLORS.muted, font=(UI_FONT, 10), anchor="center")
         tab.order_products_tree = prod_tree
+
+        from app.ui.order_production_panel import OrderProductionPanel
+        tab.production_panel = OrderProductionPanel(
+            designs, self.database, order_id,
+            prepare=lambda job_ids: self.prepare_order_production(order_id, job_ids),
+            open_planchas=lambda ids: self.show_production_planchas(plancha_ids=ids),
+        )
+        tab.production_panel.pack(fill="x", pady=(0, 10))
 
         # Los adjuntos originales del celular tienen un módulo propio. Siguen
         # vinculados al pedido, pero se distinguen de los stickers ya preparados.
@@ -8604,8 +8656,16 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                         )
                 else:
                     production_text = "Sin trazabilidad · guardar trabajo"
+                assigned = sum(int(d.get("quantity") or 0) for d in tab.order_design_state
+                               if (job_id is not None and d.get("order_job_id") == job_id)
+                               or (d.get("order_job_id") is None and d.get("order_job_index") == idx)
+                               or (len(jobs) == 1 and d.get("order_job_id") is None))
+                unit_label = {"item": "unidades", "sheet": "hojas"}.get(j.get("unit_kind"), "sin unidad")
+                policy_label = {"complete": "Completa", "partial": "Parcial", "legacy": "Histórica"}.get(j.get("distribution_policy"), "Histórica")
+                distribution = f"{policy_label}: {assigned}/{qty} {unit_label} · Sin distribuir {max(0, qty-assigned)}"
+                production_text = f"{distribution} | {production_text} | Costo ${float(j.get('cost_total') or 0):,.2f}"
                 prod_tree.insert("", "end", iid=iid, tags=(tag,), values=(
-                    j.get("title") or f"Producto {idx+1}", qty, production_text, f"${subtotal:,.2f}",
+                    " · ".join(str(v) for v in (j.get("title") or f"Producto {idx+1}", j.get("material"), j.get("size")) if v), f"{qty} {unit_label}", production_text, f"${subtotal:,.2f}",
                 ))
                 prod_total += subtotal
             if not jobs:
@@ -8915,7 +8975,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 tab.order_pending_label.configure(foreground=pending_color)
                 tab.order_payment_progress_value.set(progress)
                 tab.order_payment_progress_text.set(progress_text)
-                payments = self.database.order_payments(tab.order_id)
+                payments = [p for p in self.database.order_payments(tab.order_id) if not p.get("cancelled_at")]
                 if payments:
                     latest = payments[0]
                     paid_at = str(latest.get("paid_at") or latest.get("created_at") or "").replace("T", " ")
@@ -9930,12 +9990,12 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         amount_entry.selection_range(0, "end")
 
     def show_order_payments(self, order_id: int):
-        """Muestra los cobros y permite eliminar un registro puntual con confirmación."""
+        """Muestra cobros activos y anulados conservando sus referencias."""
         dialog = tk.Toplevel(self)
         dialog.title(f"Historial de cobros · Pedido #{order_id}")
         dialog.configure(background=COLORS.background)
         dialog.transient(self)
-        dialog.geometry("760x470")
+        dialog.geometry("1120x470")
         dialog.minsize(660, 400)
 
         heading = tk.Frame(dialog, background=COLORS.panel)
@@ -9952,13 +10012,16 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
 
         table_holder = ttk.Frame(dialog)
         table_holder.pack(fill="both", expand=True, padx=18, pady=16)
-        columns = ("date", "amount", "method", "note")
+        columns = ("date", "amount", "method", "note", "state", "reason", "cancelled")
         tree = ttk.Treeview(table_holder, columns=columns, show="headings", selectmode="browse")
         for key, label, width, anchor in (
             ("date", "Fecha", 145, "w"),
             ("amount", "Importe", 110, "e"),
             ("method", "Medio", 140, "w"),
             ("note", "Detalle / referencia", 300, "w"),
+            ("state", "Estado", 80, "w"),
+            ("reason", "Motivo de anulación", 180, "w"),
+            ("cancelled", "Fecha de anulación", 145, "w"),
         ):
             tree.heading(key, text=label)
             tree.column(key, width=width, minwidth=80, anchor=anchor)
@@ -9970,7 +10033,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         actions = ttk.Frame(dialog)
         actions.pack(fill="x", padx=18, pady=(0, 16))
         delete_button = ttk.Button(
-            actions, text="Eliminar cobro seleccionado", style="Danger.TButton",
+            actions, text="Anular cobro seleccionado", style="Danger.TButton",
             state="disabled",
         )
         delete_button.pack(side="left")
@@ -10003,6 +10066,9 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                         format_currency(payment.get("amount")),
                         payment.get("method") or "Sin especificar",
                         payment.get("note") or "—",
+                        "Anulado" if payment.get("cancelled_at") else "Activo",
+                        payment.get("cancellation_reason") or "—",
+                        str(payment.get("cancelled_at") or "—").replace("T", " ")[:16],
                     ),
                 )
             delete_button.configure(state="disabled")
@@ -10011,7 +10077,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             selected = tree.selection()
             if not selected:
                 messagebox.showinfo(
-                    "Eliminar cobro", "Seleccioná el cobro que querés eliminar.",
+                    "Anular cobro", "Seleccioná el cobro que querés anular.",
                     parent=dialog,
                 )
                 return
@@ -10022,7 +10088,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         tree.bind(
             "<<TreeviewSelect>>",
             lambda _event: delete_button.configure(
-                state="normal" if tree.selection() else "disabled"
+                state="normal" if tree.selection() and not next((p for p in self.database.order_payments(order_id) if str(p['id']) == tree.selection()[0]), {}).get('cancelled_at') else "disabled"
             ),
         )
         dialog.bind("<Escape>", lambda _event: dialog.destroy())
@@ -10031,22 +10097,22 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
 
     def cancel_latest_order_payment(self, order_id: int):
         """Cancel the newest payment while preserving a trace in order activity."""
-        payments = self.database.order_payments(order_id)
+        payments = [p for p in self.database.order_payments(order_id) if not p.get("cancelled_at")]
         if not payments:
             messagebox.showinfo("Cancelar cobro", "Este pedido no tiene cobros registrados.", parent=self)
             return
         self.cancel_order_payment(order_id, int(payments[0]["id"]))
 
     def cancel_order_payment(self, order_id: int, payment_id: int, parent=None) -> bool:
-        """Elimina un cobro elegido y actualiza todas las vistas relacionadas."""
+        """Anula un cobro elegido y actualiza todas las vistas relacionadas."""
         payments = self.database.order_payments(order_id)
         payment = next(
             (current for current in payments if int(current.get("id") or 0) == int(payment_id)),
             None,
         )
-        if not payment:
+        if not payment or payment.get("cancelled_at"):
             messagebox.showinfo(
-                "Eliminar cobro", "El cobro seleccionado ya no está disponible.",
+                "Anular cobro", "El cobro seleccionado ya no está activo.",
                 parent=parent or self,
             )
             return False
@@ -10054,24 +10120,30 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         method = str(payment.get("method") or "").strip()
         detail = f" de {method}" if method else ""
         if not messagebox.askyesno(
-            "Eliminar cobro",
-            f"¿Eliminar el cobro de {format_currency(amount)}{detail}?\n\n"
+            "Anular cobro",
+            f"¿Anular el cobro de {format_currency(amount)}{detail}?\n\n"
             "El saldo pendiente se actualizará y la corrección quedará registrada "
             "en la actividad del pedido.",
             parent=parent or self,
         ):
             return False
+        reason = simpledialog.askstring("Anular cobro", "Motivo de la anulación:", parent=parent or self)
+        if reason is None:
+            return False
+        if not reason.strip():
+            messagebox.showwarning("Anular cobro", "Indicá el motivo de la anulación.", parent=parent or self)
+            return False
         try:
-            self.database.cancel_order_payment(order_id, int(payment_id))
+            self.database.cancel_order_payment(order_id, int(payment_id), reason)
         except ValueError as error:
-            messagebox.showwarning("Eliminar cobro", str(error), parent=parent or self)
+            messagebox.showwarning("Anular cobro", str(error), parent=parent or self)
             return False
         tab = self.order_tabs.get(order_id)
         if tab:
             self.render_order_workspace(tab)
         self.refresh_orders()
         self.status.set(
-            f"Cobro de {format_currency(amount)} eliminado en el pedido #{order_id}."
+            f"Cobro de {format_currency(amount)} anulado en el pedido #{order_id}."
         )
         return True
 
@@ -12475,19 +12547,33 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         editor.pack(fill="both", expand=True)
         return editor
 
-    def show_production_planchas(self, filter_value: str | None = None):
+    def show_production_planchas(self, filter_value: str | None = None, *, plancha_ids=None):
         """Lleva el foco a la lista de planchas y muestra los cambios recientes."""
         if not hasattr(self, "tabs") or not hasattr(self, "production_tab"):
             return
+        self._production_order_plancha_ids = set(plancha_ids) if plancha_ids is not None else None
         self._ensure_production_module()
         self.tabs.select(self.production_tab)
         if hasattr(self, "production_notebook") and hasattr(self, "production_planchas_tab"):
             self.production_notebook.select(self.production_planchas_tab)
         if filter_value and hasattr(self, "production_filter"):
             self.production_filter.set(filter_value)
+        if plancha_ids is not None:
+            self.production_filter.set("Todas")
+            if hasattr(self, "production_search_var"):
+                self.production_search_var.set("")
         self.queue_production_refresh(delay=0)
 
-    def open_production_batch_dialog(self):
+    def prepare_order_production(self, order_id: int, job_ids: list[int]):
+        tab = self.order_tabs.get(order_id)
+        if tab and tab.order_dirty:
+            self.flush_order_autosave(order_id)
+            if tab.order_dirty:
+                messagebox.showwarning("Preparar producción", "Guardá los cambios del pedido antes de preparar una tanda.", parent=self)
+                return
+        self.open_production_batch_dialog(order_id=order_id, job_ids=job_ids)
+
+    def open_production_batch_dialog(self, *, order_id: int | None = None, job_ids=()):
         """Selecciona líneas de demanda y confirma una tanda sin reservar en la vista previa."""
         from app.services.production_batch_service import ProductionBatchService
 
@@ -12540,7 +12626,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         def load_candidates():
             selected_jobs = set(tree.selection())
             tree.delete(*tree.get_children())
-            candidates[:] = service.job_candidates()
+            candidates[:] = [item for item in service.job_candidates() if order_id is None or item.order_id == order_id]
             candidate_map.clear()
             candidate_map.update({item.selection_key: item for item in candidates})
             line_to_job.clear()
@@ -12553,7 +12639,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                     item.order_number, item.client, item.product, item.material, item.available,
                     quantities[item.selection_key], item.delivery_date or "—", item.urgency, status,
                 ), tags=(("blocked",) if item.blocked_reason or not item.available else ()))
-                if item.selection_key in selected_jobs:
+                if item.selection_key in selected_jobs or (not selected_jobs and item.order_job_id in job_ids):
                     tree.selection_add(item.selection_key)
         load_candidates()
         tree.tag_configure("blocked", foreground=COLORS.muted)
@@ -12601,7 +12687,16 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             if not selected:
                 messagebox.showinfo("Preparar tanda", "Seleccioná al menos un trabajo.", parent=dialog)
                 return
-            preview = service.preview_jobs({candidate_map[key].order_job_id: quantities[key] for key in selected})
+            requested = {candidate_map[key].order_job_id: quantities[key] for key in selected}
+            try:
+                if order_id is not None:
+                    from app.services.order_production_service import OrderProductionService
+                    preview = OrderProductionService(self.database).preview(order_id, requested)
+                else:
+                    preview = service.preview_jobs(requested)
+            except ValueError as error:
+                messagebox.showwarning("Preparar tanda", str(error), parent=dialog)
+                return
             lines = []
             for index, group in enumerate(preview.groups, start=1):
                 lines.append(
@@ -12701,7 +12796,13 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
 
         def load_batches():
             batch_tree.delete(*batch_tree.get_children())
+            related = None
+            if order_id is not None:
+                from app.services.order_production_service import OrderProductionService
+                related = {b["id"] for b in OrderProductionService(self.database).snapshot(order_id)["batches"]}
             for row in service.batches():
+                if related is not None and row["id"] not in related:
+                    continue
                 batch_tree.insert("", "end", iid=str(row["id"]), values=(
                     f"#{row['id']}", row["name"], row["status"], row["plancha_count"], row["created_at"],
                 ))
@@ -12725,7 +12826,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 "Tanda cancelada",
                 f"Reservas liberadas: {summary['released_units']} unidad(es).\n"
                 f"Producción que permanece registrada: {summary['preserved_units']} unidad(es).\n"
-                f"Planchas retiradas: {summary['removed_planchas']}.\n"
+                f"Planchas retiradas de producción (historial conservado): {summary['removed_planchas']}.\n"
                 f"Planchas conservadas por historial: {summary['preserved_planchas']}.",
                 parent=dialog,
             )
@@ -13680,6 +13781,10 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         """Refresca tablero, planchas y el selector de tandas ya abierto."""
         self.queue_production_refresh(delay=0)
         self._sync_production_board()
+        for tab in getattr(self, "order_tabs", {}).values():
+            panel = getattr(tab, "production_panel", None)
+            if panel is not None and panel.winfo_exists():
+                panel.refresh()
         callback = getattr(self, "_production_batch_refresh", None)
         if callable(callback):
             callback()
@@ -13868,6 +13973,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
 
     def _set_production_filter(self, filter_value):
         """Set production filter and refresh."""
+        self._production_order_plancha_ids = None
         self.production_filter.set(filter_value)
         self.queue_production_refresh()
 
@@ -13892,6 +13998,9 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         self._production_plancha_data.clear()
         self.production_tree.delete(*self.production_tree.get_children())
         rows = self.database.production_planchas()
+        related_ids = getattr(self, "_production_order_plancha_ids", None)
+        if related_ids is not None:
+            rows = [row for row in rows if int(row["id"]) in related_ids]
         # Aplicar filtro
         filter_value = getattr(self, "production_filter", tk.StringVar(value="Todas")).get()
         status_map = {
@@ -13921,6 +14030,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                    search_query in (r.get("name") or "").lower()]
 
         production_status_labels = {
+            "Cancelada": "Cancelada · reservas liberadas",
             "borrador": "Borrador", "guardada": "Guardada", "lista": "Lista",
             "en_cola": "En cola", "impresa": "Impresa",
             "disponible_para_continua": "Disponible", "usada_en_continua": "Usada en tira",

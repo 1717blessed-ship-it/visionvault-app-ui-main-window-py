@@ -5,12 +5,17 @@ import re
 import base64
 from io import BytesIO
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 
 def analyze_image(path: str, api_key: str, model: str, progress=None) -> dict:
     progress = progress or (lambda _message: None)
-    base = {"text": "", "caption": "", "suggestions": [], "category": "", "names": [], "references": []}
+    # Mantener el mismo contrato para éxitos, claves ausentes y errores de
+    # red. Así la interfaz puede siempre mostrar un resultado informativo.
+    base = {
+        "text": "", "caption": "", "suggestions": [], "category": "",
+        "names": [], "references": [], "confidence": "",
+    }
     if not api_key:
         return base | {"missing": ["Clave de Gemini"], "errors": []}
     try:
@@ -22,7 +27,7 @@ text: texto legible horizontal o vertical en español, inglés y números; no in
 caption: descripción visual breve, concreta y con mayúscula inicial en español argentino.
 category: una categoría simple y global; por ejemplo Argentina, Fútbol, Música, Logos, Personajes o Frases.
 names: arreglo de hasta tres nombres claros para argentinos; si no reconocés una referencia, describí sin inventar.
-tags: arreglo de hasta seis palabras o frases útiles para buscar.
+tags: arreglo de hasta seis etiquetas individuales útiles para buscar; no uses una oración completa. Separá personaje, objeto, color y franquicia cuando corresponda.
 confidence: Alta, Media o Baja según qué tan segura sea la identificación.
 No uses el nombre del archivo como evidencia."""
         with Image.open(path) as image:
@@ -88,7 +93,9 @@ No uses el nombre del archivo como evidencia."""
         text = str(structured.get("text") or field(headers["text"])).strip()
         caption = str(structured.get("caption") or field(headers["caption"])).strip()
         category = str(structured.get("category") or field(headers["category"])).strip()
-        tags = [tag.title() for tag in string_list(structured.get("tags"))] or [tag.strip().title() for tag in re.split(r"\s*\|\s*", field(headers["tags"])) if tag.strip()]
+        from app.ai.tagging import individual_tags
+        raw_tags = string_list(structured.get("tags")) or [tag.strip() for tag in re.split(r"\s*\|\s*", field(headers["tags"])) if tag.strip()]
+        tags = individual_tags(*raw_tags)
         names = string_list(structured.get("names")) or [name.strip() for name in re.split(r"\s*\|\s*", field(headers["names"])) if name.strip()]
         return base | {
             "text": text,
@@ -108,6 +115,17 @@ No uses el nombre del archivo como evidencia."""
         message = f"Gemini rechazó la solicitud ({error.code})"
         if detail:
             message += f": {detail}"
+        return base | {"missing": [], "errors": [message]}
+    except URLError as error:
+        reason = getattr(error, "reason", error)
+        if getattr(reason, "winerror", None) == 10013:
+            message = (
+                "Windows bloqueó la conexión con Gemini (error 10013). "
+                "Permití Doccione o Python en el Firewall de Windows y verificá "
+                "que tu red no bloquee generativelanguage.googleapis.com."
+            )
+        else:
+            message = f"No se pudo conectar con Gemini: {reason}"
         return base | {"missing": [], "errors": [message]}
     except Exception as error:
         return base | {"missing": [], "errors": [str(error)]}

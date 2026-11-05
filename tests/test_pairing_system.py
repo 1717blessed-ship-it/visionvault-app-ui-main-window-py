@@ -106,7 +106,7 @@ class TestPairingCodeSystem:
     def test_register_device_with_pairing_success(self, repo):
         """Test de registro de dispositivo mediante código."""
         code = repo.create_pairing_code()
-        success, message, device_id = repo.register_device_with_pairing(
+        success, message, device_id, session_token = repo.register_device_with_pairing(
             pairing_code=code,
             push_token="test_token_123",
             platform="android",
@@ -115,11 +115,12 @@ class TestPairingCodeSystem:
         
         assert success is True
         assert device_id is not None
+        assert session_token
         assert "registrado" in message.lower()
 
     def test_register_device_with_pairing_invalid_code(self, repo):
         """Test de registro con código inválido."""
-        success, message, device_id = repo.register_device_with_pairing(
+        success, message, device_id, session_token = repo.register_device_with_pairing(
             pairing_code="000000",
             push_token="test_token_123",
             platform="android",
@@ -127,6 +128,7 @@ class TestPairingCodeSystem:
         
         assert success is False
         assert device_id is None
+        assert session_token == ""
         assert "inválido" in message.lower() or "expirado" in message.lower()
 
     def test_register_device_with_pairing_reused_code(self, repo):
@@ -141,7 +143,7 @@ class TestPairingCodeSystem:
         )
         
         # Intentar usarlo de nuevo
-        success, message, device_id = repo.register_device_with_pairing(
+        success, message, device_id, session_token = repo.register_device_with_pairing(
             pairing_code=code,
             push_token="test_token_456",
             platform="android",
@@ -149,6 +151,7 @@ class TestPairingCodeSystem:
         
         assert success is False
         assert device_id is None
+        assert session_token == ""
 
     def test_cleanup_expired_pairing_codes(self, repo):
         """Test de limpieza de códigos expirados."""
@@ -180,7 +183,7 @@ class TestTokenRefreshLogic:
         """Test de actualización con nuevo token."""
         # Registrar dispositivo con token antiguo
         old_token = "old_token_123"
-        device_id = repo.register_device(old_token, "android", "Test Device")
+        device_id, _ = repo.register_device(old_token, "android", "Test Device")
         
         # Actualizar con nuevo token
         new_token = "new_token_456"
@@ -232,7 +235,7 @@ class TestDeviceManagement:
 
     def test_pause_device(self, repo):
         """Test de pausar dispositivo."""
-        device_id = repo.register_device("test_token", "android", "Test Device")
+        device_id, _ = repo.register_device("test_token", "android", "Test Device")
         
         repo.pause_device(device_id)
         
@@ -241,7 +244,7 @@ class TestDeviceManagement:
 
     def test_resume_device(self, repo):
         """Test de reactivar dispositivo."""
-        device_id = repo.register_device("test_token", "android", "Test Device")
+        device_id, _ = repo.register_device("test_token", "android", "Test Device")
         repo.pause_device(device_id)
         
         repo.resume_device(device_id)
@@ -251,7 +254,7 @@ class TestDeviceManagement:
 
     def test_rename_device(self, repo):
         """Test de renombrar dispositivo."""
-        device_id = repo.register_device("test_token", "android", "Old Name")
+        device_id, _ = repo.register_device("test_token", "android", "Old Name")
         
         repo.rename_device(device_id, "New Name")
         
@@ -260,7 +263,7 @@ class TestDeviceManagement:
 
     def test_unlink_device(self, repo):
         """Test de desvincular dispositivo."""
-        device_id = repo.register_device("test_token", "android", "Test Device")
+        device_id, _ = repo.register_device("test_token", "android", "Test Device")
         
         repo.unlink_device(device_id)
         
@@ -272,10 +275,10 @@ class TestDeviceManagement:
         token = "duplicate_token_123"
         
         # Primer registro
-        device_id1 = repo.register_device(token, "android", "Device 1")
+        device_id1, _ = repo.register_device(token, "android", "Device 1")
         
         # Segundo registro con mismo token (debe actualizar el existente)
-        device_id2 = repo.register_device(token, "android", "Device 2")
+        device_id2, _ = repo.register_device(token, "android", "Device 2")
         
         # Debe ser el mismo ID
         assert device_id1 == device_id2

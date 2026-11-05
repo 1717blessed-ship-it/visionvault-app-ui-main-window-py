@@ -25,9 +25,14 @@ class CostRuleService:
         for rule in self.list_rules():
             if not rule.active:
                 continue
-            if rule.material and context.get("material") and rule.material.lower() != str(context.get("material")).lower():
+            if rule.product_type and context.get("material") and rule.product_type.lower() != str(context.get("material")).lower():
                 continue
-            calculation = CostCalculator.calculate(rule, context=context, quantity=quantity, subtotal=subtotal)
-            if calculation["cost_total"] > 0:
-                results.append({"rule": rule.name, "cost_total": calculation["cost_total"], "components": calculation["components"]})
+            calculation = CostCalculator.calculate(
+                rule,
+                context=context,
+                sale_price=float(context.get("sale_price") or subtotal or 0),
+                quantity=quantity,
+            )
+            if calculation.cost_total > 0:
+                results.append({"rule": rule.name, "cost_total": calculation.cost_total, "components": calculation.components})
         return results

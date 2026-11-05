@@ -354,7 +354,10 @@ class Gallery(ttk.Frame):
             card, item, tile_size, placeholder, reason = self.thumbnail_queue.popleft()
             if not card.winfo_exists():
                 continue
-            thumb = load_thumbnail(item["path"], (tile_size - 6, tile_size - 6))
+            thumb = load_thumbnail(
+                item["path"], (tile_size - 6, tile_size - 6),
+                upscale=True, trim_transparency=True,
+            )
             card.delete(placeholder)
             if thumb:
                 card.create_image(tile_size // 2, tile_size // 2, image=thumb)
