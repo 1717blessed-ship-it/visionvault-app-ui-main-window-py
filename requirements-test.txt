@@ -1,0 +1,6 @@
+# La suite usa las dependencias de aplicación ya instaladas.
+# No requiere descargar modelos de IA para los tests locales.
+pytest>=9.0,<10
+watchdog>=3.0
+# Comprueba la geometría exacta de exportación PDF A4.
+reportlab>=4.0
