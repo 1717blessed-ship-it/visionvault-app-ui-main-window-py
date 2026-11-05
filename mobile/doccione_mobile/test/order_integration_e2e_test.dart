@@ -9,6 +9,12 @@ import 'package:doccione_mobile/services/order_integration_sync.dart';
 import 'package:doccione_mobile/models/order_draft.dart';
 import 'support/order_integration_fixture.dart';
 
+String flutterExecutablePath() {
+  final root =
+      File(Platform.resolvedExecutable).parent.parent.parent.parent.parent.path;
+  return '$root/bin/flutter${Platform.isWindows ? '.bat' : ''}';
+}
+
 void main() {
   late IntegrationFixture f;
   setUp(() async {
@@ -441,7 +447,7 @@ void main() {
     final evidence = StringBuffer();
     for (final stage in ['enqueue', 'send']) {
       final result = await Process.run(
-          'C:/flutter-sdk/bin/flutter.bat',
+          flutterExecutablePath(),
           [
             'test',
             'contract_tests/order_queue_process_test.dart',

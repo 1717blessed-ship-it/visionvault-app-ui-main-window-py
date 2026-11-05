@@ -31,6 +31,19 @@ Future<void> capture(WidgetTester tester, String name) async {
   });
 }
 
+String flutterRootPath() =>
+    File(Platform.resolvedExecutable).parent.parent.parent.parent.parent.path;
+
+File readableSystemFont() {
+  final candidates = [
+    if (Platform.isWindows) 'C:/Windows/Fonts/segoeui.ttf',
+    if (Platform.isLinux) '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+    if (Platform.isMacOS) '/System/Library/Fonts/Supplemental/Arial.ttf',
+  ].map(File.new);
+  return candidates.firstWhere((font) => font.existsSync(),
+      orElse: () => throw StateError('No readable system font available'));
+}
+
 void main() {
   testWidgets(
       'editor real: cola pendiente, confirmación HTTP y conflicto con ambas versiones',
@@ -49,12 +62,12 @@ void main() {
     final draft = (await tester.runAsync(f.saved))!;
     await tester.runAsync(() async {
       final font = FontLoader('IntegrationReadable');
-      final bytes = await File('C:/Windows/Fonts/segoeui.ttf').readAsBytes();
+      final bytes = await readableSystemFont().readAsBytes();
       font.addFont(Future.value(ByteData.sublistView(bytes)));
       await font.load();
       final icons = FontLoader('MaterialIcons');
       final iconBytes = await File(
-              'C:/flutter-sdk/bin/cache/artifacts/material_fonts/materialicons-regular.otf')
+              '${flutterRootPath()}/bin/cache/artifacts/material_fonts/materialicons-regular.otf')
           .readAsBytes();
       icons.addFont(Future.value(ByteData.sublistView(iconBytes)));
       await icons.load();
