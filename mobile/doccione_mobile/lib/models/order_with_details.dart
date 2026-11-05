@@ -16,11 +16,11 @@ class OrderWithDetails {
 
   String get clientName => client?.name ?? 'Sin cliente';
   String get clientPhone => client?.phone ?? '';
-  
+
   int get jobsCount => jobs.length;
-  
+
   bool get hasJobs => jobs.isNotEmpty;
-  
+
   /// Get formatted order date
   String get formattedOrderDate {
     if (order.orderDate == null) return 'Sin fecha';
@@ -31,7 +31,7 @@ class OrderWithDetails {
       return order.orderDate!;
     }
   }
-  
+
   /// Get formatted delivery date
   String get formattedDeliveryDate {
     if (order.deliveryDate == null) return 'Sin fecha';
@@ -43,13 +43,13 @@ class OrderWithDetails {
       return order.deliveryDate!;
     }
   }
-  
+
   /// Get primary job title (first job or empty)
   String get primaryJobTitle {
     if (jobs.isEmpty) return 'Sin trabajos';
     return jobs.first.title ?? 'Sin título';
   }
-  
+
   /// Get concatenated job titles
   String get jobTitles {
     if (jobs.isEmpty) return 'Sin trabajos';

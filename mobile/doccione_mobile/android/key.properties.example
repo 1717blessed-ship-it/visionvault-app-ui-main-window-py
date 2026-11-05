@@ -1,0 +1,5 @@
+# Copiar como android/key.properties y completar fuera de Git.
+storeFile=C:/secure/doccione-upload.jks
+storePassword=CAMBIAR
+keyAlias=doccione-upload
+keyPassword=CAMBIAR

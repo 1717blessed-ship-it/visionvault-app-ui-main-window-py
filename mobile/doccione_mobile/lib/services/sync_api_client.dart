@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
+import '../models/catalog_design.dart';
 import '../models/connection_test_result.dart';
+import '../models/mobile_runtime_config.dart';
 
 /// Exception thrown when a sync API call fails
 class SyncApiException implements Exception {
@@ -41,9 +43,8 @@ class SyncApiClient {
       final uri = Uri.parse('$baseUrl/api/v1/mobile/capabilities');
       final headers = _buildHeaders();
 
-      final response = await _httpClient
-          .get(uri, headers: headers)
-          .timeout(timeout);
+      final response =
+          await _httpClient.get(uri, headers: headers).timeout(timeout);
 
       if (response.statusCode == 200) {
         return jsonDecode(response.body) as Map<String, dynamic>;
@@ -57,9 +58,18 @@ class SyncApiClient {
       throw SyncApiException('Request timeout', originalError: e);
     } on http.ClientException catch (e) {
       throw SyncApiException('Network error', originalError: e);
+    } on SyncApiException {
+      rethrow;
     } catch (e) {
-      throw SyncApiException('Unexpected error: \$e', originalError: e);
+      throw SyncApiException('Unexpected error: $e', originalError: e);
     }
+  }
+
+  /// Obtiene la configuración publicada por Studio. Un servidor antiguo o una
+  /// respuesta incompleta conserva los valores seguros incluidos en la app.
+  Future<MobileRuntimeConfig> getRuntimeConfig() async {
+    final capabilities = await getCapabilities();
+    return MobileRuntimeConfig.fromCapabilities(capabilities);
   }
 
   /// Test connection to the server using GET /api/v1/mobile/health
@@ -72,9 +82,8 @@ class SyncApiClient {
       final uri = Uri.parse('$baseUrl/api/v1/mobile/health');
       final headers = _buildHeaders();
 
-      final response = await _httpClient
-          .get(uri, headers: headers)
-          .timeout(timeout);
+      final response =
+          await _httpClient.get(uri, headers: headers).timeout(timeout);
 
       stopwatch.stop();
 
@@ -106,9 +115,11 @@ class SyncApiClient {
           );
         }
       } else if (response.statusCode == 401 || response.statusCode == 403) {
-        return ConnectionTestResult.unauthorized(statusCode: response.statusCode);
+        return ConnectionTestResult.unauthorized(
+            statusCode: response.statusCode);
       } else if (response.statusCode >= 500) {
-        return ConnectionTestResult.serverError(statusCode: response.statusCode);
+        return ConnectionTestResult.serverError(
+            statusCode: response.statusCode);
       } else {
         return ConnectionTestResult.unexpected(
           detail: 'Código inesperado: ${response.statusCode}',
@@ -132,6 +143,52 @@ class SyncApiClient {
     }
   }
 
+  Future<List<CatalogDesign>> getCatalogDesigns({
+    String query = '',
+    String? category,
+    String? tag,
+    bool recent = false,
+    bool random = false,
+    int? limit,
+  }) async {
+    try {
+      final queryParams = <String, String>{};
+      if (query.trim().isNotEmpty) queryParams['q'] = query.trim();
+      if (category != null && category.isNotEmpty) {
+        queryParams['category'] = category;
+      }
+      if (tag != null && tag.isNotEmpty) queryParams['tag'] = tag;
+      if (recent) queryParams['recent'] = '1';
+      if (random) queryParams['random'] = '1';
+      if (limit != null) queryParams['limit'] = limit.toString();
+
+      final uri = Uri.parse('$baseUrl/api/v1/mobile/catalog/designs')
+          .replace(queryParameters: queryParams);
+      final response =
+          await _httpClient.get(uri, headers: _buildHeaders()).timeout(timeout);
+
+      if (response.statusCode == 200) {
+        final body = jsonDecode(response.body) as Map<String, dynamic>;
+        return (body['designs'] as List<dynamic>? ?? const [])
+            .map((item) => CatalogDesign.fromJson(item as Map<String, dynamic>))
+            .toList();
+      }
+
+      throw SyncApiException(
+        'Failed to fetch catalog designs: ${response.body}',
+        statusCode: response.statusCode,
+      );
+    } on TimeoutException catch (e) {
+      throw SyncApiException('Request timeout', originalError: e);
+    } on http.ClientException catch (e) {
+      throw SyncApiException('Network error', originalError: e);
+    } on SyncApiException {
+      rethrow;
+    } catch (e) {
+      throw SyncApiException('Unexpected error: $e', originalError: e);
+    }
+  }
+
   /// Pull synchronization data
   /// GET /api/v1/mobile/sync/pull?cursor=<cursor>&limit=<limit>
   Future<Map<String, dynamic>> syncPull({
@@ -142,7 +199,7 @@ class SyncApiClient {
       final queryParams = <String, String>{
         'limit': limit.toString(),
       };
-      
+
       if (cursor != null) {
         queryParams['cursor'] = cursor;
       }
@@ -151,9 +208,8 @@ class SyncApiClient {
           .replace(queryParameters: queryParams);
       final headers = _buildHeaders();
 
-      final response = await _httpClient
-          .get(uri, headers: headers)
-          .timeout(timeout);
+      final response =
+          await _httpClient.get(uri, headers: headers).timeout(timeout);
 
       if (response.statusCode == 200) {
         return jsonDecode(response.body) as Map<String, dynamic>;
@@ -181,7 +237,7 @@ class SyncApiClient {
     } on SyncApiException {
       rethrow;
     } catch (e) {
-      throw SyncApiException('Unexpected error: \$e', originalError: e);
+      throw SyncApiException('Unexpected error: $e', originalError: e);
     }
   }
 

@@ -21,7 +21,7 @@ void main() {
   setUp(() async {
     dbHelper = DatabaseHelper();
     await dbHelper.deleteDatabase();
-    
+
     ordersRepo = OrdersRepository(dbHelper);
     syncStateRepo = SyncStateRepository(dbHelper);
     jobsRepo = JobsRepository(dbHelper);
@@ -51,7 +51,8 @@ void main() {
 
     test('should count orders by status correctly', () async {
       final today = DateTime.now();
-      final todayStr = '${today.year}-${today.month.toString().padLeft(2, '0')}-${today.day.toString().padLeft(2, '0')}';
+      final todayStr =
+          '${today.year}-${today.month.toString().padLeft(2, '0')}-${today.day.toString().padLeft(2, '0')}';
 
       await ordersRepo.upsertOrders([
         {
@@ -100,8 +101,16 @@ void main() {
       ]);
 
       await clientsRepo.upsertClients([
-        {'id': 'client-1', 'name': 'Client 1', 'updated_at': '2026-01-01T00:00:00Z'},
-        {'id': 'client-2', 'name': 'Client 2', 'updated_at': '2026-01-01T00:00:00Z'},
+        {
+          'id': 'client-1',
+          'name': 'Client 1',
+          'updated_at': '2026-01-01T00:00:00Z'
+        },
+        {
+          'id': 'client-2',
+          'name': 'Client 2',
+          'updated_at': '2026-01-01T00:00:00Z'
+        },
       ]);
 
       final metrics = await ordersRepo.getDashboardMetrics(
@@ -156,7 +165,7 @@ void main() {
   group('OrdersRepository - getOrdersByDate', () {
     test('should get orders for specific date', () async {
       final date = DateTime(2026, 7, 21);
-      final dateStr = '2026-07-21';
+      const dateStr = '2026-07-21';
 
       await ordersRepo.upsertOrders([
         {

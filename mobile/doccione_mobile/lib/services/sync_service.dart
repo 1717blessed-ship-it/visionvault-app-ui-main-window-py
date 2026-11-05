@@ -1,6 +1,5 @@
-import 'dart:convert';
-import 'package:sqflite/sqflite.dart';
 import '../database/database_helper.dart';
+import '../database/offline_catalog_repository.dart';
 import '../database/sync_state_repository.dart';
 import '../models/sync_result.dart';
 import 'sync_api_client.dart';
@@ -11,6 +10,7 @@ class SyncService {
   final DatabaseHelper _dbHelper;
   final SyncStateRepository _syncStateRepo;
   final SyncApiClient _apiClient;
+  final OfflineCatalogRepository _offlineCatalogRepo;
   final Map<String, SyncEntityHandler> _handlers = {};
 
   SyncService({
@@ -19,11 +19,16 @@ class SyncService {
     required SyncApiClient apiClient,
   })  : _dbHelper = dbHelper,
         _syncStateRepo = syncStateRepo,
-        _apiClient = apiClient;
+        _apiClient = apiClient,
+        _offlineCatalogRepo = OfflineCatalogRepository(dbHelper);
 
   /// Register a handler for a specific entity type
   void registerHandler(String entityType, SyncEntityHandler handler) {
     _handlers[entityType] = handler;
+  }
+
+  void close() {
+    _apiClient.close();
   }
 
   /// Check if there's an incomplete synchronization
@@ -50,7 +55,7 @@ class SyncService {
       totalStopwatch.stop();
       final errorMessage = e.toString();
       await _syncStateRepo.setLastSyncError(errorMessage);
-      
+
       return SyncResult.error(
         error: errorMessage,
         totalDuration: totalStopwatch.elapsed,
@@ -64,7 +69,7 @@ class SyncService {
 
     try {
       final cursor = await _syncStateRepo.getCurrentNextCursor();
-      
+
       if (cursor == null) {
         totalStopwatch.stop();
         return SyncResult.error(
@@ -82,7 +87,7 @@ class SyncService {
       totalStopwatch.stop();
       final errorMessage = e.toString();
       await _syncStateRepo.setLastSyncError(errorMessage);
-      
+
       return SyncResult.error(
         error: errorMessage,
         totalDuration: totalStopwatch.elapsed,
@@ -108,6 +113,7 @@ class SyncService {
     // { snapshot_until, complete, next_cursor, entities: { X: { items, has_more } } }
     final parseStopwatch = Stopwatch()..start();
     final snapshotId = response['snapshot_until'] as String;
+    final scopeId = response['scope_id'] as String?;
     final nextCursor = response['next_cursor'] as String?;
     final complete = response['complete'] as bool;
     final entities = response['entities'] as Map<String, dynamic>;
@@ -122,6 +128,27 @@ class SyncService {
     final db = await _dbHelper.database;
 
     await db.transaction((txn) async {
+      if (scopeId != null) {
+        final currentState = await txn.query(
+          'sync_state',
+          columns: ['scope_id'],
+          where: 'id = ?',
+          whereArgs: [1],
+          limit: 1,
+        );
+        final currentScope = currentState.isEmpty
+            ? null
+            : currentState.first['scope_id'] as String?;
+        if (currentScope != scopeId) {
+          // Evita que queden visibles pedidos sincronizados para la empresa o
+          // para otro vendedor antes de que existiera el aislamiento.
+          await txn.delete('jobs');
+          await txn.delete('orders');
+          await txn.delete('clients');
+          await _syncStateRepo.setScopeId(scopeId, txn: txn);
+        }
+      }
+
       // Process each entity type within transaction, using the txn handle
       if (_handlers.containsKey('jobs') && jobs.isNotEmpty) {
         await _handlers['jobs']!.process(jobs, txn: txn);
@@ -143,6 +170,14 @@ class SyncService {
       }
     });
     dbStopwatch.stop();
+
+    if (complete) {
+      try {
+        await _refreshCatalogDesigns();
+      } catch (_) {
+        // No bloquear la sincronización principal si la biblioteca de diseños falla.
+      }
+    }
 
     totalStopwatch.stop();
 
@@ -177,7 +212,7 @@ class SyncService {
     try {
       // Start sync
       var result = await startSync(limit: limit);
-      
+
       if (result.hasError) {
         return result;
       }
@@ -194,7 +229,7 @@ class SyncService {
       // Continue until complete
       while (!result.completed && result.nextCursor != null) {
         result = await continueSync(limit: limit);
-        
+
         if (result.hasError) {
           return result;
         }
@@ -225,12 +260,17 @@ class SyncService {
       totalStopwatch.stop();
       final errorMessage = e.toString();
       await _syncStateRepo.setLastSyncError(errorMessage);
-      
+
       return SyncResult.error(
         error: errorMessage,
         totalDuration: totalStopwatch.elapsed,
       );
     }
+  }
+
+  Future<void> _refreshCatalogDesigns() async {
+    final designs = await _apiClient.getCatalogDesigns(limit: 500);
+    await _offlineCatalogRepo.saveDesigns(designs);
   }
 
   /// Extract items from entities[type].items and coerce int IDs to String.
@@ -239,7 +279,9 @@ class SyncService {
     final entity = entities[type] as Map<String, dynamic>?;
     if (entity == null) return [];
     final items = entity['items'] as List<dynamic>? ?? [];
-    return items.map((item) => _coerceIdTypes(item as Map<String, dynamic>)).toList();
+    return items
+        .map((item) => _coerceIdTypes(item as Map<String, dynamic>))
+        .toList();
   }
 
   /// Convert int ID fields to String for model compatibility.

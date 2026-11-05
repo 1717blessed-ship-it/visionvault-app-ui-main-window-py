@@ -25,10 +25,10 @@ class DashboardMetrics {
 
   String get lastSyncFormatted {
     if (lastSyncAt == null) return 'Nunca';
-    
+
     final now = DateTime.now();
     final difference = now.difference(lastSyncAt!);
-    
+
     if (difference.inMinutes < 1) {
       return 'Hace unos segundos';
     } else if (difference.inMinutes < 60) {

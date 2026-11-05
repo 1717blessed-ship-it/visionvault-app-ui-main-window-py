@@ -98,13 +98,25 @@ void main() {
               'complete': false,
               'data': {
                 'jobs': [
-                  {'id': 'job-1', 'title': 'Job 1', 'updated_at': '2026-01-01T00:00:00Z'}
+                  {
+                    'id': 'job-1',
+                    'title': 'Job 1',
+                    'updated_at': '2026-01-01T00:00:00Z'
+                  }
                 ],
                 'orders': [
-                  {'id': 'order-1', 'job_id': 'job-1', 'updated_at': '2026-01-01T00:00:00Z'}
+                  {
+                    'id': 'order-1',
+                    'job_id': 'job-1',
+                    'updated_at': '2026-01-01T00:00:00Z'
+                  }
                 ],
                 'clients': [
-                  {'id': 'client-1', 'name': 'Client 1', 'updated_at': '2026-01-01T00:00:00Z'}
+                  {
+                    'id': 'client-1',
+                    'name': 'Client 1',
+                    'updated_at': '2026-01-01T00:00:00Z'
+                  }
                 ],
               },
             }),
@@ -231,7 +243,8 @@ void main() {
     });
 
     group('testConnection', () {
-      test('should return ok with healthInfo on valid health response', () async {
+      test('should return ok with healthInfo on valid health response',
+          () async {
         final mockClient = MockClient((request) async {
           expect(request.url.path, '/api/v1/mobile/health');
           return http.Response(

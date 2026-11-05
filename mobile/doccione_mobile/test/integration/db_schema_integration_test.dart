@@ -58,16 +58,29 @@ void main() {
     );
   });
 
-  group('Schema v3 — CREATE TABLE matches models', () {
+  group('Schema v4 — CREATE TABLE matches models', () {
     test('jobs table has all 17 columns from Job.toMap()', () async {
       final db = await dbHelper.database;
       final columns = await db.rawQuery('PRAGMA table_info(jobs)');
       final names = columns.map((c) => c['name'] as String).toSet();
 
       final expected = {
-        'id', 'order_id', 'job_number', 'title', 'material', 'size',
-        'quantity', 'status', 'notes', 'sort_order', 'priority',
-        'client_id', 'assigned_to', 'due_date', 'created_at', 'updated_at',
+        'id',
+        'order_id',
+        'job_number',
+        'title',
+        'material',
+        'size',
+        'quantity',
+        'status',
+        'notes',
+        'sort_order',
+        'priority',
+        'client_id',
+        'assigned_to',
+        'due_date',
+        'created_at',
+        'updated_at',
         'metadata',
       };
 
@@ -80,11 +93,28 @@ void main() {
       final names = columns.map((c) => c['name'] as String).toSet();
 
       final expected = {
-        'id', 'order_number', 'job_id', 'client_id', 'client', 'whatsapp',
-        'status', 'material', 'size', 'quantity', 'delivery_date',
-        'print_priority', 'is_archived', 'observations', 'order_concept',
-        'order_description', 'total_amount', 'currency', 'order_date',
-        'created_at', 'updated_at', 'metadata',
+        'id',
+        'order_number',
+        'job_id',
+        'client_id',
+        'client',
+        'whatsapp',
+        'status',
+        'material',
+        'size',
+        'quantity',
+        'delivery_date',
+        'print_priority',
+        'is_archived',
+        'observations',
+        'order_concept',
+        'order_description',
+        'total_amount',
+        'currency',
+        'order_date',
+        'created_at',
+        'updated_at',
+        'metadata',
       };
 
       expect(names, expected);
@@ -96,17 +126,31 @@ void main() {
       final names = columns.map((c) => c['name'] as String).toSet();
 
       final expected = {
-        'id', 'name', 'email', 'phone', 'company', 'address',
-        'created_at', 'updated_at', 'metadata',
+        'id',
+        'name',
+        'email',
+        'phone',
+        'company',
+        'address',
+        'created_at',
+        'updated_at',
+        'metadata',
       };
 
       expect(names, expected);
     });
 
-    test('database version is 3', () async {
+    test('database version is 18', () async {
       final db = await dbHelper.database;
       final version = await db.getVersion();
-      expect(version, 3);
+      expect(version, 18);
+    });
+
+    test('sync state stores the active seller scope', () async {
+      final db = await dbHelper.database;
+      final columns = await db.rawQuery('PRAGMA table_info(sync_state)');
+      final names = columns.map((column) => column['name'] as String).toSet();
+      expect(names, contains('scope_id'));
     });
   });
 
@@ -127,6 +171,64 @@ void main() {
       expect(orderNames, contains('whatsapp'));
       expect(orderNames, contains('delivery_date'));
       expect(orderNames, contains('is_archived'));
+    });
+  });
+
+  group('Migration v3 → v4', () {
+    test('clears the unscoped company cache', () async {
+      final db = await dbHelper.database;
+      await db.insert('clients', {'id': 'C1', 'name': 'Empresa'});
+      await db.insert('orders', {
+        'id': 'O1',
+        'client_id': 'C1',
+        'client': 'Empresa',
+      });
+      await db.insert('jobs', {
+        'id': 'J1',
+        'order_id': 'O1',
+        'title': 'Trabajo anterior',
+      });
+
+      // Reproduce el esquema de sync_state de v3 antes de reabrir la base.
+      await db.execute('DROP TABLE sync_state');
+      await db.execute('''
+        CREATE TABLE sync_state (
+          id INTEGER PRIMARY KEY CHECK (id = 1),
+          last_completed_snapshot TEXT,
+          current_next_cursor TEXT,
+          last_sync_at TEXT,
+          last_sync_error TEXT
+        )
+      ''');
+      await db.insert('sync_state', {
+        'id': 1,
+        'current_next_cursor': 'old-company-cursor',
+      });
+      await db.setVersion(3);
+      await dbHelper.close();
+
+      final upgraded = await dbHelper.database;
+      expect(
+        Sqflite.firstIntValue(
+          await upgraded.rawQuery('SELECT COUNT(*) FROM jobs'),
+        ),
+        0,
+      );
+      expect(
+        Sqflite.firstIntValue(
+          await upgraded.rawQuery('SELECT COUNT(*) FROM orders'),
+        ),
+        0,
+      );
+      expect(
+        Sqflite.firstIntValue(
+          await upgraded.rawQuery('SELECT COUNT(*) FROM clients'),
+        ),
+        0,
+      );
+      final state = (await upgraded.query('sync_state')).single;
+      expect(state['scope_id'], isNull);
+      expect(state['current_next_cursor'], isNull);
     });
   });
 
@@ -195,7 +297,8 @@ void main() {
         'metadata': '{"r":1}',
       });
 
-      final rows = await db.query('orders', where: 'id = ?', whereArgs: ['300']);
+      final rows =
+          await db.query('orders', where: 'id = ?', whereArgs: ['300']);
       expect(rows.length, 1);
 
       final row = rows.first;
@@ -223,16 +326,24 @@ void main() {
       await db.transaction((txn) async {
         final batch = txn.batch();
         batch.insert('jobs', {
-          'id': 'B1', 'title': 'Batch Job', 'status': 'pending',
-          'created_at': '2026-07-20', 'updated_at': '2026-07-20',
+          'id': 'B1',
+          'title': 'Batch Job',
+          'status': 'pending',
+          'created_at': '2026-07-20',
+          'updated_at': '2026-07-20',
         });
         batch.insert('orders', {
-          'id': 'B2', 'status': 'pending', 'order_date': '2026-07-20',
-          'created_at': '2026-07-20', 'updated_at': '2026-07-20',
+          'id': 'B2',
+          'status': 'pending',
+          'order_date': '2026-07-20',
+          'created_at': '2026-07-20',
+          'updated_at': '2026-07-20',
         });
         batch.insert('clients', {
-          'id': 'B3', 'name': 'Batch Client',
-          'created_at': '2026-07-20', 'updated_at': '2026-07-20',
+          'id': 'B3',
+          'name': 'Batch Client',
+          'created_at': '2026-07-20',
+          'updated_at': '2026-07-20',
         });
         await batch.commit(noResult: true);
       });
@@ -265,16 +376,26 @@ void main() {
               'jobs': {
                 'items': [
                   {
-                    'id': 1, 'order_id': 10, 'title': 'Integration Job',
-                    'material': 'Acero', 'size': '100x200', 'quantity': 3,
-                    'status': 'pending', 'notes': 'Test note', 'sort_order': 0,
-                    'priority': 'high', 'client_id': 1, 'assigned_to': 'Tech',
+                    'id': 1,
+                    'order_id': 10,
+                    'title': 'Integration Job',
+                    'material': 'Acero',
+                    'size': '100x200',
+                    'quantity': 3,
+                    'status': 'pending',
+                    'notes': 'Test note',
+                    'sort_order': 0,
+                    'priority': 'high',
+                    'client_id': 1,
+                    'assigned_to': 'Tech',
                     'due_date': '2026-08-01',
                     'created_at': '2026-07-20T08:00:00',
                     'updated_at': '2026-07-20T09:00:00',
                   },
                   {
-                    'id': 2, 'title': 'Second Job', 'status': 'done',
+                    'id': 2,
+                    'title': 'Second Job',
+                    'status': 'done',
                     'sort_order': 1,
                     'created_at': '2026-07-20T08:00:00',
                     'updated_at': '2026-07-20T10:00:00',
@@ -285,11 +406,17 @@ void main() {
               'orders': {
                 'items': [
                   {
-                    'id': 10, 'client_id': 1, 'client': 'John Doe',
-                    'whatsapp': '+549115555', 'status': 'production',
-                    'material': 'Acero', 'quantity': 5,
-                    'delivery_date': '2026-08-15', 'print_priority': 'high',
-                    'is_archived': 0, 'order_date': '2026-07-20',
+                    'id': 10,
+                    'client_id': 1,
+                    'client': 'John Doe',
+                    'whatsapp': '+549115555',
+                    'status': 'production',
+                    'material': 'Acero',
+                    'quantity': 5,
+                    'delivery_date': '2026-08-15',
+                    'print_priority': 'high',
+                    'is_archived': 0,
+                    'order_date': '2026-07-20',
                     'created_at': '2026-07-20T08:00:00',
                     'updated_at': '2026-07-20T09:00:00',
                   },
@@ -299,7 +426,9 @@ void main() {
               'clients': {
                 'items': [
                   {
-                    'id': 1, 'name': 'John Doe', 'phone': '+549115555',
+                    'id': 1,
+                    'name': 'John Doe',
+                    'phone': '+549115555',
                     'created_at': '2026-07-20T08:00:00',
                     'updated_at': '2026-07-20T09:00:00',
                   },
@@ -376,6 +505,9 @@ void main() {
       int requestCount = 0;
 
       final mockClient = MockClient((request) async {
+        if (request.url.path == '/api/v1/mobile/catalog/designs') {
+          return http.Response(jsonEncode({'designs': []}), 200);
+        }
         requestCount++;
 
         if (requestCount == 1) {
@@ -389,7 +521,9 @@ void main() {
                 'jobs': {
                   'items': [
                     {
-                      'id': 1, 'title': 'Page 1 Job', 'status': 'pending',
+                      'id': 1,
+                      'title': 'Page 1 Job',
+                      'status': 'pending',
                       'sort_order': 0,
                       'created_at': '2026-07-20T08:00:00',
                       'updated_at': '2026-07-20T09:00:00',
@@ -414,7 +548,9 @@ void main() {
                 'jobs': {
                   'items': [
                     {
-                      'id': 2, 'title': 'Page 2 Job', 'status': 'done',
+                      'id': 2,
+                      'title': 'Page 2 Job',
+                      'status': 'done',
                       'sort_order': 1,
                       'created_at': '2026-07-20T08:00:00',
                       'updated_at': '2026-07-20T10:00:00',
@@ -425,7 +561,9 @@ void main() {
                 'orders': {
                   'items': [
                     {
-                      'id': 10, 'client_id': 1, 'status': 'pending',
+                      'id': 10,
+                      'client_id': 1,
+                      'status': 'pending',
                       'order_date': '2026-07-20',
                       'created_at': '2026-07-20T08:00:00',
                       'updated_at': '2026-07-20T09:00:00',
@@ -449,7 +587,9 @@ void main() {
                 'jobs': {
                   'items': [
                     {
-                      'id': 3, 'title': 'Page 3 Job', 'status': 'pending',
+                      'id': 3,
+                      'title': 'Page 3 Job',
+                      'status': 'pending',
                       'sort_order': 2,
                       'created_at': '2026-07-20T08:00:00',
                       'updated_at': '2026-07-20T11:00:00',
@@ -461,7 +601,8 @@ void main() {
                 'clients': {
                   'items': [
                     {
-                      'id': 1, 'name': 'Client Page 3',
+                      'id': 1,
+                      'name': 'Client Page 3',
                       'created_at': '2026-07-20T08:00:00',
                       'updated_at': '2026-07-20T09:00:00',
                     },
@@ -516,9 +657,6 @@ void main() {
     test('rollback on handler error — no data persisted after exception',
         () async {
       final syncStateRepo = SyncStateRepository(dbHelper);
-      final jobsRepo = JobsRepository(dbHelper);
-      final ordersRepo = OrdersRepository(dbHelper);
-      final clientsRepo = ClientsRepository(dbHelper);
 
       final mockClient = MockClient((request) async {
         return http.Response(
@@ -531,7 +669,9 @@ void main() {
               'jobs': {
                 'items': [
                   {
-                    'id': 1, 'title': 'Should Rollback', 'status': 'pending',
+                    'id': 1,
+                    'title': 'Should Rollback',
+                    'status': 'pending',
                     'sort_order': 0,
                     'created_at': '2026-07-20T08:00:00',
                     'updated_at': '2026-07-20T09:00:00',
@@ -585,7 +725,8 @@ class _ExplodingHandler implements JobsSyncHandler {
   String get entityType => 'jobs';
 
   @override
-  Future<void> process(List<Map<String, dynamic>> items, {Transaction? txn}) async {
+  Future<void> process(List<Map<String, dynamic>> items,
+      {Transaction? txn}) async {
     throw Exception('Simulated mid-transaction failure');
   }
 

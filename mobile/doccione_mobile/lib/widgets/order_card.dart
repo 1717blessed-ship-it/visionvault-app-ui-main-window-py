@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:doccione_mobile/models/order_with_details.dart';
+import 'package:doccione_mobile/models/order_status.dart';
+import '../theme/doccione_palette.dart';
 
 class OrderCard extends StatelessWidget {
   final OrderWithDetails orderDetails;
@@ -14,14 +16,14 @@ class OrderCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final order = orderDetails.order;
-    
+
     return Card(
-      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      margin: const EdgeInsets.fromLTRB(16, 10, 16, 0),
       child: InkWell(
         onTap: onTap,
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(20),
         child: Padding(
-          padding: const EdgeInsets.all(16),
+          padding: const EdgeInsets.all(18),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -39,14 +41,21 @@ class OrderCard extends StatelessWidget {
                   _buildStatusBadge(context),
                   const Spacer(),
                   // Arrow icon
-                  const Icon(Icons.chevron_right, color: Colors.grey),
+                  const Icon(
+                    Icons.chevron_right,
+                    color: DoccionePalette.muted,
+                  ),
                 ],
               ),
               const SizedBox(height: 12),
               // Client name
               Row(
                 children: [
-                  const Icon(Icons.person_outline, size: 16, color: Colors.grey),
+                  const Icon(
+                    Icons.person_outline,
+                    size: 16,
+                    color: DoccionePalette.muted,
+                  ),
                   const SizedBox(width: 4),
                   Expanded(
                     child: Text(
@@ -61,7 +70,11 @@ class OrderCard extends StatelessWidget {
               // Primary job
               Row(
                 children: [
-                  const Icon(Icons.work_outline, size: 16, color: Colors.grey),
+                  const Icon(
+                    Icons.work_outline,
+                    size: 16,
+                    color: DoccionePalette.muted,
+                  ),
                   const SizedBox(width: 4),
                   Expanded(
                     child: Text(
@@ -79,7 +92,7 @@ class OrderCard extends StatelessWidget {
                   Text(
                     orderDetails.formattedOrderDate,
                     style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                          color: Colors.grey[600],
+                          color: DoccionePalette.muted,
                         ),
                   ),
                   const SizedBox(width: 16),
@@ -87,7 +100,7 @@ class OrderCard extends StatelessWidget {
                     Text(
                       '${orderDetails.jobsCount} ${orderDetails.jobsCount == 1 ? 'trabajo' : 'trabajos'}',
                       style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                            color: Colors.grey[600],
+                            color: DoccionePalette.muted,
                           ),
                     ),
                 ],
@@ -101,50 +114,50 @@ class OrderCard extends StatelessWidget {
 
   Widget _buildStatusBadge(BuildContext context) {
     final status = orderDetails.order.status ?? 'unknown';
-    
+
     Color backgroundColor;
     Color textColor;
     String label;
     IconData icon;
-    
-    switch (status.toLowerCase()) {
+
+    switch (OrderStatus.key(status)) {
       case 'pending':
-        backgroundColor = Colors.blue.shade50;
-        textColor = Colors.blue.shade700;
+        backgroundColor = DoccionePalette.wine.withValues(alpha: .10);
+        textColor = DoccionePalette.wine;
         label = 'Pendiente';
         icon = Icons.schedule;
         break;
       case 'production':
-        backgroundColor = Colors.orange.shade50;
-        textColor = Colors.orange.shade700;
+        backgroundColor = DoccionePalette.production.withValues(alpha: .12);
+        textColor = DoccionePalette.production;
         label = 'Producción';
         icon = Icons.build;
         break;
       case 'completed':
-        backgroundColor = Colors.green.shade50;
-        textColor = Colors.green.shade700;
+        backgroundColor = DoccionePalette.success.withValues(alpha: .11);
+        textColor = DoccionePalette.success;
         label = 'Completado';
         icon = Icons.check_circle;
         break;
       case 'delivered':
-        backgroundColor = Colors.purple.shade50;
-        textColor = Colors.purple.shade700;
+        backgroundColor = DoccionePalette.violetSoft;
+        textColor = DoccionePalette.violet;
         label = 'Entregado';
         icon = Icons.local_shipping;
         break;
       case 'cancelled':
-        backgroundColor = Colors.red.shade50;
-        textColor = Colors.red.shade700;
+        backgroundColor = DoccionePalette.dangerSoft;
+        textColor = DoccionePalette.danger;
         label = 'Cancelado';
         icon = Icons.cancel;
         break;
       default:
-        backgroundColor = Colors.grey.shade50;
-        textColor = Colors.grey.shade700;
+        backgroundColor = DoccionePalette.neutralSoft;
+        textColor = DoccionePalette.muted;
         label = status;
         icon = Icons.help_outline;
     }
-    
+
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
       decoration: BoxDecoration(

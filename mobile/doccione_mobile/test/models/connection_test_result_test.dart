@@ -4,7 +4,8 @@ import 'package:doccione_mobile/models/connection_test_result.dart';
 void main() {
   group('ConnectionTestResult', () {
     test('ok creates success result', () {
-      final result = ConnectionTestResult.ok(responseTime: const Duration(milliseconds: 150));
+      final result = ConnectionTestResult.ok(
+          responseTime: const Duration(milliseconds: 150));
       expect(result.success, true);
       expect(result.message, 'Conexión exitosa');
       expect(result.statusCode, 200);
@@ -56,7 +57,8 @@ void main() {
     });
 
     test('networkError with custom detail', () {
-      final result = ConnectionTestResult.networkError(detail: 'Connection refused');
+      final result =
+          ConnectionTestResult.networkError(detail: 'Connection refused');
       expect(result.success, false);
       expect(result.message, 'Connection refused');
     });

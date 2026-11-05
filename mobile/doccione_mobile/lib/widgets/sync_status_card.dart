@@ -44,7 +44,7 @@ class _SyncStatusCardState extends State<SyncStatusCard> {
 
   Future<void> _initializeSyncService() async {
     _dbHelper = DatabaseHelper();
-    
+
     final syncStateRepo = SyncStateRepository(_dbHelper);
     final jobsRepo = JobsRepository(_dbHelper);
     final ordersRepo = OrdersRepository(_dbHelper);
@@ -81,7 +81,7 @@ class _SyncStatusCardState extends State<SyncStatusCard> {
 
   Future<void> _performSync() async {
     if (_isSyncing) return;
-    
+
     if (widget.sessionToken == null) {
       _showError('Debe vincular el dispositivo primero');
       return;
@@ -99,7 +99,8 @@ class _SyncStatusCardState extends State<SyncStatusCard> {
         onPageComplete: (pageResult) {
           if (mounted) {
             setState(() {
-              _syncStatus = 'Sincronizando: ${pageResult.jobsUpdated} trabajos, '
+              _syncStatus =
+                  'Sincronizando: ${pageResult.jobsUpdated} trabajos, '
                   '${pageResult.ordersUpdated} pedidos, '
                   '${pageResult.clientsUpdated} clientes';
             });
@@ -110,7 +111,7 @@ class _SyncStatusCardState extends State<SyncStatusCard> {
       if (mounted) {
         setState(() {
           _lastResult = result;
-          
+
           if (result.isSuccess) {
             _syncStatus = 'Sincronización completada';
           } else {
@@ -235,11 +236,13 @@ class _SyncStatusCardState extends State<SyncStatusCard> {
                         height: 16,
                         child: CircularProgressIndicator(
                           strokeWidth: 2,
-                          valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                          valueColor:
+                              AlwaysStoppedAnimation<Color>(Colors.white),
                         ),
                       )
                     : const Icon(Icons.sync),
-                label: Text(_isSyncing ? 'Sincronizando...' : 'Sincronizar ahora'),
+                label:
+                    Text(_isSyncing ? 'Sincronizando...' : 'Sincronizar ahora'),
               ),
             ),
           ],

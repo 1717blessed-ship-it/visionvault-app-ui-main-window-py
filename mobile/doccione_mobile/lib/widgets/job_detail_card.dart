@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:doccione_mobile/models/job.dart';
 import 'package:doccione_mobile/widgets/quick_action_sheet.dart';
 import 'package:doccione_mobile/services/quick_edit_api_client.dart';
+import 'package:doccione_mobile/theme/doccione_palette.dart';
 
 /// Widget to display job details in a card format
 class JobDetailCard extends StatelessWidget {
@@ -40,7 +41,8 @@ class JobDetailCard extends StatelessWidget {
                   width: 32,
                   height: 32,
                   decoration: BoxDecoration(
-                    color: Theme.of(context).primaryColor.withOpacity(0.1),
+                    color:
+                        Theme.of(context).primaryColor.withValues(alpha: 0.1),
                     borderRadius: BorderRadius.circular(16),
                   ),
                   child: Center(
@@ -57,7 +59,10 @@ class JobDetailCard extends StatelessWidget {
                 Expanded(
                   child: Text(
                     job.title ?? 'Sin título',
-                    style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
+                    style: Theme.of(context)
+                        .textTheme
+                        .titleMedium
+                        ?.copyWith(fontWeight: FontWeight.bold),
                   ),
                 ),
                 _buildStatusBadge(context),
@@ -65,39 +70,52 @@ class JobDetailCard extends StatelessWidget {
                   PopupMenuButton<String>(
                     icon: const Icon(Icons.more_vert, size: 20),
                     tooltip: 'Editar trabajo',
-                    onSelected: (action) => _handleJobAction(context, action, jobUid),
+                    onSelected: (action) =>
+                        _handleJobAction(context, action, jobUid),
                     itemBuilder: (context) => [
-                      const PopupMenuItem(value: 'stage', child: Text('Cambiar etapa')),
-                      const PopupMenuItem(value: 'quantity_size', child: Text('Cantidad y tamaño')),
+                      const PopupMenuItem(
+                          value: 'stage', child: Text('Cambiar etapa')),
+                      const PopupMenuItem(
+                          value: 'quantity_size',
+                          child: Text('Cantidad y tamaño')),
                     ],
                   ),
               ],
             ),
             const SizedBox(height: 12),
             if (job.material != null && job.material!.isNotEmpty)
-              _buildInfoRow(context, Icons.category_outlined, 'Material', job.material!),
+              _buildInfoRow(
+                  context, Icons.category_outlined, 'Material', job.material!),
             if (job.size != null && job.size!.isNotEmpty)
               _buildInfoRow(context, Icons.straighten, 'Tamaño', job.size!),
             if (job.quantity != null)
-              _buildInfoRow(context, Icons.format_list_numbered, 'Cantidad', '${job.quantity}'),
+              _buildInfoRow(context, Icons.format_list_numbered, 'Cantidad',
+                  '${job.quantity}'),
             if (job.notes != null && job.notes!.isNotEmpty)
               Padding(
                 padding: const EdgeInsets.only(top: 8),
                 child: Container(
                   padding: const EdgeInsets.all(12),
                   decoration: BoxDecoration(
-                    color: Colors.grey.shade50,
+                    color: DoccionePalette.surfaceElevated,
                     borderRadius: BorderRadius.circular(8),
                   ),
                   child: Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Icon(Icons.note_outlined, size: 16, color: Colors.grey[600]),
+                      const Icon(
+                        Icons.note_outlined,
+                        size: 16,
+                        color: DoccionePalette.muted,
+                      ),
                       const SizedBox(width: 8),
                       Expanded(
                         child: Text(
                           job.notes!,
-                          style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.grey[700]),
+                          style: Theme.of(context)
+                              .textTheme
+                              .bodySmall
+                              ?.copyWith(color: DoccionePalette.muted),
                         ),
                       ),
                     ],
@@ -131,7 +149,10 @@ class JobDetailCard extends StatelessWidget {
               padding: const EdgeInsets.all(16),
               child: Text(
                 'Editar "${job.title ?? 'Trabajo'}"',
-                style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
+                style: Theme.of(context)
+                    .textTheme
+                    .titleMedium
+                    ?.copyWith(fontWeight: FontWeight.bold),
               ),
             ),
             ListTile(
@@ -207,16 +228,20 @@ class JobDetailCard extends StatelessWidget {
     onRefresh?.call();
   }
 
-  Widget _buildInfoRow(BuildContext context, IconData icon, String label, String value) {
+  Widget _buildInfoRow(
+      BuildContext context, IconData icon, String label, String value) {
     return Padding(
       padding: const EdgeInsets.only(top: 8),
       child: Row(
         children: [
-          Icon(icon, size: 16, color: Colors.grey[600]),
+          Icon(icon, size: 16, color: DoccionePalette.muted),
           const SizedBox(width: 8),
           Text(
             '$label: ',
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.grey[600], fontWeight: FontWeight.w500),
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: DoccionePalette.muted,
+                  fontWeight: FontWeight.w500,
+                ),
           ),
           Expanded(
             child: Text(value, style: Theme.of(context).textTheme.bodyMedium),
@@ -234,29 +259,29 @@ class JobDetailCard extends StatelessWidget {
 
     switch (status.toLowerCase()) {
       case 'pending':
-        backgroundColor = Colors.blue.shade50;
-        textColor = Colors.blue.shade700;
+        backgroundColor = DoccionePalette.infoSoft;
+        textColor = DoccionePalette.info;
         label = 'Pendiente';
         break;
       case 'in_progress':
       case 'production':
-        backgroundColor = Colors.orange.shade50;
-        textColor = Colors.orange.shade700;
+        backgroundColor = DoccionePalette.productionSoft;
+        textColor = DoccionePalette.production;
         label = 'En Proceso';
         break;
       case 'completed':
-        backgroundColor = Colors.green.shade50;
-        textColor = Colors.green.shade700;
+        backgroundColor = DoccionePalette.successSoft;
+        textColor = DoccionePalette.success;
         label = 'Completado';
         break;
       case 'cancelled':
-        backgroundColor = Colors.red.shade50;
-        textColor = Colors.red.shade700;
+        backgroundColor = DoccionePalette.dangerSoft;
+        textColor = DoccionePalette.danger;
         label = 'Cancelado';
         break;
       default:
-        backgroundColor = Colors.grey.shade50;
-        textColor = Colors.grey.shade700;
+        backgroundColor = DoccionePalette.neutralSoft;
+        textColor = DoccionePalette.muted;
         label = status;
     }
 
@@ -268,7 +293,8 @@ class JobDetailCard extends StatelessWidget {
       ),
       child: Text(
         label,
-        style: TextStyle(color: textColor, fontSize: 11, fontWeight: FontWeight.w600),
+        style: TextStyle(
+            color: textColor, fontSize: 11, fontWeight: FontWeight.w600),
       ),
     );
   }

@@ -2,7 +2,6 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:sqflite/sqflite.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -11,6 +10,7 @@ import 'package:doccione_mobile/database/sync_state_repository.dart';
 import 'package:doccione_mobile/database/jobs_repository.dart';
 import 'package:doccione_mobile/database/orders_repository.dart';
 import 'package:doccione_mobile/database/clients_repository.dart';
+import 'package:doccione_mobile/database/offline_catalog_repository.dart';
 import 'package:doccione_mobile/services/sync_api_client.dart';
 import 'package:doccione_mobile/services/sync_service.dart';
 import 'package:doccione_mobile/services/handlers/jobs_sync_handler.dart';
@@ -29,10 +29,12 @@ Map<String, dynamic> _backendResponse({
   bool jobsHasMore = false,
   bool ordersHasMore = false,
   bool clientsHasMore = false,
+  String? scopeId,
 }) {
   return {
     'server_time': '2026-07-21T10:00:00',
     'snapshot_until': snapshotUntil,
+    if (scopeId != null) 'scope_id': scopeId,
     'complete': complete,
     'next_cursor': nextCursor,
     'entities': {
@@ -61,7 +63,7 @@ void main() {
 
   setUpAll(() async {
     TestWidgetsFlutterBinding.ensureInitialized();
-    
+
     // Mock path_provider for tests
     final testDir = Directory.systemTemp.createTempSync('sync_test_');
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
@@ -74,14 +76,14 @@ void main() {
         return null;
       },
     );
-    
+
     sqfliteFfiInit();
     databaseFactory = databaseFactoryFfi;
   });
 
   setUp(() async {
     dbHelper = DatabaseHelper();
-    
+
     syncStateRepo = SyncStateRepository(dbHelper);
     jobsRepo = JobsRepository(dbHelper);
     ordersRepo = OrdersRepository(dbHelper);
@@ -104,20 +106,51 @@ void main() {
   });
 
   group('SyncService — backend contract (entities/items)', () {
-    test('single page: jobs, orders, clients with int IDs coerced to String', () async {
+    test('single page: jobs, orders, clients with int IDs coerced to String',
+        () async {
       final mockClient = MockClient((request) async {
         return http.Response(
           jsonEncode(_backendResponse(
             snapshotUntil: '2026-07-21T10:00:00',
             complete: true,
             jobs: [
-              {'id': 1, 'order_id': 10, 'title': 'Job 1', 'material': 'Acero', 'status': 'pending', 'sort_order': 0, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'}
+              {
+                'id': 1,
+                'order_id': 10,
+                'title': 'Job 1',
+                'material': 'Acero',
+                'status': 'pending',
+                'sort_order': 0,
+                'created_at': '2026-07-20T08:00:00',
+                'updated_at': '2026-07-20T09:00:00'
+              }
             ],
             orders: [
-              {'id': 10, 'client_id': 1, 'client': 'John', 'whatsapp': '123', 'order_date': '2026-07-20', 'status': 'pending', 'material': 'Acero', 'quantity': 5, 'delivery_date': '2026-07-25', 'print_priority': 'high', 'is_archived': 0, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'}
+              {
+                'id': 10,
+                'client_id': 1,
+                'client': 'John',
+                'whatsapp': '123',
+                'order_date': '2026-07-20',
+                'status': 'pending',
+                'material': 'Acero',
+                'quantity': 5,
+                'delivery_date': '2026-07-25',
+                'print_priority': 'high',
+                'is_archived': 0,
+                'created_at': '2026-07-20T08:00:00',
+                'updated_at': '2026-07-20T09:00:00'
+              }
             ],
             clients: [
-              {'id': 1, 'name': 'John', 'whatsapp': '123', 'client_type': 'regular', 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'}
+              {
+                'id': 1,
+                'name': 'John',
+                'whatsapp': '123',
+                'client_type': 'regular',
+                'created_at': '2026-07-20T08:00:00',
+                'updated_at': '2026-07-20T09:00:00'
+              }
             ],
           )),
           200,
@@ -169,6 +202,217 @@ void main() {
       apiClient.close();
     });
 
+    test('a seller scope removes cached company orders before upsert',
+        () async {
+      await ordersRepo.upsertOrder({
+        'id': '900',
+        'client': 'Cliente empresa',
+        'order_date': '2026-07-19',
+        'status': 'pending',
+        'created_at': '2026-07-19T08:00:00',
+        'updated_at': '2026-07-19T09:00:00',
+      });
+      await jobsRepo.upsertJob({
+        'id': '901',
+        'order_id': '900',
+        'title': 'Trabajo empresa',
+        'status': 'pending',
+        'created_at': '2026-07-19T08:00:00',
+        'updated_at': '2026-07-19T09:00:00',
+      });
+      await clientsRepo.upsertClient({
+        'id': '902',
+        'name': 'Cliente empresa',
+        'created_at': '2026-07-19T08:00:00',
+        'updated_at': '2026-07-19T09:00:00',
+      });
+
+      final mockClient = MockClient((request) async {
+        return http.Response(
+          jsonEncode(_backendResponse(
+            snapshotUntil: '2026-07-21T10:00:00',
+            scopeId: 'seller-device:7',
+            complete: true,
+            jobs: [
+              {
+                'id': 11,
+                'order_id': 10,
+                'title': 'Trabajo propio',
+                'status': 'pending',
+                'created_at': '2026-07-20T08:00:00',
+                'updated_at': '2026-07-20T09:00:00'
+              }
+            ],
+            orders: [
+              {
+                'id': 10,
+                'client_id': 12,
+                'client': 'Cliente propio',
+                'order_date': '2026-07-20',
+                'status': 'pending',
+                'created_at': '2026-07-20T08:00:00',
+                'updated_at': '2026-07-20T09:00:00'
+              }
+            ],
+            clients: [
+              {
+                'id': 12,
+                'name': 'Cliente propio',
+                'created_at': '2026-07-20T08:00:00',
+                'updated_at': '2026-07-20T09:00:00'
+              }
+            ],
+          )),
+          200,
+        );
+      });
+      final apiClient = SyncApiClient(
+        baseUrl: 'http://localhost:8766',
+        authToken: 'test-token',
+        httpClient: mockClient,
+      );
+      final syncService = SyncService(
+        dbHelper: dbHelper,
+        syncStateRepo: syncStateRepo,
+        apiClient: apiClient,
+      );
+      syncService.registerHandler('jobs', JobsSyncHandler(jobsRepo));
+      syncService.registerHandler('orders', OrdersSyncHandler(ordersRepo));
+      syncService.registerHandler('clients', ClientsSyncHandler(clientsRepo));
+
+      final result = await syncService.startSync();
+
+      expect(result.isSuccess, true);
+      expect((await ordersRepo.getAllOrders()).map((item) => item.id), ['10']);
+      expect((await jobsRepo.getAllJobs()).map((item) => item.id), ['11']);
+      expect(
+          (await clientsRepo.getAllClients()).map((item) => item.id), ['12']);
+      expect((await syncStateRepo.getSyncState()).scopeId, 'seller-device:7');
+      apiClient.close();
+    });
+
+    test('sync refreshes offline catalog designs from Studio library',
+        () async {
+      final mockClient = MockClient((request) async {
+        if (request.url.path == '/api/v1/mobile/sync/pull') {
+          return http.Response(
+            jsonEncode(_backendResponse(
+              snapshotUntil: '2026-07-21T12:00:00',
+              complete: true,
+            )),
+            200,
+          );
+        }
+        if (request.url.path == '/api/v1/mobile/catalog/designs') {
+          return http.Response(
+            jsonEncode({
+              'designs': [
+                {
+                  'id': 'design-1',
+                  'name': 'Nuevo diseño',
+                  'category': 'Stickers',
+                  'caption': 'Diseño nuevo',
+                  'tags': ['nuevo'],
+                  'preview_url': '/previews/design-1.png',
+                  'visible_width': 100,
+                  'visible_height': 100,
+                  'modified_ms': 1710000000000,
+                }
+              ]
+            }),
+            200,
+          );
+        }
+        if (request.url.path == '/api/v1/mobile/catalog/categories') {
+          return http.Response(jsonEncode({'categories': []}), 200);
+        }
+        if (request.url.path == '/api/v1/mobile/catalog/tags') {
+          return http.Response(jsonEncode({'tags': []}), 200);
+        }
+        return http.Response(jsonEncode({}), 404);
+      });
+
+      final apiClient = SyncApiClient(
+        baseUrl: 'http://localhost:8766',
+        authToken: 'test-token',
+        httpClient: mockClient,
+      );
+      final syncService = SyncService(
+        dbHelper: dbHelper,
+        syncStateRepo: syncStateRepo,
+        apiClient: apiClient,
+      );
+      syncService.registerHandler('jobs', JobsSyncHandler(jobsRepo));
+      syncService.registerHandler('orders', OrdersSyncHandler(ordersRepo));
+      syncService.registerHandler('clients', ClientsSyncHandler(clientsRepo));
+
+      final offlineCatalogRepo = OfflineCatalogRepository(dbHelper);
+      final result = await syncService.startSync();
+
+      expect(result.isSuccess, true);
+      final designs = await offlineCatalogRepo.getDesigns();
+      expect(designs.map((design) => design.id), ['design-1']);
+      expect(designs.first.name, 'Nuevo diseño');
+      apiClient.close();
+    });
+
+    test('cancelled remote order is removed from the mobile cache', () async {
+      await ordersRepo.upsertOrder({
+        'id': '10',
+        'status': 'pending',
+        'updated_at': '2026-07-20T09:00:00',
+      });
+      await jobsRepo.upsertJob({
+        'id': '11',
+        'order_id': '10',
+        'status': 'pending',
+        'updated_at': '2026-07-20T09:00:00',
+      });
+      final mockClient = MockClient((request) async {
+        return http.Response(
+          jsonEncode(_backendResponse(
+            snapshotUntil: '2026-07-21T12:00:00',
+            complete: true,
+            jobs: [
+              {
+                'id': 11,
+                'order_id': 10,
+                'status': 'cancelled',
+                'updated_at': '2026-07-21T11:00:00',
+              }
+            ],
+            orders: [
+              {
+                'id': 10,
+                'status': 'cancelled',
+                'updated_at': '2026-07-21T11:00:00',
+              }
+            ],
+          )),
+          200,
+        );
+      });
+      final apiClient = SyncApiClient(
+        baseUrl: 'http://localhost:8766',
+        authToken: 'test-token',
+        httpClient: mockClient,
+      );
+      final syncService = SyncService(
+        dbHelper: dbHelper,
+        syncStateRepo: syncStateRepo,
+        apiClient: apiClient,
+      );
+      syncService.registerHandler('jobs', JobsSyncHandler(jobsRepo));
+      syncService.registerHandler('orders', OrdersSyncHandler(ordersRepo));
+
+      final result = await syncService.startSync();
+
+      expect(result.isSuccess, true);
+      expect(await ordersRepo.getOrderById('10'), isNull);
+      expect(await jobsRepo.getJobById('11'), isNull);
+      apiClient.close();
+    });
+
     test('zero orders, multiple jobs, empty clients', () async {
       final mockClient = MockClient((request) async {
         return http.Response(
@@ -176,9 +420,30 @@ void main() {
             snapshotUntil: '2026-07-21T11:00:00',
             complete: true,
             jobs: [
-              {'id': 1, 'title': 'Job A', 'status': 'pending', 'sort_order': 0, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'},
-              {'id': 2, 'title': 'Job B', 'status': 'done', 'sort_order': 1, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T10:00:00'},
-              {'id': 3, 'title': 'Job C', 'status': 'pending', 'sort_order': 2, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T11:00:00'},
+              {
+                'id': 1,
+                'title': 'Job A',
+                'status': 'pending',
+                'sort_order': 0,
+                'created_at': '2026-07-20T08:00:00',
+                'updated_at': '2026-07-20T09:00:00'
+              },
+              {
+                'id': 2,
+                'title': 'Job B',
+                'status': 'done',
+                'sort_order': 1,
+                'created_at': '2026-07-20T08:00:00',
+                'updated_at': '2026-07-20T10:00:00'
+              },
+              {
+                'id': 3,
+                'title': 'Job C',
+                'status': 'pending',
+                'sort_order': 2,
+                'created_at': '2026-07-20T08:00:00',
+                'updated_at': '2026-07-20T11:00:00'
+              },
             ],
             orders: [],
             clients: [],
@@ -225,10 +490,10 @@ void main() {
 
     test('paginated sync with cursor', () async {
       int requestCount = 0;
-      
+
       final mockClient = MockClient((request) async {
         requestCount++;
-        
+
         if (requestCount == 1) {
           return http.Response(
             jsonEncode(_backendResponse(
@@ -236,7 +501,14 @@ void main() {
               complete: false,
               nextCursor: 'cursor-page2',
               jobs: [
-                {'id': 1, 'title': 'Job 1', 'status': 'pending', 'sort_order': 0, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'}
+                {
+                  'id': 1,
+                  'title': 'Job 1',
+                  'status': 'pending',
+                  'sort_order': 0,
+                  'created_at': '2026-07-20T08:00:00',
+                  'updated_at': '2026-07-20T09:00:00'
+                }
               ],
               jobsHasMore: true,
             )),
@@ -249,7 +521,14 @@ void main() {
               snapshotUntil: '2026-07-21T10:00:00',
               complete: true,
               jobs: [
-                {'id': 2, 'title': 'Job 2', 'status': 'done', 'sort_order': 1, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T10:00:00'}
+                {
+                  'id': 2,
+                  'title': 'Job 2',
+                  'status': 'done',
+                  'sort_order': 1,
+                  'created_at': '2026-07-20T08:00:00',
+                  'updated_at': '2026-07-20T10:00:00'
+                }
               ],
             )),
             200,
@@ -300,10 +579,10 @@ void main() {
 
     test('syncAll across 3 pages', () async {
       int requestCount = 0;
-      
+
       final mockClient = MockClient((request) async {
         requestCount++;
-        
+
         if (requestCount == 1) {
           return http.Response(
             jsonEncode(_backendResponse(
@@ -311,7 +590,14 @@ void main() {
               complete: false,
               nextCursor: 'cursor-page2',
               jobs: [
-                {'id': 1, 'title': 'Job 1', 'status': 'pending', 'sort_order': 0, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'}
+                {
+                  'id': 1,
+                  'title': 'Job 1',
+                  'status': 'pending',
+                  'sort_order': 0,
+                  'created_at': '2026-07-20T08:00:00',
+                  'updated_at': '2026-07-20T09:00:00'
+                }
               ],
               jobsHasMore: true,
             )),
@@ -324,7 +610,14 @@ void main() {
               complete: false,
               nextCursor: 'cursor-page3',
               jobs: [
-                {'id': 2, 'title': 'Job 2', 'status': 'done', 'sort_order': 1, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T10:00:00'}
+                {
+                  'id': 2,
+                  'title': 'Job 2',
+                  'status': 'done',
+                  'sort_order': 1,
+                  'created_at': '2026-07-20T08:00:00',
+                  'updated_at': '2026-07-20T10:00:00'
+                }
               ],
               jobsHasMore: true,
             )),
@@ -336,7 +629,14 @@ void main() {
               snapshotUntil: '2026-07-21T10:00:00',
               complete: true,
               jobs: [
-                {'id': 3, 'title': 'Job 3', 'status': 'pending', 'sort_order': 2, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T11:00:00'}
+                {
+                  'id': 3,
+                  'title': 'Job 3',
+                  'status': 'pending',
+                  'sort_order': 2,
+                  'created_at': '2026-07-20T08:00:00',
+                  'updated_at': '2026-07-20T11:00:00'
+                }
               ],
             )),
             200,
@@ -382,20 +682,30 @@ void main() {
       apiClient.close();
     });
 
-    test('has_more true triggers pagination, has_more false completes', () async {
-      int requestCount = 0;
-      
+    test('has_more true triggers pagination, has_more false completes',
+        () async {
+      int syncPullRequestCount = 0;
+
       final mockClient = MockClient((request) async {
-        requestCount++;
-        
-        if (requestCount == 1) {
+        if (request.url.path == '/api/v1/mobile/sync/pull') {
+          syncPullRequestCount++;
+        }
+
+        if (syncPullRequestCount == 1) {
           return http.Response(
             jsonEncode(_backendResponse(
               snapshotUntil: '2026-07-21T10:00:00',
               complete: false,
               nextCursor: 'cursor-p2',
               jobs: [
-                {'id': 1, 'title': 'Job 1', 'status': 'pending', 'sort_order': 0, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'}
+                {
+                  'id': 1,
+                  'title': 'Job 1',
+                  'status': 'pending',
+                  'sort_order': 0,
+                  'created_at': '2026-07-20T08:00:00',
+                  'updated_at': '2026-07-20T09:00:00'
+                }
               ],
               jobsHasMore: true,
               orders: [],
@@ -409,7 +719,14 @@ void main() {
               snapshotUntil: '2026-07-21T10:00:00',
               complete: true,
               jobs: [
-                {'id': 2, 'title': 'Job 2', 'status': 'done', 'sort_order': 1, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T10:00:00'}
+                {
+                  'id': 2,
+                  'title': 'Job 2',
+                  'status': 'done',
+                  'sort_order': 1,
+                  'created_at': '2026-07-20T08:00:00',
+                  'updated_at': '2026-07-20T10:00:00'
+                }
               ],
               jobsHasMore: false,
             )),
@@ -436,7 +753,7 @@ void main() {
 
       expect(result.isSuccess, true);
       expect(result.completed, true);
-      expect(requestCount, 2);
+      expect(syncPullRequestCount, 2);
 
       final jobs = await jobsRepo.getAllJobs();
       expect(jobs.length, 2);
@@ -444,7 +761,8 @@ void main() {
       apiClient.close();
     });
 
-    test('malformed response: missing snapshot_until throws and returns error', () async {
+    test('malformed response: missing snapshot_until throws and returns error',
+        () async {
       final mockClient = MockClient((request) async {
         return http.Response(
           jsonEncode({
@@ -486,7 +804,8 @@ void main() {
       apiClient.close();
     });
 
-    test('malformed response: missing entities throws and returns error', () async {
+    test('malformed response: missing entities throws and returns error',
+        () async {
       final mockClient = MockClient((request) async {
         return http.Response(
           jsonEncode({
@@ -557,7 +876,14 @@ void main() {
             snapshotUntil: '2026-07-21T10:00:00',
             complete: true,
             jobs: [
-              {'id': 1, 'title': 'Job 1', 'status': 'pending', 'sort_order': 0, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'}
+              {
+                'id': 1,
+                'title': 'Job 1',
+                'status': 'pending',
+                'sort_order': 0,
+                'created_at': '2026-07-20T08:00:00',
+                'updated_at': '2026-07-20T09:00:00'
+              }
             ],
           )),
           200,
@@ -620,13 +946,33 @@ void main() {
             snapshotUntil: '2026-07-21T10:00:00',
             complete: true,
             jobs: [
-              {'id': 42, 'order_id': 99, 'title': 'Int ID Job', 'status': 'pending', 'sort_order': 0, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'}
+              {
+                'id': 42,
+                'order_id': 99,
+                'title': 'Int ID Job',
+                'status': 'pending',
+                'sort_order': 0,
+                'created_at': '2026-07-20T08:00:00',
+                'updated_at': '2026-07-20T09:00:00'
+              }
             ],
             orders: [
-              {'id': 77, 'client_id': 33, 'client': 'Test', 'status': 'pending', 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'}
+              {
+                'id': 77,
+                'client_id': 33,
+                'client': 'Test',
+                'status': 'pending',
+                'created_at': '2026-07-20T08:00:00',
+                'updated_at': '2026-07-20T09:00:00'
+              }
             ],
             clients: [
-              {'id': 55, 'name': 'Int Client', 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'}
+              {
+                'id': 55,
+                'name': 'Int Client',
+                'created_at': '2026-07-20T08:00:00',
+                'updated_at': '2026-07-20T09:00:00'
+              }
             ],
           )),
           200,
@@ -676,7 +1022,14 @@ void main() {
             'entities': {
               'jobs': {
                 'items': [
-                  {'id': 1, 'title': 'Job Only', 'status': 'pending', 'sort_order': 0, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'}
+                  {
+                    'id': 1,
+                    'title': 'Job Only',
+                    'status': 'pending',
+                    'sort_order': 0,
+                    'created_at': '2026-07-20T08:00:00',
+                    'updated_at': '2026-07-20T09:00:00'
+                  }
                 ],
                 'has_more': false,
               },
@@ -758,7 +1111,8 @@ class _FailingJobsHandler implements JobsSyncHandler {
   String get entityType => 'jobs';
 
   @override
-  Future<void> process(List<Map<String, dynamic>> items, {Transaction? txn}) async {
+  Future<void> process(List<Map<String, dynamic>> items,
+      {Transaction? txn}) async {
     throw Exception('Simulated database error');
   }
 

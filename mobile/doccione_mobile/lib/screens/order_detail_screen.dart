@@ -1,10 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:doccione_mobile/models/order.dart';
 import 'package:doccione_mobile/models/order_with_details.dart';
+import 'package:doccione_mobile/models/order_status.dart';
 import 'package:doccione_mobile/widgets/job_detail_card.dart';
 import 'package:doccione_mobile/widgets/stage_timeline.dart';
 import 'package:doccione_mobile/widgets/quick_action_sheet.dart';
 import 'package:doccione_mobile/services/quick_edit_api_client.dart';
+import 'package:doccione_mobile/widgets/order_editor_sheet.dart';
+import 'package:doccione_mobile/theme/doccione_palette.dart';
 
 enum _SyncState { synced, saving, error }
 
@@ -14,6 +17,7 @@ class OrderDetailScreen extends StatefulWidget {
   final VoidCallback? onContactWhatsApp;
   final QuickEditApiClient? apiClient;
   final VoidCallback? onRefresh;
+  final Future<void> Function(String orderId)? onDeleteLocal;
 
   const OrderDetailScreen({
     super.key,
@@ -21,6 +25,7 @@ class OrderDetailScreen extends StatefulWidget {
     this.onContactWhatsApp,
     this.apiClient,
     this.onRefresh,
+    this.onDeleteLocal,
   });
 
   @override
@@ -66,15 +71,25 @@ class _OrderDetailScreenState extends State<OrderDetailScreen>
   bool get _hasApi => widget.apiClient != null;
   int? get _orderId => int.tryParse(_order.id);
 
-  void _openQuickAction(QuickAction action, {int? jobId, String? currentStage, int? currentQuantity, String? currentSize}) {
+  Future<void> _openQuickAction(QuickAction action,
+      {int? jobId,
+      String? currentStage,
+      int? currentQuantity,
+      String? currentSize}) async {
     if (!_hasApi || _orderId == null) return;
     setState(() => _syncState = _SyncState.saving);
-    QuickActionSheet.show(
+    await QuickActionSheet.show(
       context,
       action: action,
       api: widget.apiClient!,
       orderId: _orderId!,
       onSuccess: () => _applyEdit(action),
+      onCancelled: widget.onDeleteLocal == null
+          ? null
+          : () async {
+              await widget.onDeleteLocal!(_order.id);
+              if (mounted) Navigator.pop(context);
+            },
       jobId: jobId,
       currentStatus: _order.status,
       currentPriority: int.tryParse(_order.printPriority ?? '') ?? 0,
@@ -82,6 +97,8 @@ class _OrderDetailScreenState extends State<OrderDetailScreen>
       currentQuantity: currentQuantity,
       currentSize: currentSize,
     );
+    if (!mounted || _syncState != _SyncState.saving) return;
+    setState(() => _syncState = _SyncState.synced);
   }
 
   void _applyEdit(QuickAction action) {
@@ -100,7 +117,9 @@ class _OrderDetailScreenState extends State<OrderDetailScreen>
           _orderDetails = OrderWithDetails(
             order: _order.copyWith(status: 'Entregado'),
             client: _orderDetails.client,
-            jobs: _orderDetails.jobs.map((j) => j.copyWith(status: 'Entregado')).toList(),
+            jobs: _orderDetails.jobs
+                .map((j) => j.copyWith(status: 'Entregado'))
+                .toList(),
           );
           _flashBadge();
           break;
@@ -122,7 +141,8 @@ class _OrderDetailScreenState extends State<OrderDetailScreen>
     setState(() => _showCheckmark = true);
   }
 
-  void _onJobEdited(int jobIndex, {String? status, int? quantity, String? size}) {
+  void _onJobEdited(int jobIndex,
+      {String? status, int? quantity, String? size}) {
     final jobs = List.of(_orderDetails.jobs);
     if (jobIndex < 0 || jobIndex >= jobs.length) return;
     final old = jobs[jobIndex];
@@ -145,7 +165,8 @@ class _OrderDetailScreenState extends State<OrderDetailScreen>
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text('Pedido #${_order.orderNumber ?? (_order.id.length > 8 ? _order.id.substring(0, 8) : _order.id)}'),
+        title: Text(
+            'Pedido #${_order.orderNumber ?? (_order.id.length > 8 ? _order.id.substring(0, 8) : _order.id)}'),
         actions: [
           if (_hasApi && _orderId != null)
             PopupMenuButton<String>(
@@ -153,10 +174,16 @@ class _OrderDetailScreenState extends State<OrderDetailScreen>
               tooltip: 'Edición rápida',
               onSelected: (action) => _handleQuickAction(action),
               itemBuilder: (context) => [
-                const PopupMenuItem(value: 'status', child: Text('Cambiar estado')),
-                const PopupMenuItem(value: 'priority', child: Text('Cambiar prioridad')),
-                const PopupMenuItem(value: 'deliver', child: Text('Marcar entregado')),
-                const PopupMenuItem(value: 'payment', child: Text('Registrar cobro')),
+                const PopupMenuItem(
+                    value: 'status', child: Text('Cambiar estado')),
+                const PopupMenuItem(
+                    value: 'details', child: Text('Editar pedido')),
+                const PopupMenuItem(
+                    value: 'priority', child: Text('Cambiar prioridad')),
+                const PopupMenuItem(
+                    value: 'deliver', child: Text('Marcar entregado')),
+                const PopupMenuItem(
+                    value: 'payment', child: Text('Registrar cobro')),
               ],
             ),
           if (widget.onContactWhatsApp != null && _hasWhatsAppNumber())
@@ -183,25 +210,26 @@ class _OrderDetailScreenState extends State<OrderDetailScreen>
   // ── Sync indicator: 3 states ────────────────────────────────────────
 
   Widget _buildSyncIndicator() {
-    final (Color bg, Color fg, IconData icon, String text) = switch (_syncState) {
+    final (Color bg, Color fg, IconData icon, String text) =
+        switch (_syncState) {
       _SyncState.saving => (
-        Colors.orange.shade50,
-        Colors.orange.shade700,
-        Icons.sync,
-        'Guardando...',
-      ),
+          DoccionePalette.productionSoft,
+          DoccionePalette.production,
+          Icons.sync,
+          'Guardando...',
+        ),
       _SyncState.error => (
-        Colors.red.shade50,
-        Colors.red.shade700,
-        Icons.error_outline,
-        'Error al guardar',
-      ),
+          DoccionePalette.dangerSoft,
+          DoccionePalette.danger,
+          Icons.error_outline,
+          'Error al guardar',
+        ),
       _SyncState.synced => (
-        Colors.green.shade50,
-        Colors.green.shade700,
-        Icons.check_circle_outline,
-        _formatSyncTime(),
-      ),
+          DoccionePalette.successSoft,
+          DoccionePalette.success,
+          Icons.check_circle_outline,
+          _formatSyncTime(),
+        ),
     };
 
     return AnimatedContainer(
@@ -244,32 +272,49 @@ class _OrderDetailScreenState extends State<OrderDetailScreen>
                   children: [
                     _buildStatusBadge(context),
                     const SizedBox(width: 8),
-                    if (_order.printPriority != null && _order.printPriority!.isNotEmpty)
+                    if (_order.printPriority != null &&
+                        _order.printPriority!.isNotEmpty)
                       _buildPriorityBadge(context),
                   ],
                 ),
                 const SizedBox(height: 16),
-                _buildInfoSection(context, Icons.person, 'Cliente', _orderDetails.client?.name ?? _order.client ?? 'Sin cliente'),
+                _buildInfoSection(
+                    context,
+                    Icons.person,
+                    'Cliente',
+                    _orderDetails.client?.name ??
+                        _order.client ??
+                        'Sin cliente'),
                 if (_getWhatsAppNumber() != null)
-                  _buildInfoSection(context, Icons.phone, 'WhatsApp', _getWhatsAppNumber()!),
-                _buildInfoSection(context, Icons.calendar_today, 'Fecha del pedido', _orderDetails.formattedOrderDate),
-                _buildInfoSection(context, Icons.event, 'Fecha de entrega', _orderDetails.formattedDeliveryDate),
+                  _buildInfoSection(
+                      context, Icons.phone, 'WhatsApp', _getWhatsAppNumber()!),
+                _buildInfoSection(context, Icons.calendar_today,
+                    'Fecha del pedido', _orderDetails.formattedOrderDate),
+                _buildInfoSection(context, Icons.event, 'Fecha de entrega',
+                    _orderDetails.formattedDeliveryDate),
                 if (_order.material != null && _order.material!.isNotEmpty)
-                  _buildInfoSection(context, Icons.category, 'Material', _order.material!),
+                  _buildInfoSection(
+                      context, Icons.category, 'Material', _order.material!),
                 if (_order.size != null && _order.size!.isNotEmpty)
-                  _buildInfoSection(context, Icons.straighten, 'Tamaño', _order.size!),
+                  _buildInfoSection(
+                      context, Icons.straighten, 'Tamaño', _order.size!),
                 if (_order.quantity != null)
-                  _buildInfoSection(context, Icons.format_list_numbered, 'Cantidad', '${_order.quantity}'),
+                  _buildInfoSection(context, Icons.format_list_numbered,
+                      'Cantidad', '${_order.quantity}'),
               ],
             ),
           ),
         ),
         if (_order.orderConcept != null && _order.orderConcept!.isNotEmpty)
-          _buildTextCard(context, 'Concepto', Icons.lightbulb_outline, _order.orderConcept!),
-        if (_order.orderDescription != null && _order.orderDescription!.isNotEmpty)
-          _buildTextCard(context, 'Descripción', Icons.description_outlined, _order.orderDescription!),
+          _buildTextCard(context, 'Concepto', Icons.lightbulb_outline,
+              _order.orderConcept!),
+        if (_order.orderDescription != null &&
+            _order.orderDescription!.isNotEmpty)
+          _buildTextCard(context, 'Descripción', Icons.description_outlined,
+              _order.orderDescription!),
         if (_order.observations != null && _order.observations!.isNotEmpty)
-          _buildTextCard(context, 'Observaciones', Icons.note_outlined, _order.observations!),
+          _buildTextCard(context, 'Observaciones', Icons.note_outlined,
+              _order.observations!),
         // ── Interactive timeline for jobs ──
         if (_orderDetails.hasJobs)
           for (int i = 0; i < _orderDetails.jobs.length; i++)
@@ -293,11 +338,17 @@ class _OrderDetailScreenState extends State<OrderDetailScreen>
           padding: const EdgeInsets.fromLTRB(16, 24, 16, 12),
           child: Row(
             children: [
-              Icon(Icons.work_outline, color: Colors.grey[700]),
+              const Icon(
+                Icons.work_outline,
+                color: DoccionePalette.muted,
+              ),
               const SizedBox(width: 8),
               Text(
                 'Trabajos (${_orderDetails.jobsCount})',
-                style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
+                style: Theme.of(context)
+                    .textTheme
+                    .titleMedium
+                    ?.copyWith(fontWeight: FontWeight.bold),
               ),
             ],
           ),
@@ -316,7 +367,11 @@ class _OrderDetailScreenState extends State<OrderDetailScreen>
                       apiClient: widget.apiClient,
                       orderId: _orderId,
                       onRefresh: widget.onRefresh,
-                      onJobEdited: (status, quantity, size) => _onJobEdited(entry.key, status: status, quantity: quantity, size: size),
+                      onJobEdited: (status, quantity, size) => _onJobEdited(
+                          entry.key,
+                          status: status,
+                          quantity: quantity,
+                          size: size),
                     ),
                   )
                   .toList(),
@@ -328,7 +383,10 @@ class _OrderDetailScreenState extends State<OrderDetailScreen>
             child: Center(
               child: Text(
                 'No hay trabajos asociados a este pedido',
-                style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: Colors.grey[600]),
+                style: Theme.of(context)
+                    .textTheme
+                    .bodyMedium
+                    ?.copyWith(color: DoccionePalette.muted),
               ),
             ),
           ),
@@ -342,6 +400,22 @@ class _OrderDetailScreenState extends State<OrderDetailScreen>
       case 'status':
         _openQuickAction(QuickAction.status);
         break;
+      case 'details':
+        if (_hasApi && _orderId != null) {
+          OrderEditorSheet.show(
+            context,
+            api: widget.apiClient!,
+            orderId: _orderId!,
+            order: _order,
+            onSaved: () {
+              widget.onRefresh?.call();
+              setState(() {
+                _lastSyncTime = DateTime.now();
+              });
+            },
+          );
+        }
+        break;
       case 'priority':
         _openQuickAction(QuickAction.priority);
         break;
@@ -354,21 +428,32 @@ class _OrderDetailScreenState extends State<OrderDetailScreen>
     }
   }
 
-  Widget _buildInfoSection(BuildContext context, IconData icon, String label, String value) {
+  Widget _buildInfoSection(
+      BuildContext context, IconData icon, String label, String value) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(icon, size: 20, color: Colors.grey[600]),
+          Icon(icon, size: 20, color: DoccionePalette.muted),
           const SizedBox(width: 12),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(label, style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.grey[600], fontWeight: FontWeight.w500)),
+                Text(
+                  label,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: DoccionePalette.muted,
+                        fontWeight: FontWeight.w500,
+                      ),
+                ),
                 const SizedBox(height: 2),
-                Text(value, style: Theme.of(context).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w500)),
+                Text(value,
+                    style: Theme.of(context)
+                        .textTheme
+                        .bodyMedium
+                        ?.copyWith(fontWeight: FontWeight.w500)),
               ],
             ),
           ),
@@ -384,40 +469,40 @@ class _OrderDetailScreenState extends State<OrderDetailScreen>
     String label;
     IconData icon;
 
-    switch (status.toLowerCase()) {
+    switch (OrderStatus.key(status)) {
       case 'pending':
-        backgroundColor = Colors.blue.shade50;
-        textColor = Colors.blue.shade700;
+        backgroundColor = DoccionePalette.infoSoft;
+        textColor = DoccionePalette.info;
         label = 'Pendiente';
         icon = Icons.schedule;
         break;
       case 'production':
-        backgroundColor = Colors.orange.shade50;
-        textColor = Colors.orange.shade700;
+        backgroundColor = DoccionePalette.productionSoft;
+        textColor = DoccionePalette.production;
         label = 'Producción';
         icon = Icons.build;
         break;
       case 'completed':
-        backgroundColor = Colors.green.shade50;
-        textColor = Colors.green.shade700;
+        backgroundColor = DoccionePalette.successSoft;
+        textColor = DoccionePalette.success;
         label = 'Completado';
         icon = Icons.check_circle;
         break;
       case 'delivered':
-        backgroundColor = Colors.purple.shade50;
-        textColor = Colors.purple.shade700;
+        backgroundColor = DoccionePalette.violetSoft;
+        textColor = DoccionePalette.violet;
         label = 'Entregado';
         icon = Icons.local_shipping;
         break;
       case 'cancelled':
-        backgroundColor = Colors.red.shade50;
-        textColor = Colors.red.shade700;
+        backgroundColor = DoccionePalette.dangerSoft;
+        textColor = DoccionePalette.danger;
         label = 'Cancelado';
         icon = Icons.cancel;
         break;
       default:
-        backgroundColor = Colors.grey.shade50;
-        textColor = Colors.grey.shade700;
+        backgroundColor = DoccionePalette.neutralSoft;
+        textColor = DoccionePalette.muted;
         label = status;
         icon = Icons.help_outline;
     }
@@ -429,18 +514,26 @@ class _OrderDetailScreenState extends State<OrderDetailScreen>
         return Container(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
           decoration: BoxDecoration(
-            color: isFlashing ? Colors.green.shade100 : backgroundColor,
+            color: isFlashing ? DoccionePalette.successSoft : backgroundColor,
             borderRadius: BorderRadius.circular(16),
           ),
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
               if (_showCheckmark && isFlashing)
-                Icon(Icons.check, size: 16, color: Colors.green.shade700)
+                const Icon(
+                  Icons.check,
+                  size: 16,
+                  color: DoccionePalette.success,
+                )
               else
                 Icon(icon, size: 16, color: textColor),
               const SizedBox(width: 6),
-              Text(label, style: TextStyle(color: textColor, fontSize: 13, fontWeight: FontWeight.w600)),
+              Text(label,
+                  style: TextStyle(
+                      color: textColor,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600)),
             ],
           ),
         );
@@ -458,28 +551,28 @@ class _OrderDetailScreenState extends State<OrderDetailScreen>
     switch (priority) {
       case 'high':
       case 'alta':
-        backgroundColor = Colors.red.shade50;
-        textColor = Colors.red.shade700;
+        backgroundColor = DoccionePalette.dangerSoft;
+        textColor = DoccionePalette.danger;
         label = 'Prioridad Alta';
         icon = Icons.priority_high;
         break;
       case 'medium':
       case 'media':
-        backgroundColor = Colors.orange.shade50;
-        textColor = Colors.orange.shade700;
+        backgroundColor = DoccionePalette.productionSoft;
+        textColor = DoccionePalette.production;
         label = 'Prioridad Media';
         icon = Icons.remove;
         break;
       case 'low':
       case 'baja':
-        backgroundColor = Colors.blue.shade50;
-        textColor = Colors.blue.shade700;
+        backgroundColor = DoccionePalette.infoSoft;
+        textColor = DoccionePalette.info;
         label = 'Prioridad Baja';
         icon = Icons.arrow_downward;
         break;
       default:
-        backgroundColor = Colors.grey.shade50;
-        textColor = Colors.grey.shade700;
+        backgroundColor = DoccionePalette.neutralSoft;
+        textColor = DoccionePalette.muted;
         label = priority;
         icon = Icons.flag;
     }
@@ -495,13 +588,16 @@ class _OrderDetailScreenState extends State<OrderDetailScreen>
         children: [
           Icon(icon, size: 16, color: textColor),
           const SizedBox(width: 6),
-          Text(label, style: TextStyle(color: textColor, fontSize: 13, fontWeight: FontWeight.w600)),
+          Text(label,
+              style: TextStyle(
+                  color: textColor, fontSize: 13, fontWeight: FontWeight.w600)),
         ],
       ),
     );
   }
 
-  Widget _buildTextCard(BuildContext context, String title, IconData icon, String content) {
+  Widget _buildTextCard(
+      BuildContext context, String title, IconData icon, String content) {
     return Card(
       margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       child: Padding(
@@ -511,9 +607,13 @@ class _OrderDetailScreenState extends State<OrderDetailScreen>
           children: [
             Row(
               children: [
-                Icon(icon, color: Colors.grey[600]),
+                Icon(icon, color: DoccionePalette.muted),
                 const SizedBox(width: 8),
-                Text(title, style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.bold)),
+                Text(title,
+                    style: Theme.of(context)
+                        .textTheme
+                        .titleSmall
+                        ?.copyWith(fontWeight: FontWeight.bold)),
               ],
             ),
             const SizedBox(height: 8),

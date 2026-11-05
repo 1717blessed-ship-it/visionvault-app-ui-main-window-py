@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
-import 'sync_api_client.dart';
 
 /// Result of a quick-edit API call
 class QuickEditResult {
@@ -9,8 +8,12 @@ class QuickEditResult {
   final String? errorMessage;
   final Map<String, dynamic>? data;
 
-  const QuickEditResult.success(this.data) : success = true, errorMessage = null;
-  const QuickEditResult.failure(this.errorMessage) : success = false, data = null;
+  const QuickEditResult.success(this.data)
+      : success = true,
+        errorMessage = null;
+  const QuickEditResult.failure(this.errorMessage)
+      : success = false,
+        data = null;
 }
 
 /// HTTP client for quick-edit actions from mobile
@@ -41,6 +44,15 @@ class QuickEditApiClient {
       '/api/v1/mobile/orders/$orderId/priority',
       {'print_priority': priority},
     );
+  }
+
+  /// PATCH /api/v1/mobile/orders/{id}/details
+  /// Actualiza los datos operativos que se pueden resolver desde producción.
+  Future<QuickEditResult> updateOrderDetails(
+    int orderId,
+    Map<String, dynamic> changes,
+  ) {
+    return _patch('/api/v1/mobile/orders/$orderId/details', changes);
   }
 
   /// PATCH /api/v1/mobile/orders/{oid}/jobs/{jid}

@@ -15,7 +15,11 @@ String pairingUrlFrom(String baseUrl) {
 /// Returns (configLoaded, configError, baseUrl) after loading a config.
 ({bool loaded, String? error, String baseUrl}) loadConfig(ServerConfig config) {
   if (unreachableHosts.contains(config.host)) {
-    return (loaded: false, error: 'Configurá la IP de la PC antes de vincular', baseUrl: '');
+    return (
+      loaded: false,
+      error: 'Configurá la IP de la PC antes de vincular',
+      baseUrl: ''
+    );
   }
   return (loaded: true, error: null, baseUrl: config.baseUrl);
 }
@@ -23,13 +27,13 @@ String pairingUrlFrom(String baseUrl) {
 String buttonTextForState(bool configLoaded) =>
     configLoaded ? 'Vincular' : 'Configurar servidor primero';
 
-Function? onPressedForState(bool configLoaded) =>
-    configLoaded ? () {} : null;
+Function? onPressedForState(bool configLoaded) => configLoaded ? () {} : null;
 
 void main() {
   group('host validation for Android', () {
     test('localhost keeps Vincular disabled', () {
-      const config = ServerConfig(host: 'localhost', port: 8765, scheme: 'http');
+      const config =
+          ServerConfig(host: 'localhost', port: 8765, scheme: 'http');
       final result = loadConfig(config);
       expect(result.loaded, false);
       expect(result.error, 'Configurá la IP de la PC antes de vincular');
@@ -38,7 +42,8 @@ void main() {
     });
 
     test('127.0.0.1 keeps Vincular disabled', () {
-      const config = ServerConfig(host: '127.0.0.1', port: 8765, scheme: 'http');
+      const config =
+          ServerConfig(host: '127.0.0.1', port: 8765, scheme: 'http');
       final result = loadConfig(config);
       expect(result.loaded, false);
       expect(result.error, isNotNull);
@@ -62,7 +67,8 @@ void main() {
     });
 
     test('192.168.1.46:8766 enables Vincular', () {
-      const config = ServerConfig(host: '192.168.1.46', port: 8766, scheme: 'http');
+      const config =
+          ServerConfig(host: '192.168.1.46', port: 8766, scheme: 'http');
       final result = loadConfig(config);
       expect(result.loaded, true);
       expect(result.error, isNull);
@@ -71,14 +77,16 @@ void main() {
     });
 
     test('10.0.0.50 enables Vincular', () {
-      const config = ServerConfig(host: '10.0.0.50', port: 9000, scheme: 'http');
+      const config =
+          ServerConfig(host: '10.0.0.50', port: 9000, scheme: 'http');
       final result = loadConfig(config);
       expect(result.loaded, true);
       expect(result.error, isNull);
     });
 
     test('my-server.local enables Vincular', () {
-      const config = ServerConfig(host: 'my-server.local', port: 8765, scheme: 'http');
+      const config =
+          ServerConfig(host: 'my-server.local', port: 8765, scheme: 'http');
       final result = loadConfig(config);
       expect(result.loaded, true);
       expect(result.error, isNull);
@@ -86,8 +94,11 @@ void main() {
   });
 
   group('pairingUrl derivation', () {
-    test('saved 192.168.1.46:8766 -> pairing at 192.168.1.46:8765, never localhost', () {
-      const saved = ServerConfig(host: '192.168.1.46', port: 8766, scheme: 'http');
+    test(
+        'saved 192.168.1.46:8766 -> pairing at 192.168.1.46:8765, never localhost',
+        () {
+      const saved =
+          ServerConfig(host: '192.168.1.46', port: 8766, scheme: 'http');
       final url = pairingUrlFrom(saved.baseUrl);
       expect(url, 'http://192.168.1.46:8765');
       expect(url, isNot(contains('localhost')));
@@ -107,13 +118,15 @@ void main() {
     });
 
     test('pairing URL uses configured scheme', () {
-      const config = ServerConfig(host: '10.0.0.1', port: 8766, scheme: 'https');
+      const config =
+          ServerConfig(host: '10.0.0.1', port: 8766, scheme: 'https');
       final url = pairingUrlFrom(config.baseUrl);
       expect(url, 'https://10.0.0.1:8765');
     });
 
     test('exact pairing request URL for the real bug scenario', () {
-      const saved = ServerConfig(host: '192.168.1.46', port: 8766, scheme: 'http');
+      const saved =
+          ServerConfig(host: '192.168.1.46', port: 8766, scheme: 'http');
       final baseUrl = pairingUrlFrom(saved.baseUrl);
       final fullUrl = '$baseUrl/api/pair/validate';
       expect(fullUrl, 'http://192.168.1.46:8765/api/pair/validate');

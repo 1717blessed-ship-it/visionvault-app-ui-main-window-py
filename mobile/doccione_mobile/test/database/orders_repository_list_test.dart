@@ -19,7 +19,7 @@ void main() {
   setUp(() async {
     dbHelper = DatabaseHelper();
     await dbHelper.deleteDatabase();
-    
+
     ordersRepo = OrdersRepository(dbHelper);
     clientsRepo = ClientsRepository(dbHelper);
     jobsRepo = JobsRepository(dbHelper);
@@ -32,7 +32,7 @@ void main() {
   group('OrdersRepository - getOrdersWithDetails', () {
     test('should return empty list when no orders', () async {
       final result = await ordersRepo.getOrdersWithDetails();
-      
+
       expect(result, isEmpty);
     });
 
@@ -109,8 +109,10 @@ void main() {
       ]);
 
       final pending = await ordersRepo.getOrdersWithDetails(status: 'pending');
-      final production = await ordersRepo.getOrdersWithDetails(status: 'production');
-      final completed = await ordersRepo.getOrdersWithDetails(status: 'completed');
+      final production =
+          await ordersRepo.getOrdersWithDetails(status: 'production');
+      final completed =
+          await ordersRepo.getOrdersWithDetails(status: 'completed');
 
       expect(pending.length, 1);
       expect(pending[0].order.id, 'order-1');

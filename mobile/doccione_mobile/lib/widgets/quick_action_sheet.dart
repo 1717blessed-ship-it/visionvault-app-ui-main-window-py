@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:doccione_mobile/services/quick_edit_api_client.dart';
+import 'package:doccione_mobile/services/stage_service.dart';
+import 'package:doccione_mobile/models/mobile_runtime_config.dart';
+import 'package:doccione_mobile/theme/doccione_palette.dart';
 
 /// Actions available from the quick-action sheet.
 enum QuickAction {
@@ -19,45 +22,21 @@ class QuickActionSheet {
 
   // ── Constants ──────────────────────────────────────────────────────────
 
-  static const _orderStatuses = [
-    'Pendiente',
-    'En producción',
-    'Finalizado',
-    'Entregado',
-    'Archivado',
-  ];
-
-  static const _priorities = {
-    0: 'Sin prisa',
-    1: 'Baja',
-    2: 'Media',
-    3: 'Alta',
-    4: 'Urgente',
-  };
-
-  static const _jobStages = [
-    'Recibido',
-    'Esperando archivos',
-    'Diseños confirmados',
-    'Listo para armado de planchas',
-    'En armado de planchas',
-    'Listo para imprimir',
-    'Impresión',
-    'Sublimado / Laminado',
-    'Corte',
-    'Control de calidad',
-    'Finalizado',
-    'Entregado',
-  ];
+  static List<String> get _orderStatuses => StageService.orderStatuses;
+  static Map<int, String> get _priorities => {
+        for (final item in StageService.priorities) item.value: item.label,
+      };
+  static List<String> get _jobStages => StageService.generalWorkflow;
 
   // ── Public API ─────────────────────────────────────────────────────────
 
-  static void show(
+  static Future<void> show(
     BuildContext context, {
     required QuickAction action,
     required QuickEditApiClient api,
     required int orderId,
     required VoidCallback onSuccess,
+    Future<void> Function()? onCancelled,
     int? jobId,
     String? currentStatus,
     int? currentPriority,
@@ -65,9 +44,34 @@ class QuickActionSheet {
     int? currentQuantity,
     String? currentSize,
   }) {
+    final runtime = MobileRuntimeConfigStore.current;
+    if (runtime.maintenanceEnabled) {
+      _showUnavailable(
+        context,
+        runtime.maintenanceMessage.isEmpty
+            ? 'Studio está en mantenimiento.'
+            : runtime.maintenanceMessage,
+      );
+      return Future.value();
+    }
+    if (!runtime.featureEnabled('quick_edits') &&
+        action != QuickAction.payment) {
+      _showUnavailable(
+        context,
+        'Las ediciones están temporalmente deshabilitadas desde Studio.',
+      );
+      return Future.value();
+    }
+    if (action == QuickAction.payment && !runtime.featureEnabled('payments')) {
+      _showUnavailable(
+        context,
+        'El registro de cobros está temporalmente deshabilitado.',
+      );
+      return Future.value();
+    }
     switch (action) {
       case QuickAction.status:
-        showModalBottomSheet(
+        return showModalBottomSheet<void>(
           context: context,
           isScrollControlled: true,
           builder: (_) => _StatusEditor(
@@ -75,11 +79,13 @@ class QuickActionSheet {
             orderId: orderId,
             currentStatus: currentStatus ?? 'Pendiente',
             onSuccess: onSuccess,
+            onCancelled: onCancelled,
           ),
         );
       case QuickAction.priority:
-        showModalBottomSheet(
+        return showModalBottomSheet<void>(
           context: context,
+          isScrollControlled: true,
           builder: (_) => _PriorityEditor(
             api: api,
             orderId: orderId,
@@ -88,8 +94,8 @@ class QuickActionSheet {
           ),
         );
       case QuickAction.jobStage:
-        if (jobId == null) return;
-        showModalBottomSheet(
+        if (jobId == null) return Future.value();
+        return showModalBottomSheet<void>(
           context: context,
           isScrollControlled: true,
           builder: (_) => _JobStageEditor(
@@ -101,8 +107,8 @@ class QuickActionSheet {
           ),
         );
       case QuickAction.jobQuantitySize:
-        if (jobId == null) return;
-        showModalBottomSheet(
+        if (jobId == null) return Future.value();
+        return showModalBottomSheet<void>(
           context: context,
           isScrollControlled: true,
           builder: (_) => _JobQuantitySizeEditor(
@@ -115,7 +121,7 @@ class QuickActionSheet {
           ),
         );
       case QuickAction.payment:
-        showModalBottomSheet(
+        return showModalBottomSheet<void>(
           context: context,
           isScrollControlled: true,
           builder: (_) => _PaymentEditor(
@@ -125,7 +131,7 @@ class QuickActionSheet {
           ),
         );
       case QuickAction.delivery:
-        showDialog(
+        return showDialog<void>(
           context: context,
           builder: (_) => _DeliveryConfirm(
             api: api,
@@ -134,6 +140,12 @@ class QuickActionSheet {
           ),
         );
     }
+  }
+
+  static void _showUnavailable(BuildContext context, String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
   }
 }
 
@@ -146,12 +158,14 @@ class _StatusEditor extends StatefulWidget {
   final int orderId;
   final String currentStatus;
   final VoidCallback onSuccess;
+  final Future<void> Function()? onCancelled;
 
   const _StatusEditor({
     required this.api,
     required this.orderId,
     required this.currentStatus,
     required this.onSuccess,
+    this.onCancelled,
   });
 
   @override
@@ -172,37 +186,70 @@ class _StatusEditorState extends State<_StatusEditor> {
             padding: const EdgeInsets.all(16),
             child: Text(
               'Cambiar estado del pedido',
-              style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
+              style: Theme.of(context)
+                  .textTheme
+                  .titleMedium
+                  ?.copyWith(fontWeight: FontWeight.bold),
             ),
           ),
-          IgnorePointer(
-            ignoring: _isSaving,
-            child: Opacity(
-              opacity: _isSaving ? 0.5 : 1.0,
-              child: Column(
-                children: QuickActionSheet._orderStatuses.map(
-                  (status) => RadioListTile<String>(
-                    title: Text(status),
-                    value: status,
-                    groupValue: widget.currentStatus,
-                    onChanged: _isSaving ? null : (value) async {
-                      if (value == null || value == widget.currentStatus) {
-                        Navigator.pop(context);
-                        return;
-                      }
-                      setState(() => _isSaving = true);
-                      Navigator.pop(context);
-                      final result = await widget.api.updateOrderStatus(widget.orderId, value);
-                      if (!mounted) return;
-                      if (result.success) {
-                        showSuccess(context, '✔ Estado cambiado a "$value"');
-                        widget.onSuccess();
-                      } else {
-                        showError(context, result.errorMessage);
-                      }
-                    },
-                  ),
-                ).toList(),
+          Flexible(
+            child: IgnorePointer(
+              ignoring: _isSaving,
+              child: Opacity(
+                opacity: _isSaving ? 0.5 : 1.0,
+                child: ListView(
+                  shrinkWrap: true,
+                  children: QuickActionSheet._orderStatuses
+                      .map(
+                        (status) => RadioListTile<String>(
+                          title: Text(status),
+                          value: status,
+                          // Compatibilidad con Flutter estable actual; migrar
+                          // el grupo completo cuando RadioGroup sea obligatorio.
+                          // ignore: deprecated_member_use
+                          groupValue: widget.currentStatus,
+                          // ignore: deprecated_member_use
+                          onChanged: _isSaving
+                              ? null
+                              : (value) async {
+                                  if (value == null ||
+                                      value == widget.currentStatus) {
+                                    Navigator.pop(context);
+                                    return;
+                                  }
+                                  setState(() => _isSaving = true);
+                                  final result = await widget.api
+                                      .updateOrderStatus(widget.orderId, value);
+                                  if (!context.mounted) return;
+                                  if (result.success) {
+                                    final normalized =
+                                        value.trim().toLowerCase();
+                                    final cancelled =
+                                        normalized == 'cancelado' ||
+                                            normalized == 'cancelled';
+                                    if (cancelled &&
+                                        widget.onCancelled != null) {
+                                      showSuccess(
+                                        context,
+                                        'Pedido cancelado y quitado de este móvil',
+                                      );
+                                      Navigator.pop(context);
+                                      await widget.onCancelled!();
+                                    } else {
+                                      showSuccess(context,
+                                          '✔ Estado cambiado a "$value"');
+                                      Navigator.pop(context);
+                                      widget.onSuccess();
+                                    }
+                                  } else {
+                                    setState(() => _isSaving = false);
+                                    showError(context, result.errorMessage);
+                                  }
+                                },
+                        ),
+                      )
+                      .toList(),
+                ),
               ),
             ),
           ),
@@ -244,38 +291,58 @@ class _PriorityEditorState extends State<_PriorityEditor> {
             padding: const EdgeInsets.all(16),
             child: Text(
               'Cambiar prioridad',
-              style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
+              style: Theme.of(context)
+                  .textTheme
+                  .titleMedium
+                  ?.copyWith(fontWeight: FontWeight.bold),
             ),
           ),
-          IgnorePointer(
-            ignoring: _isSaving,
-            child: Opacity(
-              opacity: _isSaving ? 0.5 : 1.0,
-              child: Column(
-                children: QuickActionSheet._priorities.entries.map(
-                  (entry) => RadioListTile<int>(
-                    title: Text(entry.value),
-                    value: entry.key,
-                    groupValue: widget.currentPriority,
-                    onChanged: _isSaving ? null : (value) async {
-                      if (value == null || value == widget.currentPriority) {
-                        Navigator.pop(context);
-                        return;
-                      }
-                      setState(() => _isSaving = true);
-                      Navigator.pop(context);
-                      final label = QuickActionSheet._priorities[value] ?? '$value';
-                      final result = await widget.api.updateOrderPriority(widget.orderId, value);
-                      if (!mounted) return;
-                      if (result.success) {
-                        showSuccess(context, '✔ Prioridad cambiada a "$label"');
-                        widget.onSuccess();
-                      } else {
-                        showError(context, result.errorMessage);
-                      }
-                    },
-                  ),
-                ).toList(),
+          Flexible(
+            child: IgnorePointer(
+              ignoring: _isSaving,
+              child: Opacity(
+                opacity: _isSaving ? 0.5 : 1.0,
+                child: ListView(
+                  shrinkWrap: true,
+                  children: QuickActionSheet._priorities.entries
+                      .map(
+                        (entry) => RadioListTile<int>(
+                          title: Text(entry.value),
+                          value: entry.key,
+                          // Compatibilidad con Flutter estable actual.
+                          // ignore: deprecated_member_use
+                          groupValue: widget.currentPriority,
+                          // ignore: deprecated_member_use
+                          onChanged: _isSaving
+                              ? null
+                              : (value) async {
+                                  if (value == null ||
+                                      value == widget.currentPriority) {
+                                    Navigator.pop(context);
+                                    return;
+                                  }
+                                  setState(() => _isSaving = true);
+                                  final label =
+                                      QuickActionSheet._priorities[value] ??
+                                          '$value';
+                                  final result = await widget.api
+                                      .updateOrderPriority(
+                                          widget.orderId, value);
+                                  if (!context.mounted) return;
+                                  if (result.success) {
+                                    showSuccess(context,
+                                        '✔ Prioridad cambiada a "$label"');
+                                    Navigator.pop(context);
+                                    widget.onSuccess();
+                                  } else {
+                                    setState(() => _isSaving = false);
+                                    showError(context, result.errorMessage);
+                                  }
+                                },
+                        ),
+                      )
+                      .toList(),
+                ),
               ),
             ),
           ),
@@ -319,7 +386,10 @@ class _JobStageEditorState extends State<_JobStageEditor> {
             padding: const EdgeInsets.all(16),
             child: Text(
               'Cambiar etapa del trabajo',
-              style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
+              style: Theme.of(context)
+                  .textTheme
+                  .titleMedium
+                  ?.copyWith(fontWeight: FontWeight.bold),
             ),
           ),
           Flexible(
@@ -329,29 +399,40 @@ class _JobStageEditorState extends State<_JobStageEditor> {
                 opacity: _isSaving ? 0.5 : 1.0,
                 child: ListView(
                   shrinkWrap: true,
-                  children: QuickActionSheet._jobStages.map(
-                    (stage) => RadioListTile<String>(
-                      title: Text(stage),
-                      value: stage,
-                      groupValue: widget.currentStage,
-                      onChanged: _isSaving ? null : (value) async {
-                        if (value == null || value == widget.currentStage) {
-                          Navigator.pop(context);
-                          return;
-                        }
-                        setState(() => _isSaving = true);
-                        Navigator.pop(context);
-                        final result = await widget.api.changeJobStage(widget.jobId, value);
-                        if (!mounted) return;
-                        if (result.success) {
-                          showSuccess(context, '✔ Etapa cambiada a "$value"');
-                          widget.onSuccess();
-                        } else {
-                          showError(context, result.errorMessage);
-                        }
-                      },
-                    ),
-                  ).toList(),
+                  children: QuickActionSheet._jobStages
+                      .map(
+                        (stage) => RadioListTile<String>(
+                          title: Text(stage),
+                          value: stage,
+                          // Compatibilidad con Flutter estable actual.
+                          // ignore: deprecated_member_use
+                          groupValue: widget.currentStage,
+                          // ignore: deprecated_member_use
+                          onChanged: _isSaving
+                              ? null
+                              : (value) async {
+                                  if (value == null ||
+                                      value == widget.currentStage) {
+                                    Navigator.pop(context);
+                                    return;
+                                  }
+                                  setState(() => _isSaving = true);
+                                  final result = await widget.api
+                                      .changeJobStage(widget.jobId, value);
+                                  if (!context.mounted) return;
+                                  if (result.success) {
+                                    showSuccess(
+                                        context, '✔ Etapa cambiada a "$value"');
+                                    Navigator.pop(context);
+                                    widget.onSuccess();
+                                  } else {
+                                    setState(() => _isSaving = false);
+                                    showError(context, result.errorMessage);
+                                  }
+                                },
+                        ),
+                      )
+                      .toList(),
                 ),
               ),
             ),
@@ -392,7 +473,8 @@ class _JobQuantitySizeEditorState extends State<_JobQuantitySizeEditor> {
   @override
   void initState() {
     super.initState();
-    _quantityController = TextEditingController(text: widget.currentQuantity.toString());
+    _quantityController =
+        TextEditingController(text: widget.currentQuantity.toString());
     _sizeController = TextEditingController(text: widget.currentSize);
   }
 
@@ -419,7 +501,10 @@ class _JobQuantitySizeEditorState extends State<_JobQuantitySizeEditor> {
           if (_isSaving) const LinearProgressIndicator(minHeight: 3),
           Text(
             'Modificar cantidad y tamaño',
-            style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
+            style: Theme.of(context)
+                .textTheme
+                .titleMedium
+                ?.copyWith(fontWeight: FontWeight.bold),
           ),
           const SizedBox(height: 16),
           TextField(
@@ -448,7 +533,8 @@ class _JobQuantitySizeEditorState extends State<_JobQuantitySizeEditor> {
                 ? const SizedBox(
                     height: 18,
                     width: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2, color: Colors.white),
                   )
                 : const Text('Guardar'),
           ),
@@ -462,7 +548,8 @@ class _JobQuantitySizeEditorState extends State<_JobQuantitySizeEditor> {
     final size = _sizeController.text.trim();
     if (quantity == null || quantity < 1) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('La cantidad debe ser un número mayor a 0')),
+        const SnackBar(
+            content: Text('La cantidad debe ser un número mayor a 0')),
       );
       return;
     }
@@ -475,9 +562,10 @@ class _JobQuantitySizeEditorState extends State<_JobQuantitySizeEditor> {
     );
     if (!mounted) return;
     if (result.success) {
-      Navigator.pop(context);
       final sizePart = size.isNotEmpty ? ' · Tamaño: $size' : '';
-      showSuccess(context, '✔ Trabajo actualizado\nCantidad: $quantity$sizePart');
+      showSuccess(
+          context, '✔ Trabajo actualizado\nCantidad: $quantity$sizePart');
+      Navigator.pop(context);
       widget.onSuccess();
     } else {
       setState(() => _isSaving = false);
@@ -531,7 +619,10 @@ class _PaymentEditorState extends State<_PaymentEditor> {
           if (_isSaving) const LinearProgressIndicator(minHeight: 3),
           Text(
             'Registrar cobro',
-            style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
+            style: Theme.of(context)
+                .textTheme
+                .titleMedium
+                ?.copyWith(fontWeight: FontWeight.bold),
           ),
           const SizedBox(height: 16),
           TextField(
@@ -570,7 +661,8 @@ class _PaymentEditorState extends State<_PaymentEditor> {
                 ? const SizedBox(
                     height: 18,
                     width: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2, color: Colors.white),
                   )
                 : const Text('Registrar cobro'),
           ),
@@ -596,9 +688,10 @@ class _PaymentEditorState extends State<_PaymentEditor> {
     );
     if (!mounted) return;
     if (result.success) {
-      Navigator.pop(context);
-      final msg = '✔ Cobro registrado: \$${amount.toStringAsFixed(amount.truncateToDouble() == amount ? 0 : 2)}';
+      final msg =
+          '✔ Cobro registrado: \$${amount.toStringAsFixed(amount.truncateToDouble() == amount ? 0 : 2)}';
       showSuccess(context, msg);
+      Navigator.pop(context);
       widget.onSuccess();
     } else {
       setState(() => _isSaving = false);
@@ -639,23 +732,27 @@ class _DeliveryConfirmState extends State<_DeliveryConfirm> {
           child: const Text('Cancelar'),
         ),
         FilledButton(
-          onPressed: _isSaving ? null : () async {
-            setState(() => _isSaving = true);
-            Navigator.pop(context);
-            final result = await widget.api.markDelivered(widget.orderId);
-            if (!mounted) return;
-            if (result.success) {
-              showSuccess(context, '✔ Pedido marcado como entregado');
-              widget.onSuccess();
-            } else {
-              showError(context, result.errorMessage);
-            }
-          },
+          onPressed: _isSaving
+              ? null
+              : () async {
+                  setState(() => _isSaving = true);
+                  final result = await widget.api.markDelivered(widget.orderId);
+                  if (!context.mounted) return;
+                  if (result.success) {
+                    showSuccess(context, '✔ Pedido marcado como entregado');
+                    Navigator.pop(context);
+                    widget.onSuccess();
+                  } else {
+                    setState(() => _isSaving = false);
+                    showError(context, result.errorMessage);
+                  }
+                },
           child: _isSaving
               ? const SizedBox(
                   height: 18,
                   width: 18,
-                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                  child: CircularProgressIndicator(
+                      strokeWidth: 2, color: Colors.white),
                 )
               : const Text('Entregar'),
         ),
@@ -670,7 +767,8 @@ class _DeliveryConfirmState extends State<_DeliveryConfirm> {
 
 void showSuccess(BuildContext context, String message) {
   final now = TimeOfDay.now();
-  final timeStr = '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
+  final timeStr =
+      '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
   ScaffoldMessenger.of(context).showSnackBar(
     SnackBar(
       behavior: SnackBarBehavior.floating,
@@ -683,7 +781,10 @@ void showSuccess(BuildContext context, String message) {
           ),
           Text(
             timeStr,
-            style: TextStyle(fontSize: 12, color: Colors.grey[400]),
+            style: const TextStyle(
+              fontSize: 12,
+              color: DoccionePalette.muted,
+            ),
           ),
         ],
       ),

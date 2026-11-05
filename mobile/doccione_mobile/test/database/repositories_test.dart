@@ -1,3 +1,6 @@
+import 'dart:io';
+
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:doccione_mobile/database/database_helper.dart';
@@ -12,16 +15,38 @@ void main() {
   late OrdersRepository ordersRepo;
   late ClientsRepository clientsRepo;
   late SyncStateRepository syncStateRepo;
+  late Directory testDirectory;
 
   setUpAll(() {
+    TestWidgetsFlutterBinding.ensureInitialized();
+    testDirectory = Directory.systemTemp.createTempSync('repositories_test_');
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+      const MethodChannel('plugins.flutter.io/path_provider'),
+      (methodCall) async {
+        if (methodCall.method == 'getApplicationDocumentsDirectory') {
+          return testDirectory.path;
+        }
+        return null;
+      },
+    );
     sqfliteFfiInit();
     databaseFactory = databaseFactoryFfi;
+  });
+
+  tearDownAll(() {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+      const MethodChannel('plugins.flutter.io/path_provider'),
+      null,
+    );
+    testDirectory.deleteSync(recursive: true);
   });
 
   setUp(() async {
     dbHelper = DatabaseHelper();
     await dbHelper.deleteDatabase();
-    
+
     jobsRepo = JobsRepository(dbHelper);
     ordersRepo = OrdersRepository(dbHelper);
     clientsRepo = ClientsRepository(dbHelper);
@@ -51,7 +76,7 @@ void main() {
       // Update same job
       jobData['title'] = 'Updated Job';
       await jobsRepo.upsertJob(jobData);
-      
+
       jobs = await jobsRepo.getAllJobs();
       expect(jobs.length, 1); // Should still be 1
       expect(jobs.first.title, 'Updated Job');
@@ -77,7 +102,7 @@ void main() {
 
       await jobsRepo.upsertJobs(jobsData);
       final jobs = await jobsRepo.getAllJobs();
-      
+
       expect(jobs.length, 2);
       expect(jobs[0].jobNumber, 'J-002'); // Sorted by updated_at DESC
       expect(jobs[1].jobNumber, 'J-001');
@@ -85,9 +110,21 @@ void main() {
 
     test('should get jobs by status', () async {
       await jobsRepo.upsertJobs([
-        {'id': 'job-1', 'status': 'active', 'updated_at': '2026-01-01T00:00:00Z'},
-        {'id': 'job-2', 'status': 'completed', 'updated_at': '2026-01-02T00:00:00Z'},
-        {'id': 'job-3', 'status': 'active', 'updated_at': '2026-01-03T00:00:00Z'},
+        {
+          'id': 'job-1',
+          'status': 'active',
+          'updated_at': '2026-01-01T00:00:00Z'
+        },
+        {
+          'id': 'job-2',
+          'status': 'completed',
+          'updated_at': '2026-01-02T00:00:00Z'
+        },
+        {
+          'id': 'job-3',
+          'status': 'active',
+          'updated_at': '2026-01-03T00:00:00Z'
+        },
       ]);
 
       final activeJobs = await jobsRepo.getJobsByStatus('active');
@@ -112,7 +149,7 @@ void main() {
       // Update
       orderData['total_amount'] = 200.75;
       await ordersRepo.upsertOrder(orderData);
-      
+
       orders = await ordersRepo.getAllOrders();
       expect(orders.length, 1);
       expect(orders.first.totalAmount, 200.75);
@@ -120,13 +157,70 @@ void main() {
 
     test('should get orders by job ID', () async {
       await ordersRepo.upsertOrders([
-        {'id': 'order-1', 'job_id': 'job-1', 'updated_at': '2026-01-01T00:00:00Z'},
-        {'id': 'order-2', 'job_id': 'job-2', 'updated_at': '2026-01-02T00:00:00Z'},
-        {'id': 'order-3', 'job_id': 'job-1', 'updated_at': '2026-01-03T00:00:00Z'},
+        {
+          'id': 'order-1',
+          'job_id': 'job-1',
+          'updated_at': '2026-01-01T00:00:00Z'
+        },
+        {
+          'id': 'order-2',
+          'job_id': 'job-2',
+          'updated_at': '2026-01-02T00:00:00Z'
+        },
+        {
+          'id': 'order-3',
+          'job_id': 'job-1',
+          'updated_at': '2026-01-03T00:00:00Z'
+        },
       ]);
 
       final job1Orders = await ordersRepo.getOrdersByJobId('job-1');
       expect(job1Orders.length, 2);
+    });
+
+    test('cancelled sync removes only the cached order and its jobs', () async {
+      await ordersRepo.upsertOrder({
+        'id': 'order-cancelled',
+        'status': 'pending',
+        'updated_at': '2026-01-01T00:00:00Z',
+      });
+      await jobsRepo.upsertJob({
+        'id': 'job-cancelled',
+        'order_id': 'order-cancelled',
+        'status': 'pending',
+        'updated_at': '2026-01-01T00:00:00Z',
+      });
+
+      await ordersRepo.applySyncedOrders([
+        {
+          'id': 'order-cancelled',
+          'status': 'Cancelado',
+          'updated_at': '2026-01-02T00:00:00Z',
+        },
+      ]);
+
+      expect(await ordersRepo.getOrderById('order-cancelled'), isNull);
+      expect(await jobsRepo.getJobById('job-cancelled'), isNull);
+    });
+
+    test('local deletion removes the order cache without a server call',
+        () async {
+      await ordersRepo.upsertOrder({
+        'id': 'order-local',
+        'status': 'pending',
+        'updated_at': '2026-01-01T00:00:00Z',
+      });
+      await jobsRepo.upsertJob({
+        'id': 'job-local',
+        'order_id': 'order-local',
+        'status': 'pending',
+        'updated_at': '2026-01-01T00:00:00Z',
+      });
+
+      await ordersRepo.deleteOrderLocally('order-local');
+
+      expect(await ordersRepo.getOrderById('order-local'), isNull);
+      expect(await jobsRepo.getJobById('job-local'), isNull);
     });
   });
 
@@ -146,7 +240,7 @@ void main() {
       // Update
       clientData['email'] = 'john.doe@example.com';
       await clientsRepo.upsertClient(clientData);
-      
+
       clients = await clientsRepo.getAllClients();
       expect(clients.length, 1);
       expect(clients.first.email, 'john.doe@example.com');
@@ -154,9 +248,21 @@ void main() {
 
     test('should search clients by name', () async {
       await clientsRepo.upsertClients([
-        {'id': 'client-1', 'name': 'John Doe', 'updated_at': '2026-01-01T00:00:00Z'},
-        {'id': 'client-2', 'name': 'Jane Smith', 'updated_at': '2026-01-02T00:00:00Z'},
-        {'id': 'client-3', 'name': 'John Smith', 'updated_at': '2026-01-03T00:00:00Z'},
+        {
+          'id': 'client-1',
+          'name': 'John Doe',
+          'updated_at': '2026-01-01T00:00:00Z'
+        },
+        {
+          'id': 'client-2',
+          'name': 'Jane Smith',
+          'updated_at': '2026-01-02T00:00:00Z'
+        },
+        {
+          'id': 'client-3',
+          'name': 'John Smith',
+          'updated_at': '2026-01-03T00:00:00Z'
+        },
       ]);
 
       final johnClients = await clientsRepo.searchClientsByName('John');
@@ -173,10 +279,10 @@ void main() {
 
     test('should set and get current cursor', () async {
       await syncStateRepo.setCurrentNextCursor('cursor-123');
-      
+
       final cursor = await syncStateRepo.getCurrentNextCursor();
       expect(cursor, 'cursor-123');
-      
+
       final hasIncomplete = await syncStateRepo.hasIncompleteSync();
       expect(hasIncomplete, true);
     });
@@ -184,10 +290,10 @@ void main() {
     test('should clear current cursor', () async {
       await syncStateRepo.setCurrentNextCursor('cursor-123');
       await syncStateRepo.clearCurrentNextCursor();
-      
+
       final cursor = await syncStateRepo.getCurrentNextCursor();
       expect(cursor, null);
-      
+
       final hasIncomplete = await syncStateRepo.hasIncompleteSync();
       expect(hasIncomplete, false);
     });
@@ -195,9 +301,9 @@ void main() {
     test('should complete sync', () async {
       await syncStateRepo.setCurrentNextCursor('cursor-123');
       await syncStateRepo.setLastSyncError('Some error');
-      
+
       await syncStateRepo.completeSync('snapshot-456');
-      
+
       final state = await syncStateRepo.getSyncState();
       expect(state.lastCompletedSnapshot, 'snapshot-456');
       expect(state.currentNextCursor, null);

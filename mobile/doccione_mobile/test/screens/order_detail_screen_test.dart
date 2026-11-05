@@ -8,7 +8,8 @@ import 'package:doccione_mobile/models/order_with_details.dart';
 
 void main() {
   group('OrderDetailScreen', () {
-    testWidgets('displays order with client and jobs', (WidgetTester tester) async {
+    testWidgets('displays order with client and jobs',
+        (WidgetTester tester) async {
       final order = Order(
         id: 'order-1',
         orderNumber: 'ORD-001',
@@ -55,7 +56,10 @@ void main() {
 
       await tester.pumpWidget(
         MaterialApp(
-          home: OrderDetailScreen(orderDetails: orderDetails),
+          home: OrderDetailScreen(
+            orderDetails: orderDetails,
+            onContactWhatsApp: () {},
+          ),
         ),
       );
 
@@ -64,7 +68,7 @@ void main() {
       expect(find.byIcon(Icons.chat), findsOneWidget);
 
       // Check order info
-      expect(find.text('Pendiente'), findsOneWidget);
+      expect(find.text('Pendiente'), findsAtLeastNWidgets(1));
       expect(find.text('Prioridad Alta'), findsOneWidget);
       expect(find.text('John Doe'), findsOneWidget);
       expect(find.text('+1234567890'), findsOneWidget);
@@ -132,7 +136,7 @@ void main() {
 
       // WhatsApp section should not be displayed
       expect(find.textContaining('WhatsApp'), findsNothing);
-      
+
       // WhatsApp button should not be displayed
       expect(find.byIcon(Icons.chat), findsNothing);
     });
@@ -160,10 +164,12 @@ void main() {
       );
 
       expect(find.text('Trabajos (0)'), findsOneWidget);
-      expect(find.text('No hay trabajos asociados a este pedido'), findsOneWidget);
+      expect(
+          find.text('No hay trabajos asociados a este pedido'), findsOneWidget);
     });
 
-    testWidgets('displays order with empty optional fields', (WidgetTester tester) async {
+    testWidgets('displays order with empty optional fields',
+        (WidgetTester tester) async {
       final order = Order(
         id: 'order-1',
         orderNumber: 'ORD-001',
@@ -195,7 +201,8 @@ void main() {
       expect(find.text('Observaciones'), findsNothing);
     });
 
-    testWidgets('displays different order statuses correctly', (WidgetTester tester) async {
+    testWidgets('displays different order statuses correctly',
+        (WidgetTester tester) async {
       final statuses = [
         ('pending', 'Pendiente'),
         ('production', 'Producción'),
@@ -227,12 +234,13 @@ void main() {
         );
 
         expect(find.text(statusPair.$2), findsOneWidget);
-        
+
         await tester.pumpWidget(Container()); // Clear widget
       }
     });
 
-    testWidgets('displays different priorities correctly', (WidgetTester tester) async {
+    testWidgets('displays different priorities correctly',
+        (WidgetTester tester) async {
       final priorities = [
         ('high', 'Prioridad Alta'),
         ('medium', 'Prioridad Media'),
@@ -263,7 +271,7 @@ void main() {
         );
 
         expect(find.text(priorityPair.$2), findsOneWidget);
-        
+
         await tester.pumpWidget(Container()); // Clear widget
       }
     });
@@ -318,7 +326,7 @@ void main() {
       expect(find.text('Job One'), findsOneWidget);
       expect(find.text('Job Two'), findsOneWidget);
       expect(find.text('Job Three'), findsOneWidget);
-      
+
       // Check indices
       expect(find.text('1'), findsOneWidget);
       expect(find.text('2'), findsOneWidget);
@@ -356,7 +364,8 @@ void main() {
       expect(find.byType(SingleChildScrollView), findsOneWidget);
     });
 
-    testWidgets('displays whatsapp button when number available', (WidgetTester tester) async {
+    testWidgets('displays whatsapp button when number available',
+        (WidgetTester tester) async {
       final order = Order(
         id: 'order-1',
         orderNumber: 'ORD-001',
@@ -388,14 +397,14 @@ void main() {
 
       // Should display WhatsApp number
       expect(find.text('+9876543210'), findsOneWidget);
-      
+
       // Should display WhatsApp button
       expect(find.byIcon(Icons.chat), findsOneWidget);
-      
+
       // Tap button should call callback
       await tester.tap(find.byIcon(Icons.chat));
       await tester.pumpAndSettle();
-      
+
       expect(callbackCalled, true);
     });
   });

@@ -95,14 +95,14 @@ class Order {
       observations: map['observations'] as String?,
       orderConcept: map['order_concept'] as String?,
       orderDescription: map['order_description'] as String?,
-      totalAmount: map['total_amount'] != null 
+      totalAmount: map['total_amount'] != null
           ? (map['total_amount'] as num).toDouble()
           : null,
       currency: map['currency'] as String?,
       orderDate: map['order_date'] as String?,
       createdAt: map['created_at'] as String?,
       updatedAt: map['updated_at'] as String?,
-      metadata: map['metadata'] != null 
+      metadata: map['metadata'] != null
           ? jsonDecode(map['metadata'] as String) as Map<String, dynamic>
           : null,
     );

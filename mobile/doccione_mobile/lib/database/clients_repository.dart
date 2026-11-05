@@ -9,7 +9,8 @@ class ClientsRepository {
   ClientsRepository(this._dbHelper);
 
   /// Upsert a single client (insert or update if exists)
-  Future<void> upsertClient(Map<String, dynamic> clientData, {Transaction? txn}) async {
+  Future<void> upsertClient(Map<String, dynamic> clientData,
+      {Transaction? txn}) async {
     final executor = txn ?? await _dbHelper.database;
     final client = Client.fromMap(clientData);
 
@@ -21,7 +22,8 @@ class ClientsRepository {
   }
 
   /// Upsert multiple clients in a batch operation
-  Future<void> upsertClients(List<Map<String, dynamic>> clientsData, {Transaction? txn}) async {
+  Future<void> upsertClients(List<Map<String, dynamic>> clientsData,
+      {Transaction? txn}) async {
     final executor = txn ?? await _dbHelper.database;
     final batch = executor.batch();
 
@@ -98,5 +100,10 @@ class ClientsRepository {
   Future<void> clearClients() async {
     final db = await _dbHelper.database;
     await db.delete('clients');
+  }
+
+  Future<void> deleteClient(String id) async {
+    final db = await _dbHelper.database;
+    await db.delete('clients', where: 'id = ?', whereArgs: [id]);
   }
 }

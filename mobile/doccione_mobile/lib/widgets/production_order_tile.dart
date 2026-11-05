@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:doccione_mobile/models/order_with_details.dart';
 import 'package:doccione_mobile/services/quick_edit_api_client.dart';
 import 'package:doccione_mobile/services/stage_service.dart';
+import 'package:doccione_mobile/theme/doccione_palette.dart';
 import 'package:doccione_mobile/widgets/quick_action_sheet.dart';
 
 /// A reusable order tile for production-context views.
@@ -64,7 +65,7 @@ class ProductionOrderTile extends StatelessWidget {
                     Text(
                       orderDetails.primaryJobTitle,
                       style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                            color: Colors.grey[600],
+                            color: DoccionePalette.muted,
                           ),
                       overflow: TextOverflow.ellipsis,
                     ),
@@ -74,17 +75,19 @@ class ProductionOrderTile extends StatelessWidget {
                         Text(
                           '${orderDetails.jobsCount} '
                           '${orderDetails.jobsCount == 1 ? 'trabajo' : 'trabajos'}',
-                          style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                                color: Colors.grey[500],
-                              ),
+                          style:
+                              Theme.of(context).textTheme.bodySmall?.copyWith(
+                                    color: DoccionePalette.subtle,
+                                  ),
                         ),
                         if (age != null) ...[
                           const SizedBox(width: 8),
                           Text(
                             '· hace ${age}d',
-                            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                                  color: Colors.grey[500],
-                                ),
+                            style:
+                                Theme.of(context).textTheme.bodySmall?.copyWith(
+                                      color: DoccionePalette.subtle,
+                                    ),
                           ),
                         ],
                       ],
@@ -100,7 +103,7 @@ class ProductionOrderTile extends StatelessWidget {
                     _AdvanceButton(
                       label: 'Avanzar',
                       icon: Icons.arrow_forward,
-                      onPressed: () => _advance(context, next!),
+                      onPressed: () => _advance(context, next),
                     ),
                   if (isBlocking)
                     _AdvanceButton(
@@ -123,7 +126,7 @@ class ProductionOrderTile extends StatelessWidget {
       return CircleAvatar(
         backgroundColor: StageService.priorityColor(
           orderDetails.order.printPriority,
-        ).withOpacity(0.12),
+        ).withValues(alpha: 0.12),
         child: Icon(
           StageService.materialIcon(material),
           color: StageService.priorityColor(orderDetails.order.printPriority),
@@ -143,8 +146,10 @@ class ProductionOrderTile extends StatelessWidget {
 
     final result = await apiClient!.updateOrderStatus(orderId, nextStage);
     if (result.success && context.mounted) {
-      final updated = orderDetails.copyWith(
+      final updated = OrderWithDetails(
         order: orderDetails.order.copyWith(status: nextStage),
+        client: orderDetails.client,
+        jobs: orderDetails.jobs,
       );
       onAdvanced?.call(updated);
       ScaffoldMessenger.of(context).showSnackBar(
@@ -200,7 +205,7 @@ class _PriorityBadge extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
       decoration: BoxDecoration(
-        color: color.withOpacity(0.12),
+        color: color.withValues(alpha: 0.12),
         borderRadius: BorderRadius.circular(10),
       ),
       child: Text(
@@ -236,7 +241,7 @@ class _AdvanceButton extends StatelessWidget {
         label: Text(label, style: const TextStyle(fontSize: 12)),
         style: TextButton.styleFrom(
           padding: const EdgeInsets.symmetric(horizontal: 10),
-          foregroundColor: Colors.orange.shade700,
+          foregroundColor: DoccionePalette.production,
         ),
       ),
     );

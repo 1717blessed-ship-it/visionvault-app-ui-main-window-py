@@ -18,16 +18,42 @@ class ServerConfig {
   );
 
   static bool isValidHost(String host) {
-    if (host.isEmpty || host.length > 255) return false;
-    // Permitir localhost, IPs, y hostnames simples
-    final ipPattern = RegExp(
-      r'^(localhost|\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|[a-zA-Z0-9\-\.]+)$',
+    if (host.isEmpty || host.length > 253 || host != host.trim()) return false;
+    if (host == 'localhost') return true;
+
+    final ipv4Parts = host.split('.');
+    if (ipv4Parts.length == 4 && ipv4Parts.every((part) => part.isNotEmpty)) {
+      return ipv4Parts.every((part) {
+        final value = int.tryParse(part);
+        return value != null &&
+            value >= 0 &&
+            value <= 255 &&
+            (part == '0' || !part.startsWith('0'));
+      });
+    }
+
+    // DNS hostnames only: reject URLs, paths, whitespace and invalid labels.
+    final hostname = RegExp(
+      r'^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*$',
     );
-    return ipPattern.hasMatch(host);
+    return hostname.hasMatch(host);
   }
 
   static bool isValidPort(int port) {
     return port >= 1 && port <= 65535;
+  }
+
+  static bool isPrivateOrLocalHost(String host) {
+    if (host == 'localhost' || host.endsWith('.local')) return true;
+    final parts = host.split('.').map(int.tryParse).toList();
+    if (parts.length != 4 || parts.any((part) => part == null)) return false;
+    final a = parts[0]!;
+    final b = parts[1]!;
+    return a == 10 ||
+        a == 127 ||
+        (a == 100 && b >= 64 && b <= 127) ||
+        (a == 192 && b == 168) ||
+        (a == 172 && b >= 16 && b <= 31);
   }
 
   static bool isValidScheme(String scheme) {
@@ -39,16 +65,16 @@ class ServerConfig {
   }
 
   Map<String, dynamic> toMap() => {
-    'host': host,
-    'port': port,
-    'scheme': scheme,
-  };
+        'host': host,
+        'port': port,
+        'scheme': scheme,
+      };
 
   factory ServerConfig.fromMap(Map<String, dynamic> map) => ServerConfig(
-    host: map['host'] as String? ?? 'localhost',
-    port: map['port'] as int? ?? 8765,
-    scheme: map['scheme'] as String? ?? 'http',
-  );
+        host: map['host'] as String? ?? 'localhost',
+        port: map['port'] as int? ?? 8765,
+        scheme: map['scheme'] as String? ?? 'http',
+      );
 
   ServerConfig copyWith({String? host, int? port, String? scheme}) {
     return ServerConfig(

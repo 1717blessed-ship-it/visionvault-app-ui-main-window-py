@@ -46,6 +46,17 @@ class SyncStateRepository {
     await setCurrentNextCursor(null);
   }
 
+  /// Guarda el vendedor al que pertenece el caché local.
+  Future<void> setScopeId(String scopeId, {Transaction? txn}) async {
+    final executor = txn ?? await _dbHelper.database;
+    await executor.update(
+      'sync_state',
+      {'scope_id': scopeId},
+      where: 'id = ?',
+      whereArgs: [1],
+    );
+  }
+
   /// Update last completed snapshot
   Future<void> setLastCompletedSnapshot(String snapshot) async {
     final db = await _dbHelper.database;

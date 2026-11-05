@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import '../models/dashboard_metrics.dart';
 import '../screens/orders_list_screen.dart';
+import '../theme/doccione_palette.dart';
 
 /// Widget that displays dashboard metrics in a card
 class DashboardMetricsCard extends StatelessWidget {
@@ -17,13 +18,16 @@ class DashboardMetricsCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return Card(
       child: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(18),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              'Resumen',
-              style: Theme.of(context).textTheme.titleLarge,
+              'Resumen de producción',
+              style: Theme.of(context)
+                  .textTheme
+                  .titleLarge
+                  ?.copyWith(fontWeight: FontWeight.w700),
             ),
             const SizedBox(height: 16),
             Row(
@@ -34,7 +38,7 @@ class DashboardMetricsCard extends StatelessWidget {
                     'Hoy',
                     metrics.ordersToday,
                     Icons.today,
-                    Colors.blue,
+                    DoccionePalette.info,
                     null, // No filter - today is computed, not a status
                   ),
                 ),
@@ -44,7 +48,7 @@ class DashboardMetricsCard extends StatelessWidget {
                     'Producción',
                     metrics.ordersInProduction,
                     Icons.build,
-                    Colors.orange,
+                    DoccionePalette.production,
                     'production',
                   ),
                 ),
@@ -59,7 +63,7 @@ class DashboardMetricsCard extends StatelessWidget {
                     'Pendientes',
                     metrics.ordersPending,
                     Icons.schedule,
-                    Colors.amber,
+                    DoccionePalette.wine,
                     'pending',
                   ),
                 ),
@@ -69,7 +73,7 @@ class DashboardMetricsCard extends StatelessWidget {
                     'Terminados',
                     metrics.ordersCompleted,
                     Icons.check_circle,
-                    Colors.green,
+                    DoccionePalette.success,
                     'completed',
                   ),
                 ),
@@ -123,10 +127,10 @@ class DashboardMetricsCard extends StatelessWidget {
           : null,
       borderRadius: BorderRadius.circular(8),
       child: Container(
-        padding: const EdgeInsets.all(12),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 14),
         decoration: BoxDecoration(
-          color: color.withOpacity(0.1),
-          borderRadius: BorderRadius.circular(8),
+          color: color.withValues(alpha: 0.1),
+          borderRadius: BorderRadius.circular(14),
         ),
         child: Column(
           children: [
@@ -161,7 +165,7 @@ class DashboardMetricsCard extends StatelessWidget {
         Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(icon, size: 20, color: Colors.grey[600]),
+            Icon(icon, size: 20, color: DoccionePalette.muted),
             const SizedBox(width: 4),
             Text(
               value.toString(),

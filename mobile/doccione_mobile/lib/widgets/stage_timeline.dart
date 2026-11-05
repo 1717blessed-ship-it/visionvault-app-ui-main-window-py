@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:doccione_mobile/services/quick_edit_api_client.dart';
+import 'package:doccione_mobile/services/stage_service.dart';
+import 'package:doccione_mobile/theme/doccione_palette.dart';
 
 /// Interactive timeline showing job production stages.
 /// Tapping the next stage advances the job through the pipeline.
@@ -26,29 +28,15 @@ class StageTimeline extends StatefulWidget {
 class _StageTimelineState extends State<StageTimeline> {
   bool _isSaving = false;
 
-  static const _stages = [
-    'Recibido',
-    'Esperando archivos',
-    'Diseños confirmados',
-    'Listo para armado de planchas',
-    'En armado de planchas',
-    'Listo para imprimir',
-    'Impresión',
-    'Sublimado / Laminado',
-    'Corte',
-    'Control de calidad',
-    'Finalizado',
-    'Entregado',
-  ];
-
   @override
   Widget build(BuildContext context) {
-    final currentIndex = _stages.indexOf(widget.currentStage);
+    final stages = StageService.generalWorkflow;
+    final currentIndex = stages.indexOf(widget.currentStage);
     final hasApi = widget.apiClient != null &&
         widget.orderId != null &&
         widget.jobId != null;
     final canAdvance =
-        hasApi && currentIndex >= 0 && currentIndex < _stages.length - 1;
+        hasApi && currentIndex >= 0 && currentIndex < stages.length - 1;
 
     return Card(
       margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
@@ -59,7 +47,10 @@ class _StageTimelineState extends State<StageTimeline> {
           children: [
             Row(
               children: [
-                Icon(Icons.timeline, color: Colors.grey[600]),
+                const Icon(
+                  Icons.timeline,
+                  color: DoccionePalette.muted,
+                ),
                 const SizedBox(width: 8),
                 Text(
                   'Etapa del trabajo',
@@ -71,8 +62,8 @@ class _StageTimelineState extends State<StageTimeline> {
               ],
             ),
             const SizedBox(height: 16),
-            ...List.generate(_stages.length, (i) {
-              final stage = _stages[i];
+            ...List.generate(stages.length, (i) {
+              final stage = stages[i];
               final isPast = i < currentIndex;
               final isCurrent = i == currentIndex;
               final isNext = i == currentIndex + 1;
@@ -84,7 +75,7 @@ class _StageTimelineState extends State<StageTimeline> {
                 isCurrent: isCurrent,
                 isNext: isNext && canAdvance && !_isSaving,
                 isFuture: isFuture,
-                isLast: i == _stages.length - 1,
+                isLast: i == stages.length - 1,
                 isSaving: _isSaving && isNext,
                 onTap: isNext && canAdvance && !_isSaving
                     ? () => _confirmAdvance(context, stage)
@@ -174,16 +165,16 @@ class _StageRow extends StatelessWidget {
     final dotColor = isCurrent
         ? Theme.of(context).colorScheme.primary
         : isPast
-            ? Colors.green
+            ? DoccionePalette.success
             : isNext
-                ? Colors.orange
-                : Colors.grey.shade300;
+                ? DoccionePalette.production
+                : DoccionePalette.subtle;
 
     final textColor = isCurrent
         ? Theme.of(context).colorScheme.primary
         : isPast
-            ? Colors.green.shade700
-            : Colors.grey.shade500;
+            ? DoccionePalette.success
+            : DoccionePalette.muted;
 
     final fontWeight = isCurrent ? FontWeight.bold : FontWeight.normal;
 
@@ -217,8 +208,9 @@ class _StageRow extends StatelessWidget {
                   Container(
                     width: 2,
                     height: 24,
-                    color:
-                        isPast ? Colors.green.shade200 : Colors.grey.shade200,
+                    color: isPast
+                        ? DoccionePalette.success
+                        : DoccionePalette.border,
                   ),
               ],
             ),
@@ -238,9 +230,9 @@ class _StageRow extends StatelessWidget {
                 padding:
                     const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                 decoration: BoxDecoration(
-                  color: Colors.orange.shade50,
+                  color: DoccionePalette.productionSoft,
                   borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.orange.shade200),
+                  border: Border.all(color: DoccionePalette.production),
                 ),
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
@@ -252,14 +244,14 @@ class _StageRow extends StatelessWidget {
                         child: CircularProgressIndicator(strokeWidth: 2),
                       )
                     else
-                      Icon(Icons.arrow_forward,
-                          size: 14, color: Colors.orange.shade700),
+                      const Icon(Icons.arrow_forward,
+                          size: 14, color: DoccionePalette.production),
                     const SizedBox(width: 4),
                     Text(
                       isSaving ? 'Guardando…' : 'Avanzar',
-                      style: TextStyle(
+                      style: const TextStyle(
                           fontSize: 12,
-                          color: Colors.orange.shade700,
+                          color: DoccionePalette.production,
                           fontWeight: FontWeight.w600),
                     ),
                   ],

@@ -8,13 +8,14 @@ import 'package:doccione_mobile/models/job.dart';
 
 void main() {
   group('OrderCard', () {
-    testWidgets('should display order information', (WidgetTester tester) async {
+    testWidgets('should display order information',
+        (WidgetTester tester) async {
       final order = Order(
         id: 'order-1',
         orderNumber: '154',
         clientId: 'client-1',
         status: 'production',
-        orderDate: DateTime(2026, 7, 21),
+        orderDate: '2026-07-21',
         updatedAt: '2026-01-01T00:00:00Z',
       );
 
@@ -56,11 +57,12 @@ void main() {
       expect(find.text('1 trabajo'), findsOneWidget);
     });
 
-    testWidgets('should show correct status badge for pending', (WidgetTester tester) async {
+    testWidgets('should show correct status badge for pending',
+        (WidgetTester tester) async {
       final order = Order(
         id: 'order-1',
         status: 'pending',
-        orderDate: DateTime(2026, 7, 21),
+        orderDate: '2026-07-21',
         updatedAt: '2026-01-01T00:00:00Z',
       );
 
@@ -82,11 +84,12 @@ void main() {
       expect(find.byIcon(Icons.schedule), findsOneWidget);
     });
 
-    testWidgets('should show correct status badge for production', (WidgetTester tester) async {
+    testWidgets('should show correct status badge for production',
+        (WidgetTester tester) async {
       final order = Order(
         id: 'order-1',
         status: 'production',
-        orderDate: DateTime(2026, 7, 21),
+        orderDate: '2026-07-21',
         updatedAt: '2026-01-01T00:00:00Z',
       );
 
@@ -108,11 +111,12 @@ void main() {
       expect(find.byIcon(Icons.build), findsOneWidget);
     });
 
-    testWidgets('should show correct status badge for completed', (WidgetTester tester) async {
+    testWidgets('should show correct status badge for completed',
+        (WidgetTester tester) async {
       final order = Order(
         id: 'order-1',
         status: 'completed',
-        orderDate: DateTime(2026, 7, 21),
+        orderDate: '2026-07-21',
         updatedAt: '2026-01-01T00:00:00Z',
       );
 
@@ -136,10 +140,10 @@ void main() {
 
     testWidgets('should handle tap event', (WidgetTester tester) async {
       bool tapped = false;
-      
+
       final order = Order(
         id: 'order-1',
-        orderDate: DateTime(2026, 7, 21),
+        orderDate: '2026-07-21',
         updatedAt: '2026-01-01T00:00:00Z',
       );
 
@@ -169,7 +173,7 @@ void main() {
     testWidgets('should pluralize jobs count', (WidgetTester tester) async {
       final order = Order(
         id: 'order-1',
-        orderDate: DateTime(2026, 7, 21),
+        orderDate: '2026-07-21',
         updatedAt: '2026-01-01T00:00:00Z',
       );
 
@@ -205,10 +209,11 @@ void main() {
       expect(find.text('2 trabajos'), findsOneWidget);
     });
 
-    testWidgets('should show fallback when no client', (WidgetTester tester) async {
+    testWidgets('should show fallback when no client',
+        (WidgetTester tester) async {
       final order = Order(
         id: 'order-1',
-        orderDate: DateTime(2026, 7, 21),
+        orderDate: '2026-07-21',
         updatedAt: '2026-01-01T00:00:00Z',
       );
 

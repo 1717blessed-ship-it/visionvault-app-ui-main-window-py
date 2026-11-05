@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:doccione_mobile/database/database_helper.dart';
 import 'package:doccione_mobile/database/orders_repository.dart';
@@ -6,6 +8,9 @@ import 'package:doccione_mobile/models/order_with_details.dart';
 import 'package:doccione_mobile/widgets/order_card.dart';
 import 'package:doccione_mobile/screens/order_detail_screen.dart';
 import 'package:doccione_mobile/services/quick_edit_api_client.dart';
+import 'package:doccione_mobile/theme/doccione_palette.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'unified_order_creation_screen.dart';
 
 class OrdersListScreen extends StatefulWidget {
   final String? initialStatus;
@@ -26,16 +31,17 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
   late final OrdersRepository _ordersRepo;
   final TextEditingController _searchController = TextEditingController();
   QuickEditApiClient? _quickEditClient;
+  Timer? _searchDebounce;
+  int _loadRequest = 0;
 
   List<OrderWithDetails> _orders = [];
   bool _isLoading = true;
-  bool _isSyncing = false;
   String? _selectedStatus;
   String? _selectedPriority;
   bool _showArchived = false;
   String _sortBy = 'order_date';
   bool _sortDescending = true;
-  
+
   // Status filter options
   final List<Map<String, dynamic>> _statusFilters = [
     {'value': null, 'label': 'Todos', 'icon': Icons.list},
@@ -70,20 +76,24 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
 
   @override
   void dispose() {
+    _loadRequest++;
+    _searchDebounce?.cancel();
     _searchController.dispose();
+    _quickEditClient?.close();
     super.dispose();
   }
 
   Future<void> _loadOrders() async {
-    if (_isSyncing) return; // Skip if syncing
-    
+    if (!mounted) return;
+    final request = ++_loadRequest;
+
     setState(() {
       _isLoading = true;
     });
 
     try {
       final searchQuery = _searchController.text.trim();
-      
+
       final orders = await _ordersRepo.searchOrders(
         searchQuery: searchQuery.isEmpty ? null : searchQuery,
         status: _selectedStatus,
@@ -94,19 +104,19 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
         limit: 100,
       );
 
+      if (!mounted || request != _loadRequest) return;
       setState(() {
         _orders = orders;
         _isLoading = false;
       });
     } catch (e) {
+      if (!mounted || request != _loadRequest) return;
       setState(() {
         _isLoading = false;
       });
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error al cargar pedidos: $e')),
-        );
-      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error al cargar pedidos: $e')),
+      );
     }
   }
 
@@ -142,8 +152,23 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Pedidos'),
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         actions: [
+          IconButton(
+              icon: const Icon(Icons.edit_note),
+              tooltip: 'Borradores multi-trabajo',
+              onPressed: widget.sessionToken == null
+                  ? null
+                  : () async {
+                      final config =
+                          await ServerConfigRepository(_dbHelper).getConfig();
+                      if (!context.mounted) return;
+                      await Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                              builder: (_) => UnifiedOrderCreationScreen(
+                                  baseUrl: config.baseUrl,
+                                  sessionToken: widget.sessionToken!)));
+                    }),
           // Sort button
           IconButton(
             icon: const Icon(Icons.sort),
@@ -186,16 +211,18 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
                 contentPadding: const EdgeInsets.symmetric(vertical: 12),
               ),
               onChanged: (_) {
-                // Debounce search
-                Future.delayed(const Duration(milliseconds: 500), () {
-                  if (mounted) _loadOrders();
-                });
+                setState(() {});
+                _searchDebounce?.cancel();
+                _searchDebounce = Timer(
+                  const Duration(milliseconds: 500),
+                  _loadOrders,
+                );
               },
             ),
           ),
           // Status filter chips
           Container(
-            height: 50,
+            height: 54,
             padding: const EdgeInsets.symmetric(vertical: 4),
             child: ListView.builder(
               scrollDirection: Axis.horizontal,
@@ -204,7 +231,7 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
               itemBuilder: (context, index) {
                 final filter = _statusFilters[index];
                 final isSelected = _selectedStatus == filter['value'];
-                
+
                 return Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 4),
                   child: FilterChip(
@@ -215,20 +242,26 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
                         Icon(
                           filter['icon'] as IconData,
                           size: 16,
-                          color: isSelected ? Colors.white : Colors.grey[700],
+                          color: isSelected
+                              ? Theme.of(context).colorScheme.onPrimary
+                              : DoccionePalette.muted,
                         ),
                         const SizedBox(width: 4),
                         Text(filter['label'] as String),
                       ],
                     ),
                     onSelected: (selected) {
-                      _onStatusFilterChanged(selected ? filter['value'] as String? : null);
+                      _onStatusFilterChanged(
+                          selected ? filter['value'] as String? : null);
                     },
                     selectedColor: Theme.of(context).colorScheme.primary,
-                    checkmarkColor: Colors.white,
+                    checkmarkColor: Theme.of(context).colorScheme.onPrimary,
                     labelStyle: TextStyle(
-                      color: isSelected ? Colors.white : Colors.grey[700],
-                      fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
+                      color: isSelected
+                          ? Theme.of(context).colorScheme.onPrimary
+                          : DoccionePalette.muted,
+                      fontWeight:
+                          isSelected ? FontWeight.w600 : FontWeight.normal,
                     ),
                   ),
                 );
@@ -256,9 +289,15 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
                                   MaterialPageRoute(
                                     builder: (context) => OrderDetailScreen(
                                       orderDetails: orderDetails,
-                                      onContactWhatsApp: null,
+                                      onContactWhatsApp: () =>
+                                          _contactWhatsApp(orderDetails.order),
                                       apiClient: _quickEditClient,
                                       onRefresh: () => _loadOrders(),
+                                      onDeleteLocal: (orderId) async {
+                                        await _ordersRepo
+                                            .deleteOrderLocally(orderId);
+                                        await _loadOrders();
+                                      },
                                     ),
                                   ),
                                 );
@@ -273,11 +312,25 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
     );
   }
 
+  Future<void> _contactWhatsApp(order) async {
+    final phone = (order.whatsapp ?? '').replaceAll(RegExp(r'[^0-9]'), '');
+    if (phone.isEmpty) return;
+    final orderLabel = order.orderNumber ?? order.id;
+    final message =
+        'Hola ${order.client ?? ''}, te escribimos desde Doccione Studio por tu pedido #$orderLabel. Estado actual: ${order.status ?? 'Pendiente'}.';
+    final url = Uri.https('wa.me', '/$phone', {'text': message});
+    if (!await launchUrl(url, mode: LaunchMode.externalApplication) &&
+        mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No se pudo abrir WhatsApp.')));
+    }
+  }
+
   Widget _buildEmptyState() {
-    final hasFilters = _selectedStatus != null || 
-                      _selectedPriority != null || 
-                      _searchController.text.isNotEmpty;
-    
+    final hasFilters = _selectedStatus != null ||
+        _selectedPriority != null ||
+        _searchController.text.isNotEmpty;
+
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(24),
@@ -287,17 +340,15 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
             Icon(
               hasFilters ? Icons.search_off : Icons.inbox_outlined,
               size: 64,
-              color: Colors.grey[400],
+              color: DoccionePalette.subtle,
             ),
             const SizedBox(height: 16),
             Text(
-              hasFilters 
-                  ? 'No se encontraron pedidos'
-                  : 'No hay pedidos',
-              style: TextStyle(
+              hasFilters ? 'No se encontraron pedidos' : 'No hay pedidos',
+              style: const TextStyle(
                 fontSize: 18,
                 fontWeight: FontWeight.w600,
-                color: Colors.grey[700],
+                color: DoccionePalette.ink,
               ),
             ),
             const SizedBox(height: 8),
@@ -306,9 +357,9 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
                   ? 'Intenta cambiar los filtros o la búsqueda'
                   : 'Sincroniza para obtener los últimos datos',
               textAlign: TextAlign.center,
-              style: TextStyle(
+              style: const TextStyle(
                 fontSize: 14,
-                color: Colors.grey[500],
+                color: DoccionePalette.muted,
               ),
             ),
             if (hasFilters) ...[
@@ -336,7 +387,7 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
   Widget _buildFiltersSheet() {
     String? tempPriority = _selectedPriority;
     bool tempShowArchived = _showArchived;
-    
+
     return StatefulBuilder(
       builder: (context, setModalState) {
         return Padding(
@@ -395,15 +446,31 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
                     label: const Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
+                        Icon(Icons.bolt, size: 16, color: Colors.red),
+                        SizedBox(width: 4),
+                        Text('Urgente'),
+                      ],
+                    ),
+                    selected: tempPriority == '4',
+                    onSelected: (selected) {
+                      setModalState(() {
+                        tempPriority = selected ? '4' : null;
+                      });
+                    },
+                  ),
+                  FilterChip(
+                    label: const Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
                         Icon(Icons.priority_high, size: 16, color: Colors.red),
                         SizedBox(width: 4),
                         Text('Alta'),
                       ],
                     ),
-                    selected: tempPriority == 'high',
+                    selected: tempPriority == '3',
                     onSelected: (selected) {
                       setModalState(() {
-                        tempPriority = selected ? 'high' : null;
+                        tempPriority = selected ? '3' : null;
                       });
                     },
                   ),
@@ -416,10 +483,10 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
                         Text('Media'),
                       ],
                     ),
-                    selected: tempPriority == 'medium',
+                    selected: tempPriority == '2',
                     onSelected: (selected) {
                       setModalState(() {
-                        tempPriority = selected ? 'medium' : null;
+                        tempPriority = selected ? '2' : null;
                       });
                     },
                   ),
@@ -427,15 +494,16 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
                     label: const Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Icon(Icons.arrow_downward, size: 16, color: Colors.blue),
+                        Icon(Icons.arrow_downward,
+                            size: 16, color: Colors.blue),
                         SizedBox(width: 4),
                         Text('Baja'),
                       ],
                     ),
-                    selected: tempPriority == 'low',
+                    selected: tempPriority == '1',
                     onSelected: (selected) {
                       setModalState(() {
-                        tempPriority = selected ? 'low' : null;
+                        tempPriority = selected ? '1' : null;
                       });
                     },
                   ),
@@ -446,12 +514,12 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
               SwitchListTile(
                 title: const Text('Mostrar archivados'),
                 subtitle: Text(
-                  tempShowArchived 
+                  tempShowArchived
                       ? 'Incluyendo pedidos archivados'
                       : 'Ocultando pedidos archivados',
-                  style: TextStyle(
+                  style: const TextStyle(
                     fontSize: 12,
-                    color: Colors.grey[600],
+                    color: DoccionePalette.muted,
                   ),
                 ),
                 value: tempShowArchived,
@@ -487,12 +555,20 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
 
   Widget _buildSortSheet() {
     final sortOptions = [
-      {'value': 'order_date', 'label': 'Fecha del pedido', 'icon': Icons.calendar_today},
-      {'value': 'delivery_date', 'label': 'Fecha de entrega', 'icon': Icons.event},
+      {
+        'value': 'order_date',
+        'label': 'Fecha del pedido',
+        'icon': Icons.calendar_today
+      },
+      {
+        'value': 'delivery_date',
+        'label': 'Fecha de entrega',
+        'icon': Icons.event
+      },
       {'value': 'priority', 'label': 'Prioridad', 'icon': Icons.flag},
       {'value': 'client', 'label': 'Cliente', 'icon': Icons.person},
     ];
-    
+
     return Padding(
       padding: const EdgeInsets.all(16),
       child: Column(
@@ -511,18 +587,22 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
             return ListTile(
               leading: Icon(
                 option['icon'] as IconData,
-                color: isSelected ? Theme.of(context).colorScheme.primary : null,
+                color:
+                    isSelected ? Theme.of(context).colorScheme.primary : null,
               ),
               title: Text(
                 option['label'] as String,
                 style: TextStyle(
                   fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
-                  color: isSelected ? Theme.of(context).colorScheme.primary : null,
+                  color:
+                      isSelected ? Theme.of(context).colorScheme.primary : null,
                 ),
               ),
               trailing: isSelected
                   ? Icon(
-                      _sortDescending ? Icons.arrow_downward : Icons.arrow_upward,
+                      _sortDescending
+                          ? Icons.arrow_downward
+                          : Icons.arrow_upward,
                       color: Theme.of(context).colorScheme.primary,
                     )
                   : null,
@@ -535,8 +615,8 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
                     // Change sort field
                     _sortBy = option['value'] as String;
                     // Default to descending for dates, ascending for others
-                    _sortDescending = option['value'] == 'order_date' || 
-                                      option['value'] == 'delivery_date';
+                    _sortDescending = option['value'] == 'order_date' ||
+                        option['value'] == 'delivery_date';
                   }
                 });
                 Navigator.pop(context);
@@ -548,13 +628,5 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
         ],
       ),
     );
-  }
-
-  String _getStatusLabel(String status) {
-    final filter = _statusFilters.firstWhere(
-      (f) => f['value'] == status,
-      orElse: () => {'label': status},
-    );
-    return filter['label'] as String;
   }
 }

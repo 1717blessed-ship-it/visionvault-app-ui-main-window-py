@@ -7,16 +7,18 @@ import 'package:doccione_mobile/services/quick_edit_api_client.dart';
 import 'package:doccione_mobile/widgets/stage_timeline.dart';
 
 void main() {
-  QuickEditApiClient _mockApiClient({
+  QuickEditApiClient mockApiClient({
     Future<http.Response> Function(http.Request)? handler,
   }) {
     final mockHandler = handler ??
         ((request) async {
-          return http.Response(jsonEncode({
-            'success': true,
-            'message': 'Etapa actualizada',
-            'job': {'id': 10, 'status': 'Etapa siguiente'},
-          }), 200);
+          return http.Response(
+              jsonEncode({
+                'success': true,
+                'message': 'Etapa actualizada',
+                'job': {'id': 10, 'status': 'Etapa siguiente'},
+              }),
+              200);
         });
     return QuickEditApiClient(
       baseUrl: 'http://localhost:8000',
@@ -25,7 +27,7 @@ void main() {
     );
   }
 
-  Widget _buildWidget({
+  Widget buildWidget({
     required String currentStage,
     QuickEditApiClient? apiClient,
     int? orderId,
@@ -49,11 +51,10 @@ void main() {
 
   group('StageTimeline', () {
     group('intermediate stage', () {
-      testWidgets('shows "Avanzar" button for non-final stage',
-          (tester) async {
-        await tester.pumpWidget(_buildWidget(
+      testWidgets('shows "Avanzar" button for non-final stage', (tester) async {
+        await tester.pumpWidget(buildWidget(
           currentStage: 'Impresión',
-          apiClient: _mockApiClient(),
+          apiClient: mockApiClient(),
           orderId: 1,
           jobId: 10,
         ));
@@ -64,9 +65,9 @@ void main() {
       });
 
       testWidgets('tapping "Avanzar" opens confirm dialog', (tester) async {
-        await tester.pumpWidget(_buildWidget(
+        await tester.pumpWidget(buildWidget(
           currentStage: 'Impresión',
-          apiClient: _mockApiClient(),
+          apiClient: mockApiClient(),
           orderId: 1,
           jobId: 10,
         ));
@@ -86,9 +87,9 @@ void main() {
       testWidgets('confirming fires onStageChanged callback', (tester) async {
         int callbackCount = 0;
 
-        await tester.pumpWidget(_buildWidget(
+        await tester.pumpWidget(buildWidget(
           currentStage: 'Impresión',
-          apiClient: _mockApiClient(),
+          apiClient: mockApiClient(),
           orderId: 1,
           jobId: 10,
           onStageChanged: () => callbackCount++,
@@ -106,9 +107,9 @@ void main() {
       testWidgets('canceling dialog does not call API', (tester) async {
         int apiCallCount = 0;
 
-        await tester.pumpWidget(_buildWidget(
+        await tester.pumpWidget(buildWidget(
           currentStage: 'Impresión',
-          apiClient: _mockApiClient(handler: (request) async {
+          apiClient: mockApiClient(handler: (request) async {
             apiCallCount++;
             return http.Response(jsonEncode({'success': true}), 200);
           }),
@@ -128,9 +129,9 @@ void main() {
 
     group('final stage', () {
       testWidgets('does not show "Avanzar" at Entregado', (tester) async {
-        await tester.pumpWidget(_buildWidget(
+        await tester.pumpWidget(buildWidget(
           currentStage: 'Entregado',
-          apiClient: _mockApiClient(),
+          apiClient: mockApiClient(),
           orderId: 1,
           jobId: 10,
         ));
@@ -141,7 +142,7 @@ void main() {
 
       testWidgets('does not show "Avanzar" at Finalizado without API',
           (tester) async {
-        await tester.pumpWidget(_buildWidget(
+        await tester.pumpWidget(buildWidget(
           currentStage: 'Impresión',
         ));
 
@@ -151,11 +152,10 @@ void main() {
 
     group('API error', () {
       testWidgets('shows error snackbar on API failure', (tester) async {
-        await tester.pumpWidget(_buildWidget(
+        await tester.pumpWidget(buildWidget(
           currentStage: 'Impresión',
-          apiClient: _mockApiClient(handler: (request) async {
-            return http.Response(
-                jsonEncode({'error': 'Etapa inválida'}), 400);
+          apiClient: mockApiClient(handler: (request) async {
+            return http.Response(jsonEncode({'error': 'Etapa inválida'}), 400);
           }),
           orderId: 1,
           jobId: 10,
@@ -174,9 +174,9 @@ void main() {
 
       testWidgets('shows generic message when no error in response',
           (tester) async {
-        await tester.pumpWidget(_buildWidget(
+        await tester.pumpWidget(buildWidget(
           currentStage: 'Impresión',
-          apiClient: _mockApiClient(handler: (request) async {
+          apiClient: mockApiClient(handler: (request) async {
             return http.Response('Server Error', 500);
           }),
           orderId: 1,
@@ -198,16 +198,18 @@ void main() {
           (tester) async {
         int apiCallCount = 0;
 
-        await tester.pumpWidget(_buildWidget(
+        await tester.pumpWidget(buildWidget(
           currentStage: 'Impresión',
-          apiClient: _mockApiClient(handler: (request) async {
+          apiClient: mockApiClient(handler: (request) async {
             apiCallCount++;
             await Future.delayed(const Duration(milliseconds: 200));
-            return http.Response(jsonEncode({
-              'success': true,
-              'message': 'Etapa actualizada',
-              'job': {'id': 10, 'status': 'Sublimado / Laminado'},
-            }), 200);
+            return http.Response(
+                jsonEncode({
+                  'success': true,
+                  'message': 'Etapa actualizada',
+                  'job': {'id': 10, 'status': 'Sublimado / Laminado'},
+                }),
+                200);
           }),
           orderId: 1,
           jobId: 10,
@@ -238,9 +240,9 @@ void main() {
 
     group('stage list', () {
       testWidgets('matches GENERAL_WORKFLOW from backend', (tester) async {
-        await tester.pumpWidget(_buildWidget(
+        await tester.pumpWidget(buildWidget(
           currentStage: 'Recibido',
-          apiClient: _mockApiClient(),
+          apiClient: mockApiClient(),
           orderId: 1,
           jobId: 10,
         ));

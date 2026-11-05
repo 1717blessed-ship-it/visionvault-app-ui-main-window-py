@@ -38,7 +38,8 @@ void main() {
       expect(find.text('Pendiente'), findsOneWidget);
     });
 
-    testWidgets('displays job without optional fields', (WidgetTester tester) async {
+    testWidgets('displays job without optional fields',
+        (WidgetTester tester) async {
       final job = Job(
         id: 'job-1',
         orderId: 'order-1',
@@ -115,7 +116,8 @@ void main() {
       expect(find.text('Job Three'), findsOneWidget);
     });
 
-    testWidgets('displays different status badges correctly', (WidgetTester tester) async {
+    testWidgets('displays different status badges correctly',
+        (WidgetTester tester) async {
       final statuses = [
         ('pending', 'Pendiente'),
         ('production', 'En Proceso'),
@@ -144,12 +146,13 @@ void main() {
         );
 
         expect(find.text(statusPair.$2), findsOneWidget);
-        
+
         await tester.pumpWidget(Container()); // Clear widget
       }
     });
 
-    testWidgets('displays notes in separate container', (WidgetTester tester) async {
+    testWidgets('displays notes in separate container',
+        (WidgetTester tester) async {
       final job = Job(
         id: 'job-1',
         orderId: 'order-1',
@@ -169,7 +172,8 @@ void main() {
         ),
       );
 
-      expect(find.text('These are important notes for the job'), findsOneWidget);
+      expect(
+          find.text('These are important notes for the job'), findsOneWidget);
       expect(find.byIcon(Icons.note_outlined), findsOneWidget);
     });
 
@@ -196,7 +200,8 @@ void main() {
       expect(find.byIcon(Icons.note_outlined), findsNothing);
     });
 
-    testWidgets('displays material, size, and quantity icons', (WidgetTester tester) async {
+    testWidgets('displays material, size, and quantity icons',
+        (WidgetTester tester) async {
       final job = Job(
         id: 'job-1',
         orderId: 'order-1',

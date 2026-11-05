@@ -4,13 +4,13 @@ class SyncResult {
   final int ordersUpdated;
   final int clientsUpdated;
   final bool completed;
-  
+
   // Performance metrics
   final Duration httpDuration;
   final Duration parseDuration;
   final Duration databaseDuration;
   final Duration totalDuration;
-  
+
   final String? error;
   final String? nextCursor;
 

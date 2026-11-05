@@ -76,6 +76,7 @@ def repo(temp_db):
             is_archived INTEGER DEFAULT 0,
             whatsapp TEXT DEFAULT '',
             observations TEXT DEFAULT '',
+            creator_device_id INTEGER,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             last_autosave_at TEXT
@@ -154,9 +155,10 @@ def sample_device(repo):
 
 
 @pytest.fixture
-def sample_order(repo):
+def sample_order(repo, sample_device):
     """Crea un pedido de prueba con jobs."""
     conn = repo.conn
+    device_id, _ = sample_device
     now = datetime.now().isoformat(timespec="seconds")
     
     # Crear cliente
@@ -169,9 +171,9 @@ def sample_order(repo):
     # Crear pedido
     conn.execute(
         """INSERT INTO orders(client, client_id, order_date, status, material, size, quantity, price,
-           delivery_date, print_priority, created_at, updated_at, last_autosave_at)
-           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        ("Cliente Test", client_id, now, "Nuevo", "Vinilo", "10cm", 10, 5000, "2026-12-31", 2, now, now, now),
+           delivery_date, print_priority, creator_device_id, created_at, updated_at, last_autosave_at)
+           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        ("Cliente Test", client_id, now, "Nuevo", "Vinilo", "10cm", 10, 5000, "2026-12-31", 2, device_id, now, now, now),
     )
     order_id = conn.execute("SELECT id FROM orders").fetchone()["id"]
     
@@ -194,6 +196,28 @@ def sample_order(repo):
     
     conn.commit()
     return order_id
+
+
+def insert_seller_order(repo, *, creator_device_id: int | None, client: str) -> tuple[int, int]:
+    """Inserta un pedido mínimo para comprobar el aislamiento entre vendedores."""
+    now = datetime.now().isoformat(timespec="seconds")
+    client_id = repo.conn.execute(
+        "INSERT INTO clients(name, whatsapp, created_at, updated_at) VALUES(?, '', ?, ?)",
+        (client, now, now),
+    ).lastrowid
+    order_id = repo.conn.execute(
+        """INSERT INTO orders(
+               client, client_id, order_date, status, creator_device_id, created_at, updated_at, last_autosave_at
+           ) VALUES(?, ?, ?, 'Nuevo', ?, ?, ?, ?)""",
+        (client, client_id, now, creator_device_id, now, now, now),
+    ).lastrowid
+    job_id = repo.conn.execute(
+        """INSERT INTO order_jobs(order_id, title, status, created_at, updated_at)
+           VALUES(?, ?, 'Recibido', ?, ?)""",
+        (order_id, f"Trabajo de {client}", now, now),
+    ).lastrowid
+    repo.conn.commit()
+    return int(order_id), int(job_id)
 
 
 class MockRequest:
@@ -1058,6 +1082,97 @@ class TestSyncPullEndpoint:
         assert "entities" in response_data
 
 
+class TestSellerOrderIsolation:
+    """Cada token móvil solo puede leer o modificar pedidos de su creador."""
+
+    def test_list_search_and_detail_hide_company_orders(self, repo, event_bus, sample_device):
+        device_id, _ = sample_device
+        own_order, own_job = insert_seller_order(
+            repo, creator_device_id=device_id, client="Cliente del vendedor",
+        )
+        _, company_job = insert_seller_order(
+            repo, creator_device_id=None, client="Cliente de la empresa",
+        )
+        handler = create_handler(repo, event_bus)
+
+        handler._parse_url_params = Mock(return_value={"limit": "20", "offset": "0"})
+        handler._list_jobs({"id": device_id, "device_name": "Test Device"})
+        listed = json.loads(handler.response.body.decode("utf-8"))
+        assert {job["id"] for job in listed["jobs"]} == {own_job}
+        assert listed["total"] == 1
+
+        handler.response.body = b""
+        handler._parse_url_params = Mock(
+            return_value={"q": "Cliente", "limit": "20", "offset": "0"}
+        )
+        handler._search_jobs({"id": device_id, "device_name": "Test Device"})
+        searched = json.loads(handler.response.body.decode("utf-8"))
+        assert {job["order_id"] for job in searched["jobs"]} == {own_order}
+
+        handler.response.body = b""
+        handler._get_job_detail(
+            company_job, {"id": device_id, "device_name": "Test Device"}
+        )
+        assert handler.response.status_code == 404
+
+    def test_sync_returns_only_owned_orders_jobs_and_clients(
+        self, repo, event_bus, sample_device,
+    ):
+        device_id, _ = sample_device
+        own_order, own_job = insert_seller_order(
+            repo, creator_device_id=device_id, client="Propio",
+        )
+        insert_seller_order(repo, creator_device_id=None, client="Empresa")
+        other_device_id, _ = repo.register_device(
+            push_token="other_fcm_token",
+            platform="android",
+            device_name="Otro vendedor",
+        )
+        insert_seller_order(
+            repo, creator_device_id=other_device_id, client="Otro vendedor",
+        )
+
+        handler = create_handler(repo, event_bus)
+        handler._parse_url_params = Mock(return_value={"limit": "100"})
+        handler._sync_pull({"id": device_id, "device_name": "Test Device"})
+
+        payload = json.loads(handler.response.body.decode("utf-8"))
+        assert payload["scope_id"] == f"seller-device:{device_id}"
+        assert {item["id"] for item in payload["entities"]["orders"]["items"]} == {own_order}
+        assert {item["id"] for item in payload["entities"]["jobs"]["items"]} == {own_job}
+        assert {item["name"] for item in payload["entities"]["clients"]["items"]} == {"Propio"}
+
+    def test_cannot_update_another_sellers_order(
+        self, repo, event_bus, sample_device,
+    ):
+        device_id, session_token = sample_device
+        other_device_id, _ = repo.register_device(
+            push_token="other_update_token",
+            platform="android",
+            device_name="Otro vendedor",
+        )
+        other_order, _ = insert_seller_order(
+            repo, creator_device_id=other_device_id, client="Ajeno",
+        )
+        handler = _make_handler_with_body(
+            repo,
+            event_bus,
+            session_token,
+            f"/api/v1/mobile/orders/{other_order}/status",
+            {"status": "Finalizado"},
+        )
+
+        handler._update_order_status(
+            other_order, {"id": device_id, "device_name": "Test Device"}
+        )
+
+        assert handler.response.status_code == 404
+        unchanged = repo.conn.execute(
+            "SELECT status FROM orders WHERE id = ?", (other_order,)
+        ).fetchone()
+        assert unchanged["status"] == "Nuevo"
+
+
 class TestHealthEndpoint:
     """Tests para GET /api/v1/mobile/health — endpoint público sin autenticación."""
 
@@ -1280,6 +1395,28 @@ class TestUpdateOrderStatus:
         data = json.loads(handler.response.body.decode("utf-8"))
         assert data["success"] is True
         assert data["order"]["status"] == "En producción"
+
+    def test_update_status_to_delivered_clears_priority(self, repo, event_bus, sample_device, sample_order):
+        device_id, session_token = sample_device
+        device = {"id": device_id, "device_name": "Test Device"}
+        repo.conn.execute(
+            "UPDATE orders SET print_priority = 4 WHERE id = ?", (sample_order,)
+        )
+        repo.conn.commit()
+        handler = _make_handler_with_body(
+            repo,
+            event_bus,
+            session_token,
+            f"/api/v1/mobile/orders/{sample_order}/status",
+            {"status": "Entregado"},
+        )
+
+        handler._update_order_status(sample_order, device)
+
+        data = json.loads(handler.response.body.decode("utf-8"))
+        assert data["success"] is True
+        assert data["order"]["status"] == "Entregado"
+        assert data["order"]["print_priority"] == 0
 
     def test_update_status_not_found(self, repo, event_bus, sample_device):
         device_id, session_token = sample_device
@@ -1603,6 +1740,9 @@ class TestMarkDelivered:
         repo.conn.execute(
             "UPDATE order_jobs SET status = 'Finalizado' WHERE order_id = ?", (sample_order,)
         )
+        repo.conn.execute(
+            "UPDATE orders SET print_priority = 4 WHERE id = ?", (sample_order,)
+        )
         repo.conn.commit()
 
         handler = create_handler(repo, event_bus)
@@ -1613,6 +1753,7 @@ class TestMarkDelivered:
         data = json.loads(handler.response.body.decode("utf-8"))
         assert data["success"] is True
         assert data["order"]["status"] == "Entregado"
+        assert data["order"]["print_priority"] == 0
 
     def test_mark_delivered_not_found(self, repo, event_bus, sample_device):
         device_id, session_token = sample_device

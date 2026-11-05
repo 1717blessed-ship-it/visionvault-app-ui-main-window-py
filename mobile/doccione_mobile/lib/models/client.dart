@@ -48,7 +48,7 @@ class Client {
       address: map['address'] as String?,
       createdAt: map['created_at'] as String?,
       updatedAt: map['updated_at'] as String?,
-      metadata: map['metadata'] != null 
+      metadata: map['metadata'] != null
           ? jsonDecode(map['metadata'] as String) as Map<String, dynamic>
           : null,
     );

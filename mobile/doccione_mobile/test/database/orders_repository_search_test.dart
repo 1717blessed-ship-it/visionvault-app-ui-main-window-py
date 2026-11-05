@@ -193,6 +193,30 @@ void main() {
       expect(result[0].order.status, 'pending');
     });
 
+    test('should filter current Studio status using legacy semantic key',
+        () async {
+      await ordersRepo.upsertOrders([
+        {
+          'id': 'order-spanish-pending',
+          'client': 'Studio Client',
+          'status': 'Pendiente',
+          'order_date': '2026-07-21',
+          'updated_at': '2026-01-01T00:00:00Z',
+        },
+        {
+          'id': 'order-production',
+          'client': 'Production Client',
+          'status': 'En producción',
+          'order_date': '2026-07-21',
+          'updated_at': '2026-01-01T00:00:00Z',
+        },
+      ]);
+
+      final result = await ordersRepo.searchOrders(status: 'pending');
+
+      expect(result.map((item) => item.order.id), ['order-spanish-pending']);
+    });
+
     test('should filter by priority', () async {
       await ordersRepo.upsertOrders([
         {
@@ -217,6 +241,24 @@ void main() {
 
       expect(result.length, 1);
       expect(result[0].order.printPriority, 'high');
+    });
+
+    test('should match numeric Studio priorities with legacy aliases',
+        () async {
+      await ordersRepo.upsertOrders([
+        {
+          'id': 'order-numeric-high',
+          'client': 'Studio Client',
+          'status': 'Pendiente',
+          'print_priority': 3,
+          'order_date': '2026-07-21',
+          'updated_at': '2026-01-01T00:00:00Z',
+        },
+      ]);
+
+      final result = await ordersRepo.searchOrders(priority: 'high');
+
+      expect(result.map((item) => item.order.id), ['order-numeric-high']);
     });
 
     test('should hide archived by default', () async {

@@ -12,8 +12,9 @@ class OrdersSyncHandler implements SyncEntityHandler {
   String get entityType => 'orders';
 
   @override
-  Future<void> process(List<Map<String, dynamic>> items, {Transaction? txn}) async {
+  Future<void> process(List<Map<String, dynamic>> items,
+      {Transaction? txn}) async {
     if (items.isEmpty) return;
-    await _repository.upsertOrders(items, txn: txn);
+    await _repository.applySyncedOrders(items, txn: txn);
   }
 }

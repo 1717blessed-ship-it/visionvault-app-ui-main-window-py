@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:doccione_mobile/models/order_with_details.dart';
+import 'package:doccione_mobile/models/mobile_runtime_config.dart';
 
 /// Aggregated metrics for a single production stage.
 class StageMetrics {
@@ -33,7 +34,7 @@ class StageService {
 
   // ── GENERAL_WORKFLOW (source of truth: backend timeline.py) ─────────
 
-  static const generalWorkflow = [
+  static const _defaultGeneralWorkflow = [
     'Recibido',
     'Esperando archivos',
     'Diseños confirmados',
@@ -60,6 +61,10 @@ class StageService {
   // ── Legacy → current stage mapping ─────────────────────────────────
 
   static const _legacyMap = {
+    'pending': 'Recibido',
+    'production': 'En armado de planchas',
+    'completed': 'Finalizado',
+    'delivered': 'Entregado',
     'Nuevo': 'Recibido',
     'En revisión': 'Esperando archivos',
     'En diseño': 'Esperando archivos',
@@ -99,7 +104,7 @@ class StageService {
 
   // ── Stage metadata (colors from backend STAGE_METADATA) ────────────
 
-  static const stageColors = <String, int>{
+  static const _defaultStageColors = <String, int>{
     'Recibido': 0xFF9E9E9E,
     'Esperando archivos': 0xFFFF9800,
     'Diseños confirmados': 0xFF2196F3,
@@ -113,6 +118,34 @@ class StageService {
     'Finalizado': 0xFF4CAF50,
     'Entregado': 0xFF8BC34A,
   };
+
+  static List<String> generalWorkflow =
+      List.unmodifiable(_defaultGeneralWorkflow);
+  static Map<String, int> stageColors = Map.unmodifiable(_defaultStageColors);
+  static List<String> orderStatuses =
+      List.unmodifiable(MobileRuntimeConfig.defaults.orderStatuses);
+  static List<RuntimePriority> priorities =
+      List.unmodifiable(MobileRuntimeConfig.defaults.priorities);
+
+  /// Actualiza referencias visuales sin perder los valores conocidos por la
+  /// compilación cuando el servidor no publica una opción válida.
+  static void applyRuntimeConfig(MobileRuntimeConfig config) {
+    generalWorkflow = List.unmodifiable(
+      config.workflowStages.isEmpty
+          ? _defaultGeneralWorkflow
+          : config.workflowStages,
+    );
+    stageColors = Map.unmodifiable({
+      ..._defaultStageColors,
+      ...config.stageColors,
+    });
+    orderStatuses = List.unmodifiable(config.orderStatuses);
+    priorities = List.unmodifiable(config.priorities);
+  }
+
+  static void resetRuntimeConfig() {
+    applyRuntimeConfig(MobileRuntimeConfig.defaults);
+  }
 
   // ── Public: normalization ───────────────────────────────────────────
 
@@ -204,7 +237,9 @@ class StageService {
   static IconData materialIcon(String? material) {
     if (material == null || material.isEmpty) return Icons.inventory_2;
     final m = material.toLowerCase();
-    if (m.contains('vinilo') || m.contains('sticker') || m.contains('plotter')) {
+    if (m.contains('vinilo') ||
+        m.contains('sticker') ||
+        m.contains('plotter')) {
       return Icons.view_day;
     }
     if (m.contains('lona') || m.contains('banner')) return Icons.flag;
@@ -214,9 +249,15 @@ class StageService {
     if (m.contains('resina') || m.contains('doming') || m.contains('cuadro')) {
       return Icons.diamond;
     }
-    if (m.contains('acrílico') || m.contains('acrilico')) return Icons.rectangle;
-    if (m.contains('pvc') || m.contains('foam')) return Icons.square;
-    if (m.contains('canvas') || m.contains('lienzo')) return Icons.palette;
+    if (m.contains('acrílico') || m.contains('acrilico')) {
+      return Icons.rectangle;
+    }
+    if (m.contains('pvc') || m.contains('foam')) {
+      return Icons.square;
+    }
+    if (m.contains('canvas') || m.contains('lienzo')) {
+      return Icons.palette;
+    }
     return Icons.inventory_2;
   }
 

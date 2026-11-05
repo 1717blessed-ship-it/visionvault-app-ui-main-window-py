@@ -12,7 +12,8 @@ class ClientsSyncHandler implements SyncEntityHandler {
   String get entityType => 'clients';
 
   @override
-  Future<void> process(List<Map<String, dynamic>> items, {Transaction? txn}) async {
+  Future<void> process(List<Map<String, dynamic>> items,
+      {Transaction? txn}) async {
     if (items.isEmpty) return;
     await _repository.upsertClients(items, txn: txn);
   }

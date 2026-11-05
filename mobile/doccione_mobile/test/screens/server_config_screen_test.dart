@@ -27,6 +27,21 @@ void main() {
     await dbHelper.close();
   });
 
+  Future<void> settleDatabase(WidgetTester tester) async {
+    // SQLite FFI runs outside FakeAsync: virtual pumping cannot finish its I/O.
+    // Keep real persistence and all UI assertions; yield real time with a bound.
+    for (var attempt = 0; attempt < 200; attempt++) {
+      await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 10)));
+      await tester.pump(const Duration(milliseconds: 20));
+      if (find.byType(CircularProgressIndicator).evaluate().isEmpty) {
+        await tester.pumpAndSettle();
+        return;
+      }
+    }
+    fail('La operación SQLite no terminó en el plazo real de prueba.');
+  }
+
   Future<void> pumpScreen(
     WidgetTester tester, {
     Future<ConnectionTestResult> Function(String baseUrl)? onTestConnection,
@@ -39,14 +54,20 @@ void main() {
         ),
       ),
     );
-    await tester.pumpAndSettle();
+    await settleDatabase(tester);
   }
 
   group('ServerConfigScreen', () {
     testWidgets('loads and displays current config', (tester) async {
       await pumpScreen(tester);
       expect(find.text('localhost'), findsOneWidget);
-      expect(find.text('8765'), findsOneWidget);
+      // Port also appears in the preset menu: verify the editable field itself.
+      expect(
+          tester
+              .widget<TextFormField>(find.byType(TextFormField).last)
+              .controller!
+              .text,
+          '8765');
       expect(find.text('http://localhost:8765'), findsOneWidget);
     });
 
@@ -54,9 +75,9 @@ void main() {
       await pumpScreen(tester);
       final hostField = find.byType(TextFormField).first;
       await tester.enterText(hostField, '');
-      await tester.pumpAndSettle();
+      await settleDatabase(tester);
       await tester.tap(find.text('Guardar'));
-      await tester.pumpAndSettle();
+      await settleDatabase(tester);
       expect(find.text('El host es obligatorio'), findsOneWidget);
     });
 
@@ -64,9 +85,9 @@ void main() {
       await pumpScreen(tester);
       final portField = find.byType(TextFormField).last;
       await tester.enterText(portField, 'abc');
-      await tester.pumpAndSettle();
+      await settleDatabase(tester);
       await tester.tap(find.text('Guardar'));
-      await tester.pumpAndSettle();
+      await settleDatabase(tester);
       expect(find.text('Debe ser un número'), findsOneWidget);
     });
 
@@ -74,9 +95,9 @@ void main() {
       await pumpScreen(tester);
       final portField = find.byType(TextFormField).last;
       await tester.enterText(portField, '99999');
-      await tester.pumpAndSettle();
+      await settleDatabase(tester);
       await tester.tap(find.text('Guardar'));
-      await tester.pumpAndSettle();
+      await settleDatabase(tester);
       expect(find.text('Puerto debe estar entre 1 y 65535'), findsOneWidget);
     });
 
@@ -84,10 +105,14 @@ void main() {
       await pumpScreen(tester);
       final hostField = find.byType(TextFormField).first;
       await tester.enterText(hostField, '192.168.1.50');
-      await tester.pumpAndSettle();
+      await settleDatabase(tester);
       await tester.tap(find.text('Guardar'));
-      await tester.pumpAndSettle();
+      await settleDatabase(tester);
       expect(find.text('Configuración guardada correctamente'), findsOneWidget);
+      final persisted = await tester.runAsync(repository.getConfig);
+      expect(persisted!.host, '192.168.1.50');
+      expect(persisted.port, 8765);
+      expect(persisted.scheme, 'http');
     });
 
     testWidgets('calls onTestConnection callback', (tester) async {
@@ -102,7 +127,7 @@ void main() {
         },
       );
       await tester.tap(find.text('Probar conexión'));
-      await tester.pumpAndSettle();
+      await settleDatabase(tester);
       expect(callbackCalled, true);
     });
 
@@ -114,7 +139,7 @@ void main() {
         ),
       );
       await tester.tap(find.text('Probar conexión'));
-      await tester.pumpAndSettle();
+      await settleDatabase(tester);
       expect(find.text('Conexión exitosa'), findsOneWidget);
     });
 
@@ -126,7 +151,7 @@ void main() {
         ),
       );
       await tester.tap(find.text('Probar conexión'));
-      await tester.pumpAndSettle();
+      await settleDatabase(tester);
       expect(find.text('Continuar'), findsOneWidget);
     });
 
@@ -138,7 +163,7 @@ void main() {
         ),
       );
       await tester.tap(find.text('Probar conexión'));
-      await tester.pumpAndSettle();
+      await settleDatabase(tester);
       expect(find.text('No se pudo conectar'), findsOneWidget);
     });
 
@@ -150,7 +175,7 @@ void main() {
         ),
       );
       await tester.tap(find.text('Probar conexión'));
-      await tester.pumpAndSettle();
+      await settleDatabase(tester);
       expect(find.text('Continuar'), findsNothing);
     });
 
@@ -167,7 +192,7 @@ void main() {
       expect(find.text('http://localhost:8765'), findsOneWidget);
       final hostField = find.byType(TextFormField).first;
       await tester.enterText(hostField, '10.0.0.1');
-      await tester.pumpAndSettle();
+      await settleDatabase(tester);
       expect(find.text('http://10.0.0.1:8765'), findsOneWidget);
     });
 
@@ -184,7 +209,7 @@ void main() {
       await pumpScreen(tester);
       final hostField = find.byType(TextFormField).first;
       await tester.enterText(hostField, 'my host');
-      await tester.pumpAndSettle();
+      await settleDatabase(tester);
       await tester.tap(find.text('Guardar'));
       await tester.pumpAndSettle();
       expect(find.text('El host no debe contener espacios'), findsOneWidget);

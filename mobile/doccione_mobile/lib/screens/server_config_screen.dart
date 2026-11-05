@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 import '../config/server_config.dart';
 import '../database/server_config_repository.dart';
 import '../models/connection_test_result.dart';
-import '../services/sync_api_client.dart';
 
 class ServerConfigScreen extends StatefulWidget {
   final ServerConfigRepository repository;
@@ -27,6 +26,7 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
   bool _isLoading = true;
   bool _isSaving = false;
   bool _isTesting = false;
+  bool _isLocalNetwork = true;
   String? _error;
   String? _saveSuccess;
   ConnectionTestResult? _testResult;
@@ -48,14 +48,18 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
   Future<void> _loadConfig() async {
     try {
       final config = await widget.repository.getConfig();
+      final isLocal = ServerConfig.isPrivateOrLocalHost(config.host);
+      if (!mounted) return;
       setState(() {
         _currentConfig = config;
         _hostController.text = config.host;
         _portController.text = config.port.toString();
-        _scheme = config.scheme;
+        _scheme = isLocal ? config.scheme : 'https';
+        _isLocalNetwork = isLocal;
         _isLoading = false;
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _error = 'Error al cargar configuración: $e';
         _isLoading = false;
@@ -63,8 +67,90 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
     }
   }
 
-  Future<void> _saveConfig() async {
-    if (!_formKey.currentState!.validate()) return;
+  void _setNetworkType(bool isLocal) {
+    setState(() {
+      _isLocalNetwork = isLocal;
+      if (isLocal) {
+        _scheme = 'http';
+        _portController.text = '8765';
+        if (!ServerConfig.isPrivateOrLocalHost(_hostController.text.trim())) {
+          _hostController.text = '';
+        }
+      } else {
+        _scheme = 'https';
+        _portController.text = '443';
+        if (ServerConfig.isPrivateOrLocalHost(_hostController.text.trim())) {
+          _hostController.text = '';
+        }
+      }
+    });
+  }
+
+  void _showNetworkHelp(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Configuración de red'),
+        content: const SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                'Conexión Local / VPN',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              SizedBox(height: 8),
+              Text(
+                '• Ambos dispositivos en la misma red WiFi\n'
+                '• O conectados por una VPN privada\n'
+                '• Usa la IP privada de la PC (ej: 192.168.1.50)\n'
+                '• Encuentra la IP en: Configuración de red de Windows',
+              ),
+              SizedBox(height: 16),
+              Text(
+                'Conexión Externa (Datos)',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              SizedBox(height: 8),
+              Text(
+                '• Funciona desde cualquier red\n'
+                '• Requiere un dominio público con HTTPS\n'
+                '• Recomendado: reverse proxy con certificado TLS\n'
+                '• No publiques el puerto HTTP directamente',
+              ),
+              SizedBox(height: 16),
+              Text(
+                'Cómo encontrar tu IP local:',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              SizedBox(height: 8),
+              Text(
+                '1. Abre CMD en Windows\n'
+                '2. Ejecuta: ipconfig\n'
+                '3. Busca "Dirección IPv4" (ej: 192.168.1.50)',
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Entendido'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<bool> _saveConfig() async {
+    if (!_formKey.currentState!.validate()) return false;
+    if (!_isLocalNetwork && _scheme != 'https') {
+      setState(() {
+        _error = 'HTTPS es obligatorio para conexiones externas.';
+      });
+      return false;
+    }
 
     setState(() {
       _isSaving = true;
@@ -83,21 +169,26 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
 
       await widget.repository.updateConfig(config);
 
+      if (!mounted) return false;
       setState(() {
         _currentConfig = config;
         _isSaving = false;
         _saveSuccess = 'Configuración guardada correctamente';
       });
+      return true;
     } catch (e) {
+      if (!mounted) return false;
       setState(() {
         _isSaving = false;
         _error = 'Error al guardar: $e';
       });
+      return false;
     }
   }
 
   Future<void> _testConnection() async {
     if (widget.onTestConnection == null) return;
+    if (!_formKey.currentState!.validate()) return;
 
     setState(() {
       _isTesting = true;
@@ -108,10 +199,18 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
 
     try {
       final baseUrl = _baseUrlPreview;
-      final result = await widget.onTestConnection!(baseUrl);
+      var result = await widget.onTestConnection!(baseUrl);
+      if (!mounted) return;
 
       if (result.success) {
-        await _saveConfig();
+        final saved = await _saveConfig();
+        if (!mounted) return;
+        if (!saved) {
+          result = ConnectionTestResult.unexpected(
+            detail:
+                'La conexión funciona, pero no se pudo guardar la configuración.',
+          );
+        }
       }
 
       setState(() {
@@ -119,6 +218,7 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
         _testResult = result;
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _isTesting = false;
         _testResult = ConnectionTestResult.unexpected(detail: e.toString());
@@ -164,7 +264,10 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
                               const SizedBox(height: 4),
                               Text(
                                 _baseUrlPreview,
-                                style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .titleMedium
+                                    ?.copyWith(
                                       fontFamily: 'monospace',
                                     ),
                               ),
@@ -175,14 +278,69 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
                       const SizedBox(height: 16),
                     ],
 
+                    // Network type selection
+                    Card(
+                      child: Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'Tipo de conexión',
+                              style: Theme.of(context).textTheme.labelMedium,
+                            ),
+                            const SizedBox(height: 12),
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 8,
+                              children: [
+                                _NetworkTypeChip(
+                                  label: 'Local / VPN',
+                                  icon: Icons.wifi,
+                                  isSelected: _isLocalNetwork,
+                                  onTap: () => _setNetworkType(true),
+                                ),
+                                _NetworkTypeChip(
+                                  label: 'Externa (Datos)',
+                                  icon: Icons.public,
+                                  isSelected: !_isLocalNetwork,
+                                  onTap: () => _setNetworkType(false),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 8),
+                            Text(
+                              _isLocalNetwork
+                                  ? 'Usa la IP privada de la PC en WiFi o VPN'
+                                  : 'Usa un dominio público protegido con HTTPS',
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .bodySmall
+                                  ?.copyWith(
+                                    color: Colors.grey[600],
+                                  ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+
                     // Host
                     TextFormField(
                       controller: _hostController,
-                      decoration: const InputDecoration(
+                      decoration: InputDecoration(
                         labelText: 'Host o Dirección IP',
-                        hintText: 'localhost',
-                        border: OutlineInputBorder(),
-                        helperText: 'Ej: localhost, 192.168.1.50, studio.local',
+                        hintText:
+                            _isLocalNetwork ? '192.168.1.50' : 'tu-dominio.com',
+                        border: const OutlineInputBorder(),
+                        helperText: _isLocalNetwork
+                            ? 'IP privada de la PC en la red local o VPN'
+                            : 'Dominio o IP pública del servidor',
+                        suffixIcon: IconButton(
+                          icon: const Icon(Icons.info_outline),
+                          onPressed: () => _showNetworkHelp(context),
+                        ),
                       ),
                       validator: (value) {
                         if (value == null || value.trim().isEmpty) {
@@ -193,6 +351,10 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
                         }
                         if (!ServerConfig.isValidHost(value.trim())) {
                           return 'Host no válido';
+                        }
+                        if (!_isLocalNetwork &&
+                            ServerConfig.isPrivateOrLocalHost(value.trim())) {
+                          return 'Usá un dominio público; para VPN elegí Local / VPN';
                         }
                         return null;
                       },
@@ -228,21 +390,42 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
 
                     // Scheme
                     DropdownButtonFormField<String>(
-                      value: _scheme,
+                      key: ValueKey('scheme-$_scheme-$_isLocalNetwork'),
+                      initialValue: _scheme,
                       decoration: const InputDecoration(
                         labelText: 'Esquema',
                         border: OutlineInputBorder(),
                       ),
-                      items: const [
-                        DropdownMenuItem(value: 'http', child: Text('HTTP')),
-                        DropdownMenuItem(value: 'https', child: Text('HTTPS')),
-                      ],
+                      items: _isLocalNetwork
+                          ? const [
+                              DropdownMenuItem(
+                                value: 'http',
+                                child: Text('HTTP (solo red local)'),
+                              ),
+                              DropdownMenuItem(
+                                value: 'https',
+                                child: Text('HTTPS'),
+                              ),
+                            ]
+                          : const [
+                              DropdownMenuItem(
+                                value: 'https',
+                                child: Text('HTTPS'),
+                              ),
+                            ],
                       onChanged: (value) {
                         if (value != null) {
                           setState(() => _scheme = value);
                         }
                       },
                     ),
+                    if (!_isLocalNetwork) ...[
+                      const SizedBox(height: 8),
+                      const Text(
+                        'HTTPS es obligatorio para proteger usuario, contraseña y pedidos fuera de la red local.',
+                        style: TextStyle(color: Colors.orange, fontSize: 12),
+                      ),
+                    ],
                     const SizedBox(height: 24),
 
                     // Error message
@@ -290,7 +473,8 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
                                 child: Text(
                                   _saveSuccess!,
                                   style: TextStyle(
-                                    color: Theme.of(context).colorScheme.primary,
+                                    color:
+                                        Theme.of(context).colorScheme.primary,
                                   ),
                                 ),
                               ),
@@ -328,15 +512,21 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
                                       _testResult!.message,
                                       style: TextStyle(
                                         color: _testResult!.success
-                                            ? Theme.of(context).colorScheme.primary
-                                            : Theme.of(context).colorScheme.error,
+                                            ? Theme.of(context)
+                                                .colorScheme
+                                                .primary
+                                            : Theme.of(context)
+                                                .colorScheme
+                                                .error,
                                       ),
                                     ),
                                     if (_testResult!.responseTime != null) ...[
                                       const SizedBox(height: 4),
                                       Text(
                                         'Latencia: ${_testResult!.responseTime!.inMilliseconds}ms',
-                                        style: Theme.of(context).textTheme.labelSmall,
+                                        style: Theme.of(context)
+                                            .textTheme
+                                            .labelSmall,
                                       ),
                                     ],
                                   ],
@@ -364,10 +554,13 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
                                 style: Theme.of(context).textTheme.labelSmall,
                               ),
                               const SizedBox(height: 8),
-                              Text('Servicio: ${_testResult!.healthInfo!['service'] ?? 'N/A'}'),
-                              Text('API: ${_testResult!.healthInfo!['api_version'] ?? 'N/A'}'),
+                              Text(
+                                  'Servicio: ${_testResult!.healthInfo!['service'] ?? 'N/A'}'),
+                              Text(
+                                  'API: ${_testResult!.healthInfo!['api_version'] ?? 'N/A'}'),
                               if (_testResult!.healthInfo!['version'] != null)
-                                Text('Versión: ${_testResult!.healthInfo!['version']}'),
+                                Text(
+                                    'Versión: ${_testResult!.healthInfo!['version']}'),
                             ],
                           ),
                         ),
@@ -400,10 +593,12 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
                                 ? const SizedBox(
                                     width: 16,
                                     height: 16,
-                                    child: CircularProgressIndicator(strokeWidth: 2),
+                                    child: CircularProgressIndicator(
+                                        strokeWidth: 2),
                                   )
                                 : const Icon(Icons.wifi_find),
-                            label: Text(_isTesting ? 'Probando...' : 'Probar conexión'),
+                            label: Text(
+                                _isTesting ? 'Probando...' : 'Probar conexión'),
                           ),
                         ),
                         const SizedBox(width: 12),
@@ -414,7 +609,8 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
                                 ? const SizedBox(
                                     width: 16,
                                     height: 16,
-                                    child: CircularProgressIndicator(strokeWidth: 2),
+                                    child: CircularProgressIndicator(
+                                        strokeWidth: 2),
                                   )
                                 : const Icon(Icons.save),
                             label: Text(_isSaving ? 'Guardando...' : 'Guardar'),
@@ -450,6 +646,38 @@ class _ServerConfigScreenState extends State<ServerConfigScreen> {
                 ),
               ),
             ),
+    );
+  }
+}
+
+class _NetworkTypeChip extends StatelessWidget {
+  final String label;
+  final IconData icon;
+  final bool isSelected;
+  final VoidCallback onTap;
+
+  const _NetworkTypeChip({
+    required this.label,
+    required this.icon,
+    required this.isSelected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return FilterChip(
+      label: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 16),
+          const SizedBox(width: 6),
+          Text(label),
+        ],
+      ),
+      selected: isSelected,
+      onSelected: (_) => onTap(),
+      selectedColor: Theme.of(context).colorScheme.primaryContainer,
+      checkmarkColor: Theme.of(context).colorScheme.primary,
     );
   }
 }

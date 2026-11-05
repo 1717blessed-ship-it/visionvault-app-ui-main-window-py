@@ -41,7 +41,8 @@ void main() {
     });
 
     test('maps legacy "En producción" to "En armado de planchas"', () {
-      expect(StageService.normalizeStatus('En producción'), 'En armado de planchas');
+      expect(StageService.normalizeStatus('En producción'),
+          'En armado de planchas');
     });
 
     test('maps legacy "Impreso" to "Impresión"', () {
@@ -61,7 +62,8 @@ void main() {
     });
 
     test('maps vinyl "Armado de plancha" to general', () {
-      expect(StageService.normalizeStatus('Armado de plancha'), 'En armado de planchas');
+      expect(StageService.normalizeStatus('Armado de plancha'),
+          'En armado de planchas');
     });
 
     test('maps vinyl "Laminado" to general', () {
@@ -77,7 +79,8 @@ void main() {
     });
 
     test('maps finishing "Preparación" to general', () {
-      expect(StageService.normalizeStatus('Preparación'), 'Listo para armado de planchas');
+      expect(StageService.normalizeStatus('Preparación'),
+          'Listo para armado de planchas');
     });
 
     test('maps finishing "Producción" to general', () {
@@ -236,9 +239,21 @@ void main() {
     test('returns max age across orders', () {
       final now = DateTime.now();
       final orders = [
-        _makeOrder(orderDate: now.subtract(const Duration(days: 5)).toIso8601String().substring(0, 10)),
-        _makeOrder(orderDate: now.subtract(const Duration(days: 30)).toIso8601String().substring(0, 10)),
-        _makeOrder(orderDate: now.subtract(const Duration(days: 10)).toIso8601String().substring(0, 10)),
+        _makeOrder(
+            orderDate: now
+                .subtract(const Duration(days: 5))
+                .toIso8601String()
+                .substring(0, 10)),
+        _makeOrder(
+            orderDate: now
+                .subtract(const Duration(days: 30))
+                .toIso8601String()
+                .substring(0, 10)),
+        _makeOrder(
+            orderDate: now
+                .subtract(const Duration(days: 10))
+                .toIso8601String()
+                .substring(0, 10)),
       ];
       expect(StageService.oldestAgeDays(orders), 30);
     });
@@ -251,7 +266,11 @@ void main() {
       final now = DateTime.now();
       final orders = [
         _makeOrder(orderDate: null),
-        _makeOrder(orderDate: now.subtract(const Duration(days: 7)).toIso8601String().substring(0, 10)),
+        _makeOrder(
+            orderDate: now
+                .subtract(const Duration(days: 7))
+                .toIso8601String()
+                .substring(0, 10)),
       ];
       expect(StageService.oldestAgeDays(orders), 7);
     });
@@ -260,8 +279,12 @@ void main() {
   group('StageService.computeMetrics', () {
     test('groups orders by normalized status', () {
       final orders = [
-        _makeOrder(status: 'Impresión', printPriority: 'high', jobs: [Job(id: '1'), Job(id: '2')]),
-        _makeOrder(status: 'Impresión', printPriority: 'low', jobs: [Job(id: '3')]),
+        _makeOrder(
+            status: 'Impresión',
+            printPriority: 'high',
+            jobs: [Job(id: '1'), Job(id: '2')]),
+        _makeOrder(
+            status: 'Impresión', printPriority: 'low', jobs: [Job(id: '3')]),
         _makeOrder(status: 'Recibido', jobs: []),
         _makeOrder(status: 'Entregado', jobs: [Job(id: '4')]),
       ];
@@ -295,8 +318,8 @@ void main() {
     test('normalizes workflow-specific statuses', () {
       final orders = [
         _makeOrder(status: 'Corte plotter'), // vinyl → "Corte"
-        _makeOrder(status: 'Laminado'),       // vinyl → "Sublimado / Laminado"
-        _makeOrder(status: 'Empaquetado'),    // → "Finalizado"
+        _makeOrder(status: 'Laminado'), // vinyl → "Sublimado / Laminado"
+        _makeOrder(status: 'Empaquetado'), // → "Finalizado"
       ];
       final metrics = StageService.computeMetrics(orders);
 
@@ -319,11 +342,17 @@ void main() {
       final orders = [
         _makeOrder(
           status: 'Impresión',
-          orderDate: now.subtract(const Duration(days: 15)).toIso8601String().substring(0, 10),
+          orderDate: now
+              .subtract(const Duration(days: 15))
+              .toIso8601String()
+              .substring(0, 10),
         ),
         _makeOrder(
           status: 'Impresión',
-          orderDate: now.subtract(const Duration(days: 3)).toIso8601String().substring(0, 10),
+          orderDate: now
+              .subtract(const Duration(days: 3))
+              .toIso8601String()
+              .substring(0, 10),
         ),
       ];
       final metrics = StageService.computeMetrics(orders);

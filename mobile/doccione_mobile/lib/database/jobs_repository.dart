@@ -9,7 +9,8 @@ class JobsRepository {
   JobsRepository(this._dbHelper);
 
   /// Upsert a single job (insert or update if exists)
-  Future<void> upsertJob(Map<String, dynamic> jobData, {Transaction? txn}) async {
+  Future<void> upsertJob(Map<String, dynamic> jobData,
+      {Transaction? txn}) async {
     final executor = txn ?? await _dbHelper.database;
     final job = Job.fromMap(jobData);
 
@@ -21,7 +22,8 @@ class JobsRepository {
   }
 
   /// Upsert multiple jobs in a batch operation
-  Future<void> upsertJobs(List<Map<String, dynamic>> jobsData, {Transaction? txn}) async {
+  Future<void> upsertJobs(List<Map<String, dynamic>> jobsData,
+      {Transaction? txn}) async {
     final executor = txn ?? await _dbHelper.database;
     final batch = executor.batch();
 

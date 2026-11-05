@@ -1,7 +1,7 @@
 name: doccione_mobile
 description: Doccione Mobile - Notificaciones push para Doccione Studio
 publish_to: 'none'
-version: 1.0.0+1
+version: 1.0.5+6
 
 environment:
   sdk: '>=3.0.0 <4.0.0'
@@ -13,10 +13,21 @@ dependencies:
   firebase_messaging: ^14.7.10
   flutter_local_notifications: ^17.0.0
   http: ^1.6.0
+  crypto: ^3.0.7
+  http_parser: ^4.0.2
   flutter_secure_storage: ^9.0.0
   sqflite: ^2.3.0
   path_provider: ^2.1.1
   path: ^1.8.3
+  url_launcher: ^6.3.1
+  image_picker: ^1.1.2
+  file_picker: ^8.1.7
+  camera: ^0.11.0+2
+  geolocator: ^13.0.2
+  flutter_map: ^7.0.2
+  latlong2: ^0.9.1
+  timezone: ^0.9.4
+  package_info_plus: ^8.0.2
 
 dev_dependencies:
   flutter_test:
@@ -24,5 +35,21 @@ dev_dependencies:
   flutter_lints: ^3.0.0
   sqflite_common_ffi: ^2.3.0
 
+# The app uses the platform SQLite implementation through sqflite.  The FFI
+# package is only needed by desktop tests, so builds must not download another
+# native SQLite binary (important for fully offline Android/iOS builds).
+hooks:
+  user_defines:
+    sqlite3:
+      source: system
+      # Windows exposes its system SQLite build with this library name.
+      name_windows: winsqlite3
+
 flutter:
   uses-material-design: true
+  assets:
+    - assets/sticker_bank/
+    - assets/product_catalog/
+    - assets/product_catalog.json
+    - assets/integration_pilot_ca.pem
+    - assets/integration_usb_pilot_ca.pem

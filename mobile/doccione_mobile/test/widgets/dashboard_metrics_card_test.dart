@@ -5,7 +5,8 @@ import 'package:doccione_mobile/models/dashboard_metrics.dart';
 
 void main() {
   group('DashboardMetricsCard', () {
-    testWidgets('should display metrics correctly', (WidgetTester tester) async {
+    testWidgets('should display metrics correctly',
+        (WidgetTester tester) async {
       final metrics = DashboardMetrics(
         ordersToday: 12,
         ordersInProduction: 8,
@@ -24,7 +25,7 @@ void main() {
         ),
       );
 
-      expect(find.text('Resumen'), findsOneWidget);
+      expect(find.text('Resumen de producción'), findsOneWidget);
       expect(find.text('12'), findsOneWidget);
       expect(find.text('8'), findsOneWidget);
       expect(find.text('3'), findsOneWidget);

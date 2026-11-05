@@ -40,6 +40,8 @@ _test*/
 
 # Logs and temporary files
 *.log
+*.out
+*.err
 *.xml
 test_results.json
 tmp_*.py
