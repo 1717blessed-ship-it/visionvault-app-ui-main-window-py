@@ -1,0 +1,2536 @@
+{
+  "candidate": "2.0.0-rc.1",
+  "created_at": "2026-10-20T22:27:59-03:00",
+  "git_head_before_candidate_commit": "a9e7ed82bbceb898f4623c0a27a2f2a44a455a05",
+  "classic_editor_preserved": true,
+  "profile_defaults": {
+    "name": "Doccione maestro 5,70",
+    "nominal_size_cm": null,
+    "asset_target_size_cm": null,
+    "master_size_cm": 5.7,
+    "content_size_cm": 5.3,
+    "dpi": 300,
+    "print_scale": 0.9727,
+    "cut_inset_mm": 1.0,
+    "initial_white_px": 0,
+    "consolidate_inset_px": 0,
+    "smooth_px": 8,
+    "final_white_polish_strength": 1,
+    "final_white_px": 30,
+    "inner_white_px": 10,
+    "control_black_px": 2,
+    "transparent_padding_px": 50,
+    "mode": "Automático",
+    "quality": "Comercial",
+    "remove_particles": true,
+    "remove_particles_min_px": 80,
+    "fill_holes": true,
+    "fill_holes_max_px": 2000,
+    "close_channels": true,
+    "close_channels_mm": 4.0,
+    "merge_regions": true,
+    "merge_regions_mm": 2.0,
+    "round_corners": true,
+    "round_corners_mm": 0.8,
+    "min_corner_radius_px": 8,
+    "remove_spikes": true,
+    "simplify_curves": true,
+    "simplify_curves_mm": 0.4,
+    "curve_smooth_iters": 2,
+    "ghost_threshold": 128,
+    "edge_feather_px": 3
+  },
+  "files": [
+    {
+      "source": "ui_settings.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\ui_settings.json",
+      "bytes": 110,
+      "sha256": "d7f2954d8c474322023e986d6a8515a2cecabb1b61ff4987302992298f87c83e"
+    },
+    {
+      "source": "work\\stickers\\studio_v2_session.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\studio_v2_session.json",
+      "bytes": 1410,
+      "sha256": "26efc74bb6c78753a8624f05f6707f8bfeef316ee12fe25d728a5620b42c01c7"
+    },
+    {
+      "source": "work\\stickers\\0025ab1a3e664c5d9e2e812e67c7cec2\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\0025ab1a3e664c5d9e2e812e67c7cec2\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\0047e23c4636469c9b191c904dfbaecb\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\0047e23c4636469c9b191c904dfbaecb\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\0060ef6c75ab4227a516aba22992fef6\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\0060ef6c75ab4227a516aba22992fef6\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\0127e86c5ac0495584abeb7b1f06491f\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\0127e86c5ac0495584abeb7b1f06491f\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\01551ee9361d4cd69493b301c3d1e06c\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\01551ee9361d4cd69493b301c3d1e06c\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\01f7f0d683394ce6a5b3a8be5ebcd4b2\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\01f7f0d683394ce6a5b3a8be5ebcd4b2\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\021dee5bdd0346f197f01b313cc6f1b6\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\021dee5bdd0346f197f01b313cc6f1b6\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\025b6e8e67744ad1a42795d784410dfc\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\025b6e8e67744ad1a42795d784410dfc\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\0269c89288d4411ab55299d17cc37c0d\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\0269c89288d4411ab55299d17cc37c0d\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\0387b5a794b041758207c89c171920ac\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\0387b5a794b041758207c89c171920ac\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\04502e74bcf8416a9d49f48bccb3334d\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\04502e74bcf8416a9d49f48bccb3334d\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\04b02cfb2b394ba19fee15750ab01823\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\04b02cfb2b394ba19fee15750ab01823\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\0688123b2d86458cb1a772f24579e607\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\0688123b2d86458cb1a772f24579e607\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\06a047a99ec84ff4b45a876db63cec82\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\06a047a99ec84ff4b45a876db63cec82\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\06d9f6dd23174c14bfb3b672761c666d\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\06d9f6dd23174c14bfb3b672761c666d\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\06f018cef11d41aebfdf757a7569365a\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\06f018cef11d41aebfdf757a7569365a\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\073bf4a732ab42e18c9a28481a4f1a52\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\073bf4a732ab42e18c9a28481a4f1a52\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\082ce9f4ff1b4114be1e80280252110f\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\082ce9f4ff1b4114be1e80280252110f\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\0914b7eb6dba4430a56e80b5977747f2\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\0914b7eb6dba4430a56e80b5977747f2\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\091f33d0bbdf4212960244719ecb873f\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\091f33d0bbdf4212960244719ecb873f\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\0954eb07146949e9b7390cb0d3a80bcb\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\0954eb07146949e9b7390cb0d3a80bcb\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\0a0440cd25de49fbb9ed2ab6cf627d00\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\0a0440cd25de49fbb9ed2ab6cf627d00\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\0ac041da5f52437f859f7d60f05ddc4c\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\0ac041da5f52437f859f7d60f05ddc4c\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "5289bd75acad27683cf733e8822c3cae9f69970f74655ca01531a4d4fb810182"
+    },
+    {
+      "source": "work\\stickers\\0b0360f12a5f4bf789f8032eaa8cda17\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\0b0360f12a5f4bf789f8032eaa8cda17\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\0bb2fdd235d94456bb1076d2a05a27b7\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\0bb2fdd235d94456bb1076d2a05a27b7\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\0c0047d7a7784e1abad910203e485015\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\0c0047d7a7784e1abad910203e485015\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\0cb07487549e472b80b28b9b906092f8\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\0cb07487549e472b80b28b9b906092f8\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\0cb2d1127e7547e6a5d5c6ec94ab150d\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\0cb2d1127e7547e6a5d5c6ec94ab150d\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\0cc226f90e22456ba67e221ae7dc5a86\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\0cc226f90e22456ba67e221ae7dc5a86\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\0cc858ee7ed142ad9b2ef958854c4a1f\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\0cc858ee7ed142ad9b2ef958854c4a1f\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "73eacbad3fe6607ad3b58ec832cebd7207b31e89726fdd5ae5a7a06d2aaf7523"
+    },
+    {
+      "source": "work\\stickers\\0e11c228b7a84e91a9563fe70233023b\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\0e11c228b7a84e91a9563fe70233023b\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\0e7a6c2a0bea4e8bb186c8844c12bac5\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\0e7a6c2a0bea4e8bb186c8844c12bac5\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\0f82668fe9564927974b94dda61d79a5\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\0f82668fe9564927974b94dda61d79a5\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\0fc8c1281df54c5d8864e7532659142f\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\0fc8c1281df54c5d8864e7532659142f\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\120df0fc48a84b50a27181838e608393\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\120df0fc48a84b50a27181838e608393\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\133249fa46fc4c12a8681a9fb22dac78\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\133249fa46fc4c12a8681a9fb22dac78\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\137aa2491c6b4812a6212f251ccfbc6d\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\137aa2491c6b4812a6212f251ccfbc6d\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\14519d34a4ed4d22806254801d771643\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\14519d34a4ed4d22806254801d771643\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\14f280ecb5644da7840c8c910bddf1ac\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\14f280ecb5644da7840c8c910bddf1ac\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\156b137edb354740943a9f9ea83662db\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\156b137edb354740943a9f9ea83662db\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\163722343f69404b9d13397dcdf228e3\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\163722343f69404b9d13397dcdf228e3\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\16729dfa45ff4278a9306dd42239a7c7\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\16729dfa45ff4278a9306dd42239a7c7\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\16a82506203741eba24c372ee3ab4585\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\16a82506203741eba24c372ee3ab4585\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\17c56348f996427fa97d10857ce39e05\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\17c56348f996427fa97d10857ce39e05\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\18a86dbdafe942ce9a7f219039814a54\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\18a86dbdafe942ce9a7f219039814a54\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\18d2e423324645febfb7f51e3f8db0cc\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\18d2e423324645febfb7f51e3f8db0cc\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\1b035e3b2c3e4bcd87843d8cac292c9b\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\1b035e3b2c3e4bcd87843d8cac292c9b\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\1d26c5a2d90241d9b7d4a64c9c48f3c8\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\1d26c5a2d90241d9b7d4a64c9c48f3c8\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\1d542711c8074b83ace38bee68a2b9e9\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\1d542711c8074b83ace38bee68a2b9e9\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\1d6df6cd154a4ebda46d941c7db447e2\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\1d6df6cd154a4ebda46d941c7db447e2\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\1e6248585f7c495a8f5b6bf31198230b\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\1e6248585f7c495a8f5b6bf31198230b\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\1eb3fffd376645c88064b67ed7260906\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\1eb3fffd376645c88064b67ed7260906\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\1ebaa261179346bc9d910c323ce4d0e9\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\1ebaa261179346bc9d910c323ce4d0e9\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\1ebe7e9f48754ec58e647949305897a3\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\1ebe7e9f48754ec58e647949305897a3\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\1f1880653ea84295b8ebd3e4780291f7\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\1f1880653ea84295b8ebd3e4780291f7\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\20135a22a92f41ce96717b86da543617\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\20135a22a92f41ce96717b86da543617\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\202b54893fbd414180702667991b834a\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\202b54893fbd414180702667991b834a\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\20c1046e61d9467fb0080c2c128afad9\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\20c1046e61d9467fb0080c2c128afad9\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\2171619b0d0e4c6f8490143268b5b975\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\2171619b0d0e4c6f8490143268b5b975\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\21d173d5b4ec49adaa4fad3a515a025b\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\21d173d5b4ec49adaa4fad3a515a025b\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\21d50f671d324df4bd10c2314ec41e2b\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\21d50f671d324df4bd10c2314ec41e2b\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\223b5c1ad8af43b18cb9508877047333\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\223b5c1ad8af43b18cb9508877047333\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\226e28f30a5a4588a7531735769d7025\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\226e28f30a5a4588a7531735769d7025\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\226e972823b048208175392377367ae9\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\226e972823b048208175392377367ae9\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\22a843e07cec4aef9096d76c552576cd\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\22a843e07cec4aef9096d76c552576cd\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\22bedfc21b6f4f588560f6829d332709\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\22bedfc21b6f4f588560f6829d332709\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\23d917ec53fc4be9889e7d1f7b171d9d\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\23d917ec53fc4be9889e7d1f7b171d9d\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\24790fd7ef1f423a875532a73d9d68d8\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\24790fd7ef1f423a875532a73d9d68d8\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\2512fd4e7aa4446393e078c07bf0f5eb\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\2512fd4e7aa4446393e078c07bf0f5eb\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\25260483cdcc49ddad3ebc00a6f36293\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\25260483cdcc49ddad3ebc00a6f36293\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\25936c01f62e4f9cb54ffe61e94ed394\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\25936c01f62e4f9cb54ffe61e94ed394\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "73eacbad3fe6607ad3b58ec832cebd7207b31e89726fdd5ae5a7a06d2aaf7523"
+    },
+    {
+      "source": "work\\stickers\\2659d5da13ab4603b89396564a76a9b1\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\2659d5da13ab4603b89396564a76a9b1\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\2750c371f38342eab4a7603a62fc4b86\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\2750c371f38342eab4a7603a62fc4b86\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\27fba584a9fc4e178d19b1a0965686e8\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\27fba584a9fc4e178d19b1a0965686e8\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\2869c4aae916443cac750b71b0bab888\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\2869c4aae916443cac750b71b0bab888\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\28ffc68f1bdb42bab94d96fb89f8b1c2\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\28ffc68f1bdb42bab94d96fb89f8b1c2\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\290cf9fe13bb4b6f9b642e4b64ce3935\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\290cf9fe13bb4b6f9b642e4b64ce3935\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\29216185f4994e5ca89188778fbc61b1\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\29216185f4994e5ca89188778fbc61b1\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "1c7b29176a6175b3e6c8c9c5c3a0c4301485262e171cb8ffd17eb09842c9a542"
+    },
+    {
+      "source": "work\\stickers\\29f110c703414fbfb44504a17bfcac01\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\29f110c703414fbfb44504a17bfcac01\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "5289bd75acad27683cf733e8822c3cae9f69970f74655ca01531a4d4fb810182"
+    },
+    {
+      "source": "work\\stickers\\29f4c0effa7c402c8ff458ba47fa63e0\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\29f4c0effa7c402c8ff458ba47fa63e0\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\2ca6e84a3f424a2a86870d788fb3e03d\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\2ca6e84a3f424a2a86870d788fb3e03d\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\2ebcd16fee984ecf9857b815b262e692\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\2ebcd16fee984ecf9857b815b262e692\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\2ec83b00c3f14c969178bce2ffae851c\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\2ec83b00c3f14c969178bce2ffae851c\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\2efc5e978d314eca815851e250a4ea62\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\2efc5e978d314eca815851e250a4ea62\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\2f0397fc202949c292390bf7f5072693\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\2f0397fc202949c292390bf7f5072693\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\2ff3ac7a12424b2da06f3ab132c2fafb\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\2ff3ac7a12424b2da06f3ab132c2fafb\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\30015c2df385448189621d1e9d094169\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\30015c2df385448189621d1e9d094169\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\303fc4b7e3714ffdaa4310ae2b3eb10c\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\303fc4b7e3714ffdaa4310ae2b3eb10c\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\30eff710a3d2490ca4daba937e895a2f\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\30eff710a3d2490ca4daba937e895a2f\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\314c0c8a7f754f128c1ba50e83cdfd0d\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\314c0c8a7f754f128c1ba50e83cdfd0d\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\31bb4b246b244791b9a5700cd560cd23\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\31bb4b246b244791b9a5700cd560cd23\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\33037c4dc9c9484ba0f007f847f7670b\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\33037c4dc9c9484ba0f007f847f7670b\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\3329a02e55c542dbbce0e87fec460760\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\3329a02e55c542dbbce0e87fec460760\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "5289bd75acad27683cf733e8822c3cae9f69970f74655ca01531a4d4fb810182"
+    },
+    {
+      "source": "work\\stickers\\33bd6ef9eaee41a1af6a93698b220b65\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\33bd6ef9eaee41a1af6a93698b220b65\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\35025f3ab8844b4f81573d09480401a3\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\35025f3ab8844b4f81573d09480401a3\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\35e2d9ac27974172b082ab84065a9284\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\35e2d9ac27974172b082ab84065a9284\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\35ff52790cfc46f690e2f1d7cb316c79\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\35ff52790cfc46f690e2f1d7cb316c79\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\363eb84d2eb84822ac97cedce7c93fa0\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\363eb84d2eb84822ac97cedce7c93fa0\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\368160eec2f24df0939a97f1c6be43ad\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\368160eec2f24df0939a97f1c6be43ad\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\36c195ceaff04e358563ec8b2fb41a35\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\36c195ceaff04e358563ec8b2fb41a35\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\3716452c722c4749a8f6a046a74ba1dd\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\3716452c722c4749a8f6a046a74ba1dd\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\3745df03b0274089859000f9e8317ebe\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\3745df03b0274089859000f9e8317ebe\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\38a0ffdb22e74e9ab6d9ba708d8c5910\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\38a0ffdb22e74e9ab6d9ba708d8c5910\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\3a38ce47c5e54c13b237f50a88892684\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\3a38ce47c5e54c13b237f50a88892684\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\3a8f408df5994c9f872db627623d49c4\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\3a8f408df5994c9f872db627623d49c4\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "5289bd75acad27683cf733e8822c3cae9f69970f74655ca01531a4d4fb810182"
+    },
+    {
+      "source": "work\\stickers\\3aaa8ea2d01a43dd819319f0b5d8201b\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\3aaa8ea2d01a43dd819319f0b5d8201b\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\3b26c493a120413ab6cb70bbe6aa7a70\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\3b26c493a120413ab6cb70bbe6aa7a70\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\3b4a45817b5445eb9b1c824bded025d5\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\3b4a45817b5445eb9b1c824bded025d5\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\3c2af2710e894d6fbb55e8f6bf97c500\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\3c2af2710e894d6fbb55e8f6bf97c500\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\3cdce03e392e443ebd4a91d97d35ad62\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\3cdce03e392e443ebd4a91d97d35ad62\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\3ce2b9fbc2bb4212920312a2a269f22a\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\3ce2b9fbc2bb4212920312a2a269f22a\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b34f60a3fbdd4973bfbc565dd4e0e9675131d9faf4c5fac23381c0c22f26fe79"
+    },
+    {
+      "source": "work\\stickers\\3cf2e1a1d28c478ead7ad674d7c87572\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\3cf2e1a1d28c478ead7ad674d7c87572\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\3e70f12854db47cdac6c6fc5989e175c\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\3e70f12854db47cdac6c6fc5989e175c\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\3e9618112a164580ad7a771d0fd3cac9\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\3e9618112a164580ad7a771d0fd3cac9\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\3ee20f73449445f0a74f427c5b1b0fc1\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\3ee20f73449445f0a74f427c5b1b0fc1\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\3ef643cba630423ebe2ceea632686456\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\3ef643cba630423ebe2ceea632686456\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\3f1e1af5f6f54b76b357dd5820d5860a\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\3f1e1af5f6f54b76b357dd5820d5860a\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\3f20f73264b54804986cb875af81fc68\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\3f20f73264b54804986cb875af81fc68\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\401c95ec75394a4f974338333b0becb3\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\401c95ec75394a4f974338333b0becb3\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "5289bd75acad27683cf733e8822c3cae9f69970f74655ca01531a4d4fb810182"
+    },
+    {
+      "source": "work\\stickers\\4050070c4e5549dd9f8a18e476e71609\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\4050070c4e5549dd9f8a18e476e71609\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\4068265b01834b66ab4e54fabed90875\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\4068265b01834b66ab4e54fabed90875\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\40851df9be4344cc945852d5c5f5e821\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\40851df9be4344cc945852d5c5f5e821\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\40fc86ac5ec844c3bd73c53de7b6cf9e\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\40fc86ac5ec844c3bd73c53de7b6cf9e\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\41131151754b478cb53f819279a30451\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\41131151754b478cb53f819279a30451\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\41577a5684e243c2991dd46df64b82d7\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\41577a5684e243c2991dd46df64b82d7\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\43003969441c481baa96353a87d957a8\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\43003969441c481baa96353a87d957a8\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\4336dfd3de9e44e298b89e76ad58b773\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\4336dfd3de9e44e298b89e76ad58b773\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\43952322cb7b47358a94bb69384419d8\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\43952322cb7b47358a94bb69384419d8\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\43c2c9262e1b4beba45b8d44a44f22f8\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\43c2c9262e1b4beba45b8d44a44f22f8\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\443011b398aa4b7895d39af6ed23f0f8\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\443011b398aa4b7895d39af6ed23f0f8\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\44c306d31a514baea4f80d52311406da\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\44c306d31a514baea4f80d52311406da\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b34f60a3fbdd4973bfbc565dd4e0e9675131d9faf4c5fac23381c0c22f26fe79"
+    },
+    {
+      "source": "work\\stickers\\45f4a20b266f48dda043dbfa4bca70b0\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\45f4a20b266f48dda043dbfa4bca70b0\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\460862bd17784537b0387a2fa6fd3676\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\460862bd17784537b0387a2fa6fd3676\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\467d057644d54690854aac17a3e458fa\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\467d057644d54690854aac17a3e458fa\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\492877f6fc7346adb854e3d077bcc756\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\492877f6fc7346adb854e3d077bcc756\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\4a2bd4c1b7144ba693bbb28ca3ef3fd3\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\4a2bd4c1b7144ba693bbb28ca3ef3fd3\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\4b133018f0ad4e138bc6c6698820b740\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\4b133018f0ad4e138bc6c6698820b740\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\4c6c374409514f5a868e9f92759ba592\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\4c6c374409514f5a868e9f92759ba592\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\4cbe4f20238d43aea452c6a171913769\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\4cbe4f20238d43aea452c6a171913769\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\4cdfa450d38b4c73b4302cc1859dbf5c\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\4cdfa450d38b4c73b4302cc1859dbf5c\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\4d9f605d37474ca69b6936582ca59580\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\4d9f605d37474ca69b6936582ca59580\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\4e408948f20748a0be94ab74c497773f\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\4e408948f20748a0be94ab74c497773f\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\4e79e8faa8ce429d9d0c2e8db242888f\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\4e79e8faa8ce429d9d0c2e8db242888f\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\4e7edd4d5d8f45ea8c89f67f66bfca57\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\4e7edd4d5d8f45ea8c89f67f66bfca57\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\4eac5a31e38245e29cef657f52b8b78d\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\4eac5a31e38245e29cef657f52b8b78d\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\4eba98b3a9614447becb4dc76d91a53b\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\4eba98b3a9614447becb4dc76d91a53b\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\4fb9fecb195243fcb785c23567091c50\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\4fb9fecb195243fcb785c23567091c50\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "73eacbad3fe6607ad3b58ec832cebd7207b31e89726fdd5ae5a7a06d2aaf7523"
+    },
+    {
+      "source": "work\\stickers\\501ab02b18744e5bb9d08812e0ea3060\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\501ab02b18744e5bb9d08812e0ea3060\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\50bb42fb9a9b4d1a8f546aea14eef1ff\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\50bb42fb9a9b4d1a8f546aea14eef1ff\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\50c7ae32b1dc4471bfdb1b5eef602658\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\50c7ae32b1dc4471bfdb1b5eef602658\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\51bd9531065d4eed9dd153bf92b5bcec\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\51bd9531065d4eed9dd153bf92b5bcec\\perfil_produccion.json",
+      "bytes": 186,
+      "sha256": "e35ff6596ec12fce47cb8b01526961f220f93a0df1b1849646e8f3a0140fb916"
+    },
+    {
+      "source": "work\\stickers\\520c345014c84c68b1e9d05b280b7522\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\520c345014c84c68b1e9d05b280b7522\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\52252d8abd8d436a98436ab4f35fb8f8\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\52252d8abd8d436a98436ab4f35fb8f8\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\5261325b249c4b23ab290ba1849f8e59\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\5261325b249c4b23ab290ba1849f8e59\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\52b70b8422004f8d86342fbcf98d3794\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\52b70b8422004f8d86342fbcf98d3794\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\52b8038c8d9e4aee99c1e6ce1de19500\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\52b8038c8d9e4aee99c1e6ce1de19500\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\52f0936928ba4999a1eff995591dde16\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\52f0936928ba4999a1eff995591dde16\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\532e84223b3845e2a631b02b8df54213\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\532e84223b3845e2a631b02b8df54213\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\539cfa5f88f646b7b1e1902953620047\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\539cfa5f88f646b7b1e1902953620047\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\53e574ad515f4d678abd1aaf0b4b257b\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\53e574ad515f4d678abd1aaf0b4b257b\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\54e42b60b31c4c78b859748f7fa818db\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\54e42b60b31c4c78b859748f7fa818db\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\56d17820172b4f63abf139e891da1a92\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\56d17820172b4f63abf139e891da1a92\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\5a36ca2ad6014c5dbdbcdbfece4551ae\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\5a36ca2ad6014c5dbdbcdbfece4551ae\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\5abf80af4d9f4eff96624493b15454a4\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\5abf80af4d9f4eff96624493b15454a4\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\5cd65b6a64034e96aff4f48e942e3274\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\5cd65b6a64034e96aff4f48e942e3274\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\5e43495e3ff9403c953a0fdbef3ea6b4\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\5e43495e3ff9403c953a0fdbef3ea6b4\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "73eacbad3fe6607ad3b58ec832cebd7207b31e89726fdd5ae5a7a06d2aaf7523"
+    },
+    {
+      "source": "work\\stickers\\5f5a5fb319dd45f4880055f6c3bb3302\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\5f5a5fb319dd45f4880055f6c3bb3302\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\604e51e12dbe44198399a3b5c7f4eaa9\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\604e51e12dbe44198399a3b5c7f4eaa9\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\60a9c63231fb4f0a94627885d0450e7f\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\60a9c63231fb4f0a94627885d0450e7f\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\614822a9413f4cdaa3dd7201040d21fc\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\614822a9413f4cdaa3dd7201040d21fc\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\61c5cd4aafd64b828ee5a4725ffba55a\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\61c5cd4aafd64b828ee5a4725ffba55a\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\61e794d1beca42e99ee9fd3aabc72ab7\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\61e794d1beca42e99ee9fd3aabc72ab7\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\64d7651d2ab84ec2add65663b5283817\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\64d7651d2ab84ec2add65663b5283817\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\64f461364863458cb1cef93f86e5cce5\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\64f461364863458cb1cef93f86e5cce5\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "73eacbad3fe6607ad3b58ec832cebd7207b31e89726fdd5ae5a7a06d2aaf7523"
+    },
+    {
+      "source": "work\\stickers\\657d9c1df830403a94eb31757cda0bcb\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\657d9c1df830403a94eb31757cda0bcb\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\659dad0cb3b747359c0b7d8cb98fc816\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\659dad0cb3b747359c0b7d8cb98fc816\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\673f5cfefcec42dd8ef911a5b6bd2b13\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\673f5cfefcec42dd8ef911a5b6bd2b13\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\67f8dfe4e7384576b7bb98b5d69fd28f\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\67f8dfe4e7384576b7bb98b5d69fd28f\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\689e853458bc4857bb9f71872b95f959\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\689e853458bc4857bb9f71872b95f959\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\6996c07b5c52463591c8cc4833421f69\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\6996c07b5c52463591c8cc4833421f69\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\69bf82d5893a4049b86e553d396bbbd8\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\69bf82d5893a4049b86e553d396bbbd8\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\69f22de2f2ec49299c1d6c3b7c293025\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\69f22de2f2ec49299c1d6c3b7c293025\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\6a4106b59d7247bba34b391e93cdd71b\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\6a4106b59d7247bba34b391e93cdd71b\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\6ae202a5a03448d089e5ff58183002bd\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\6ae202a5a03448d089e5ff58183002bd\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\6b50bf5984e245aaa872ef506ebe52f5\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\6b50bf5984e245aaa872ef506ebe52f5\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\6ba50a0d819e425e89c66513e0744b76\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\6ba50a0d819e425e89c66513e0744b76\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\6c53b1f493874cdeaca1ef449d014192\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\6c53b1f493874cdeaca1ef449d014192\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\6ca9604b72484d89bf8d73e4a9fb7dca\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\6ca9604b72484d89bf8d73e4a9fb7dca\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\6cdf93625edb4fba9f80bca053b2da44\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\6cdf93625edb4fba9f80bca053b2da44\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\6cf0cfd9587d4bf69f22960d211344d1\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\6cf0cfd9587d4bf69f22960d211344d1\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\6d0b4c38ef18447b898397ef236cea50\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\6d0b4c38ef18447b898397ef236cea50\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\6d8a3ab308ca46f2a05f3a71d59ebc4d\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\6d8a3ab308ca46f2a05f3a71d59ebc4d\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\6e9ef1fdc58948388f8705c7b7859a68\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\6e9ef1fdc58948388f8705c7b7859a68\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\6ec192c4c9fd40adaa0010ffb7fcec87\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\6ec192c4c9fd40adaa0010ffb7fcec87\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\6f380d4b371047b49172bdefd70cfd26\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\6f380d4b371047b49172bdefd70cfd26\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\6fb8a74aa78440cbb55c4b09b679b7cc\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\6fb8a74aa78440cbb55c4b09b679b7cc\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b6b12da2943ba77dc29f4fa33386878540fa9390c9edd47b49d83e1c290ced38"
+    },
+    {
+      "source": "work\\stickers\\6fe7b7ae652841149340439f64bfba8c\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\6fe7b7ae652841149340439f64bfba8c\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\702de957b7444a91862b900a6cd8b0ec\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\702de957b7444a91862b900a6cd8b0ec\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "5289bd75acad27683cf733e8822c3cae9f69970f74655ca01531a4d4fb810182"
+    },
+    {
+      "source": "work\\stickers\\71b94b4c503c48649434498a898f1ace\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\71b94b4c503c48649434498a898f1ace\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\7230ffffd9d4475a9de8540db16357ef\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\7230ffffd9d4475a9de8540db16357ef\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\73f972e9e7504c4f8d43c1fe28cb55ef\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\73f972e9e7504c4f8d43c1fe28cb55ef\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\74114046c959464bbef779ca30dc6284\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\74114046c959464bbef779ca30dc6284\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\74bf3fea609a4605b1df4f290d997f22\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\74bf3fea609a4605b1df4f290d997f22\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\7518891fc3524da2b101014a3b3bd4ec\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\7518891fc3524da2b101014a3b3bd4ec\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\759954d0749c47eab5f74f558661176d\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\759954d0749c47eab5f74f558661176d\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\75faaf107d074127b158d4aa0b009f21\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\75faaf107d074127b158d4aa0b009f21\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\76dcd78abf3c41d9bb58dd3cd36728cd\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\76dcd78abf3c41d9bb58dd3cd36728cd\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\770c0b37afde4a50b6599d5f36416553\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\770c0b37afde4a50b6599d5f36416553\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\77e190c5dcbc4c7d9f6a7961241c8426\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\77e190c5dcbc4c7d9f6a7961241c8426\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\78b66f9e29b84ba898882804cf9c6777\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\78b66f9e29b84ba898882804cf9c6777\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\794e20ef36294d789986f917a8dfc304\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\794e20ef36294d789986f917a8dfc304\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\79dd467d915943219cf0b20234c118c7\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\79dd467d915943219cf0b20234c118c7\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\7a57d2af12cc447c89c947e8bca07c41\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\7a57d2af12cc447c89c947e8bca07c41\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\7a695cfc95ab41bda2af85f8cf55af7c\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\7a695cfc95ab41bda2af85f8cf55af7c\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\7ad6f9855a4c43e98f778a880a28a9c7\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\7ad6f9855a4c43e98f778a880a28a9c7\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\7adc630cc1c94ba4ac643f8d75320970\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\7adc630cc1c94ba4ac643f8d75320970\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\7b8afa91df344527bd90a2f71844ee14\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\7b8afa91df344527bd90a2f71844ee14\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\7be9218cf8fd4578aeeb591565f80326\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\7be9218cf8fd4578aeeb591565f80326\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\7c3427fbafd84e20bf96ce83dce4061a\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\7c3427fbafd84e20bf96ce83dce4061a\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\7e0d7b0fecd44cc697dcef05faa9f6b8\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\7e0d7b0fecd44cc697dcef05faa9f6b8\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\7ee1f7459a654cfa93a60ccffe43f625\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\7ee1f7459a654cfa93a60ccffe43f625\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\7f547c6e5b0c4cd3a2fc7d4b3b8507b4\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\7f547c6e5b0c4cd3a2fc7d4b3b8507b4\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\80ea4a4de457413687e39ba84dfec07d\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\80ea4a4de457413687e39ba84dfec07d\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\80fcbdadb5eb4d99b05c0a63bd077cb1\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\80fcbdadb5eb4d99b05c0a63bd077cb1\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\81318284920a471e8fbb10fb65c4d75c\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\81318284920a471e8fbb10fb65c4d75c\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "73eacbad3fe6607ad3b58ec832cebd7207b31e89726fdd5ae5a7a06d2aaf7523"
+    },
+    {
+      "source": "work\\stickers\\81b13444da224575b79545978f9e5dc5\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\81b13444da224575b79545978f9e5dc5\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\8461d45119d04a5886369def217b65ad\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\8461d45119d04a5886369def217b65ad\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\847bc43acee84526892ac8e224c35c94\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\847bc43acee84526892ac8e224c35c94\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\848918e642524d738c633808b80cc9ea\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\848918e642524d738c633808b80cc9ea\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\848ddf60cc7c4ab39d1058bf6170916b\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\848ddf60cc7c4ab39d1058bf6170916b\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\86e1a1aa0e14431bb2cb3e0667957ce5\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\86e1a1aa0e14431bb2cb3e0667957ce5\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\86edd452700f49acb7c16ecc748a89d9\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\86edd452700f49acb7c16ecc748a89d9\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\874d27bca781407788ee56e72e778eac\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\874d27bca781407788ee56e72e778eac\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\88d6d5db32a84d46804907fe652cc83e\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\88d6d5db32a84d46804907fe652cc83e\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\8a99dab9070c4219afe2d98243c0b1ee\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\8a99dab9070c4219afe2d98243c0b1ee\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\8ad77205ce5449e68b638250d585bcaa\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\8ad77205ce5449e68b638250d585bcaa\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\8b0f7fad0e3948e785c26215f0d62260\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\8b0f7fad0e3948e785c26215f0d62260\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\8b51d8e3dd61435a8b717ea567182a16\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\8b51d8e3dd61435a8b717ea567182a16\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\8bff5e497ec443458be1ac75a0ebb774\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\8bff5e497ec443458be1ac75a0ebb774\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\8c8b843ae01f41b7acb05f479bf46116\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\8c8b843ae01f41b7acb05f479bf46116\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\8d0d1fa04d8a4b5a8f39fe6042bfb597\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\8d0d1fa04d8a4b5a8f39fe6042bfb597\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\8d0f8f1d1ba94620a4aa656c335ada01\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\8d0f8f1d1ba94620a4aa656c335ada01\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\8d643283bfa142768977cb729030780c\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\8d643283bfa142768977cb729030780c\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\90ae82ffe1214e5ba3afa613fb122f83\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\90ae82ffe1214e5ba3afa613fb122f83\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\914a845b16fc4016a8e5fd27c0f504b7\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\914a845b16fc4016a8e5fd27c0f504b7\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "5289bd75acad27683cf733e8822c3cae9f69970f74655ca01531a4d4fb810182"
+    },
+    {
+      "source": "work\\stickers\\91bfeb70852a43f68b32e63d76b429d6\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\91bfeb70852a43f68b32e63d76b429d6\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\920e92fd8bcc4f7e9c256f03b589a77c\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\920e92fd8bcc4f7e9c256f03b589a77c\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\9233567a234644b28b3f6534ad015d79\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\9233567a234644b28b3f6534ad015d79\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "5289bd75acad27683cf733e8822c3cae9f69970f74655ca01531a4d4fb810182"
+    },
+    {
+      "source": "work\\stickers\\93d45d7ffe634ab68a24bebec1d239ca\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\93d45d7ffe634ab68a24bebec1d239ca\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\93f62217eac9405bb44d4684231b8044\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\93f62217eac9405bb44d4684231b8044\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\957e76d62b1441d39accc7427e28c49e\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\957e76d62b1441d39accc7427e28c49e\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\95953782a01148e28a867ee0018e52dd\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\95953782a01148e28a867ee0018e52dd\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\961afeeb6e65497090ab8fd2e4f3bb1f\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\961afeeb6e65497090ab8fd2e4f3bb1f\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\9675dfa704c84e5daed8ca4a4dc9f3e6\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\9675dfa704c84e5daed8ca4a4dc9f3e6\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\970e8ccfaae34eaab9deb2c0bda76a6d\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\970e8ccfaae34eaab9deb2c0bda76a6d\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\9824b22c6ff14ba081677cc1192e54e3\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\9824b22c6ff14ba081677cc1192e54e3\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\9878e98cfa824480a3569fdc4460b205\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\9878e98cfa824480a3569fdc4460b205\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\9a32f17dea3542df9bd286ee5a367cd1\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\9a32f17dea3542df9bd286ee5a367cd1\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b6b12da2943ba77dc29f4fa33386878540fa9390c9edd47b49d83e1c290ced38"
+    },
+    {
+      "source": "work\\stickers\\9a6822076e4644558dd4c616f50ef834\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\9a6822076e4644558dd4c616f50ef834\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\9b0d4fd0e0614fc0acdd9822599d3369\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\9b0d4fd0e0614fc0acdd9822599d3369\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\9bd00adc8d234533b5fe00d4050128f9\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\9bd00adc8d234533b5fe00d4050128f9\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\9c68fe7bc4a142efaa4d56e82c7539ec\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\9c68fe7bc4a142efaa4d56e82c7539ec\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\9cd6371773b7467786e9ae4172e00b81\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\9cd6371773b7467786e9ae4172e00b81\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\9cf368fe1e114a6e9354437db899161c\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\9cf368fe1e114a6e9354437db899161c\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\9d7945c8706e42a8a86d639a512df594\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\9d7945c8706e42a8a86d639a512df594\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\9d79fe44610a402ea0fead73518b061d\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\9d79fe44610a402ea0fead73518b061d\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\9e269ea308fb4a40b8f21b032807c2c9\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\9e269ea308fb4a40b8f21b032807c2c9\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\9e615aba1da44137a8daa87a63f9b3fa\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\9e615aba1da44137a8daa87a63f9b3fa\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\9fa88bd8874249b7a1e46047709ad8ce\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\9fa88bd8874249b7a1e46047709ad8ce\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\a0d8090c82914c42ae2611040791f570\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\a0d8090c82914c42ae2611040791f570\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\a0ee7aed9af04320acfec41ec5200953\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\a0ee7aed9af04320acfec41ec5200953\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\a130cee4c8b14ea6b90e6eaee7f1ffa4\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\a130cee4c8b14ea6b90e6eaee7f1ffa4\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\a252a941f40c457f8a49130a8cd8e01b\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\a252a941f40c457f8a49130a8cd8e01b\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\a2e103d236da4e8ca0dea415c176449c\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\a2e103d236da4e8ca0dea415c176449c\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\a33291d5462541bb9a40e763d5b81750\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\a33291d5462541bb9a40e763d5b81750\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\a4d8bbd29c6641a5944e4345c7402749\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\a4d8bbd29c6641a5944e4345c7402749\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\a68872727ea148f48e19d76598bfd109\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\a68872727ea148f48e19d76598bfd109\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\a7249f8cfa2b4c75b0f88f1eaacadc09\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\a7249f8cfa2b4c75b0f88f1eaacadc09\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\a80d7fcf349741999eba4be56304c37d\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\a80d7fcf349741999eba4be56304c37d\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\a9cf2df559e541988f35b25717a4804e\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\a9cf2df559e541988f35b25717a4804e\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\a9fbd56a6f48448e8830e788a6e52d41\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\a9fbd56a6f48448e8830e788a6e52d41\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\abc224c6289547aea5eda5c8e9bbd609\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\abc224c6289547aea5eda5c8e9bbd609\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\abd71a17b2c34264ba59565df0a6990f\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\abd71a17b2c34264ba59565df0a6990f\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\ace242ddc12e4c3aab8b592636ded4f0\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\ace242ddc12e4c3aab8b592636ded4f0\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\ad046d544b7c43b2aa718468c1668e07\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\ad046d544b7c43b2aa718468c1668e07\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\ad7ef97123d54f41a21007614cc4f9db\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\ad7ef97123d54f41a21007614cc4f9db\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\ad98d00656f64a7ca8fb88d63a72123b\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\ad98d00656f64a7ca8fb88d63a72123b\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\add03d90d43a40b18fff9958e0551901\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\add03d90d43a40b18fff9958e0551901\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\ae29e8ef2ed9431085d8fc294f8c8c0b\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\ae29e8ef2ed9431085d8fc294f8c8c0b\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\aebbcfc0f63b41b3b0a3bae46be529f0\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\aebbcfc0f63b41b3b0a3bae46be529f0\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b6b12da2943ba77dc29f4fa33386878540fa9390c9edd47b49d83e1c290ced38"
+    },
+    {
+      "source": "work\\stickers\\aecd3e86c29a46c58e4ac10a1d10628b\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\aecd3e86c29a46c58e4ac10a1d10628b\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\af27d5c9d7c34888bf4ecfcb81f14d45\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\af27d5c9d7c34888bf4ecfcb81f14d45\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\b00529bf00fe44dca2e47e2a97ff3f4f\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\b00529bf00fe44dca2e47e2a97ff3f4f\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\b005a4a3954a4a4f88cc9b5dc7cb12ec\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\b005a4a3954a4a4f88cc9b5dc7cb12ec\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\b06bf0cd0600449e95123c8c7ade520d\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\b06bf0cd0600449e95123c8c7ade520d\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\b07488fe994b43d3ab1c7c3c93ad5bf2\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\b07488fe994b43d3ab1c7c3c93ad5bf2\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\b0ce4c0ddb2c490f9fb9bfa832ce800d\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\b0ce4c0ddb2c490f9fb9bfa832ce800d\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\b11a6bc7f56343058db4446f247b855e\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\b11a6bc7f56343058db4446f247b855e\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "73eacbad3fe6607ad3b58ec832cebd7207b31e89726fdd5ae5a7a06d2aaf7523"
+    },
+    {
+      "source": "work\\stickers\\b14a4f33aa274dcbbc217c2feb745f75\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\b14a4f33aa274dcbbc217c2feb745f75\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\b1fb46b852514603910bb19bbf4bf5e3\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\b1fb46b852514603910bb19bbf4bf5e3\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\b370f6fc7e7140379a4bff57e8db64bc\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\b370f6fc7e7140379a4bff57e8db64bc\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\b3ef8d7583194a20a7b1d4a2d19d8766\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\b3ef8d7583194a20a7b1d4a2d19d8766\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\b42c83440cd64bb180031318c7f2ef2d\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\b42c83440cd64bb180031318c7f2ef2d\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\b5e82a2132e54e57964a055777e55aa3\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\b5e82a2132e54e57964a055777e55aa3\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\b638be93866b4b16afaf08276ed49211\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\b638be93866b4b16afaf08276ed49211\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\b69b1f56ac824fa8b2f92b3affb1e184\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\b69b1f56ac824fa8b2f92b3affb1e184\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\b7c3e0b2563c4ce8b19a82c8c00522a6\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\b7c3e0b2563c4ce8b19a82c8c00522a6\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "5289bd75acad27683cf733e8822c3cae9f69970f74655ca01531a4d4fb810182"
+    },
+    {
+      "source": "work\\stickers\\b7e2f3826a954cc183e0d7145d7caedf\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\b7e2f3826a954cc183e0d7145d7caedf\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\b87b1432a15b43418009ae3af2ef29b5\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\b87b1432a15b43418009ae3af2ef29b5\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "5289bd75acad27683cf733e8822c3cae9f69970f74655ca01531a4d4fb810182"
+    },
+    {
+      "source": "work\\stickers\\b947a8b57d5a44f4947bd975f380cabc\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\b947a8b57d5a44f4947bd975f380cabc\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\baa79b421b70489eb94495ec36402786\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\baa79b421b70489eb94495ec36402786\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\baaca4b7607340459dff9f3b242d110f\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\baaca4b7607340459dff9f3b242d110f\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\bae6c39d07204a0cacef37c9b9031648\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\bae6c39d07204a0cacef37c9b9031648\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "5289bd75acad27683cf733e8822c3cae9f69970f74655ca01531a4d4fb810182"
+    },
+    {
+      "source": "work\\stickers\\bbe297124f974527b0937daf3b84f4a5\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\bbe297124f974527b0937daf3b84f4a5\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\be2594dac39b48309f0506c0c0923cdb\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\be2594dac39b48309f0506c0c0923cdb\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\bf83d02ae3ca4a85b38db59717caaff1\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\bf83d02ae3ca4a85b38db59717caaff1\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\bfef5b7b2a2f42709f39bd5360a8a1cd\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\bfef5b7b2a2f42709f39bd5360a8a1cd\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\c0b2daad30c147f79a87577316136a37\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\c0b2daad30c147f79a87577316136a37\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "73eacbad3fe6607ad3b58ec832cebd7207b31e89726fdd5ae5a7a06d2aaf7523"
+    },
+    {
+      "source": "work\\stickers\\c25d8e07ed374965a8eeb242a8f3715a\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\c25d8e07ed374965a8eeb242a8f3715a\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\c25deb5f42e04cc3bb5bfcc55254dddd\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\c25deb5f42e04cc3bb5bfcc55254dddd\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\c291c4a40d5a4f6a971dad5f0d625c30\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\c291c4a40d5a4f6a971dad5f0d625c30\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\c2edb365d2a34838a300f915b5c10fea\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\c2edb365d2a34838a300f915b5c10fea\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\c37fa31a38654f45984d445009bf6bc1\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\c37fa31a38654f45984d445009bf6bc1\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\c3c1ca4661d04d3285b580006d29f8d2\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\c3c1ca4661d04d3285b580006d29f8d2\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\c478389182094bb6bb07e1385b531a1e\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\c478389182094bb6bb07e1385b531a1e\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\c4bdfeae8123444a92471e030ee92151\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\c4bdfeae8123444a92471e030ee92151\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\c4f26d7ddf7b463ab64b236f8274e8e6\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\c4f26d7ddf7b463ab64b236f8274e8e6\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "73eacbad3fe6607ad3b58ec832cebd7207b31e89726fdd5ae5a7a06d2aaf7523"
+    },
+    {
+      "source": "work\\stickers\\c50b31d8ee214b99ae4e5b0607fe7565\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\c50b31d8ee214b99ae4e5b0607fe7565\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\c556f5b160e049af85ff03c78a92a0b6\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\c556f5b160e049af85ff03c78a92a0b6\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\c599f99a5da441be86aa349b4b5e7186\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\c599f99a5da441be86aa349b4b5e7186\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\c6230843d59e4f75b0df03ea93749b8d\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\c6230843d59e4f75b0df03ea93749b8d\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\c62320f52a88455383d16c6bb26ba081\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\c62320f52a88455383d16c6bb26ba081\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\c623ef12b80341bd99756bd952e16799\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\c623ef12b80341bd99756bd952e16799\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\c73710a5c84b47d882d0274b21838bfa\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\c73710a5c84b47d882d0274b21838bfa\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\c746a77144d8482fbbacf4012b699933\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\c746a77144d8482fbbacf4012b699933\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\c79632d7fcab45789c13c629c00a1b59\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\c79632d7fcab45789c13c629c00a1b59\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\c84b49195a8941ef8ee4707a73ce7224\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\c84b49195a8941ef8ee4707a73ce7224\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\cade7580dacc47c3b3f60d19164fb7c2\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\cade7580dacc47c3b3f60d19164fb7c2\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\cbe68825f6de4a5c845fa57fbb70b18c\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\cbe68825f6de4a5c845fa57fbb70b18c\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "73eacbad3fe6607ad3b58ec832cebd7207b31e89726fdd5ae5a7a06d2aaf7523"
+    },
+    {
+      "source": "work\\stickers\\cbe9f608498944f4890aff0e0fb76249\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\cbe9f608498944f4890aff0e0fb76249\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\cbfcec52304149a794a98c5f998de642\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\cbfcec52304149a794a98c5f998de642\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b6b12da2943ba77dc29f4fa33386878540fa9390c9edd47b49d83e1c290ced38"
+    },
+    {
+      "source": "work\\stickers\\cc83cbba6ec145079601037e6de133c4\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\cc83cbba6ec145079601037e6de133c4\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\cd2bd6337edd4495bbb8e121498b42b7\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\cd2bd6337edd4495bbb8e121498b42b7\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\cd85a4476e7b47c5bf641f872b343f6c\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\cd85a4476e7b47c5bf641f872b343f6c\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\ce79ad99eb8f496ca0513ccb7807920b\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\ce79ad99eb8f496ca0513ccb7807920b\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\cf1faeea497940989c49206e667cdc3c\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\cf1faeea497940989c49206e667cdc3c\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\cf4fc5a38dc643ba815a5146bb2dc394\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\cf4fc5a38dc643ba815a5146bb2dc394\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\cf772e57705a45cab5cf80c8723016ef\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\cf772e57705a45cab5cf80c8723016ef\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\d1526364a927453f9a64441f93e87764\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\d1526364a927453f9a64441f93e87764\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\d212b14a9d464914a0ab9dd0a71f8232\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\d212b14a9d464914a0ab9dd0a71f8232\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\d2e21e6f311948c0894d2df38dad1ac7\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\d2e21e6f311948c0894d2df38dad1ac7\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\d44e543c7ab744ac894d5a1f7998f982\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\d44e543c7ab744ac894d5a1f7998f982\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\d4f78b2dbd7940438d54083fa8845201\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\d4f78b2dbd7940438d54083fa8845201\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "5289bd75acad27683cf733e8822c3cae9f69970f74655ca01531a4d4fb810182"
+    },
+    {
+      "source": "work\\stickers\\d66f4c3797f3461680cb193c270516cc\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\d66f4c3797f3461680cb193c270516cc\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\d82ebf622f304344a992c8c665d293ce\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\d82ebf622f304344a992c8c665d293ce\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\d90a24f890aa46339fe5ead3bdeafa2f\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\d90a24f890aa46339fe5ead3bdeafa2f\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\d96b953f0b56489f813effd828ab5b0a\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\d96b953f0b56489f813effd828ab5b0a\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\daaf323316744614ae6448a8deadeacc\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\daaf323316744614ae6448a8deadeacc\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\dace2b62944a480f8f7b27711fe5b2cb\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\dace2b62944a480f8f7b27711fe5b2cb\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\dad200e0b26b4fb59446a9b1c2c67c3a\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\dad200e0b26b4fb59446a9b1c2c67c3a\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\db12073a467440fca4c6a18c736e1783\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\db12073a467440fca4c6a18c736e1783\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "5289bd75acad27683cf733e8822c3cae9f69970f74655ca01531a4d4fb810182"
+    },
+    {
+      "source": "work\\stickers\\dc14054eabc04ff5ab65431bd0f6b599\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\dc14054eabc04ff5ab65431bd0f6b599\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\ddce62313c2c493e9e2fb8c6810ac451\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\ddce62313c2c493e9e2fb8c6810ac451\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\de86ff0e67454e2b88148079e661b7ef\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\de86ff0e67454e2b88148079e661b7ef\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\debbe503189041aea2e1c9f49d43b19f\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\debbe503189041aea2e1c9f49d43b19f\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\df6f94dea75c4dd8abd7a2a6554f6ce8\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\df6f94dea75c4dd8abd7a2a6554f6ce8\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\e06a290532b8494094b34134ba260ca2\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\e06a290532b8494094b34134ba260ca2\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\e127f16eccd045cf9d43fd8150bbac0e\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\e127f16eccd045cf9d43fd8150bbac0e\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\e1b8d26e7a1a4ca5aa94f43c667bdb7c\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\e1b8d26e7a1a4ca5aa94f43c667bdb7c\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\e2c849e238c640a4b6096e18656033af\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\e2c849e238c640a4b6096e18656033af\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\e2c92831c2a34e1cb1ca502609ece40c\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\e2c92831c2a34e1cb1ca502609ece40c\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\e3f93fcc0ac74d25a30283d38f1414a3\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\e3f93fcc0ac74d25a30283d38f1414a3\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\e518fe9804b54ab594a6d96f60738163\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\e518fe9804b54ab594a6d96f60738163\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\e7666c77d8cd48d5bdf24a5f1ebaa2bf\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\e7666c77d8cd48d5bdf24a5f1ebaa2bf\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\e77f791cfb244a01a8650b717fb64ebe\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\e77f791cfb244a01a8650b717fb64ebe\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\e7b4fe01fac04bc6953776b41869e970\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\e7b4fe01fac04bc6953776b41869e970\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\e7d5f60ab4f648478a57f3ad59f89f68\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\e7d5f60ab4f648478a57f3ad59f89f68\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\e7f52f52204d4e2ba14aab51b40bd988\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\e7f52f52204d4e2ba14aab51b40bd988\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\e8a40e8d506e40bd8f673477760bdf79\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\e8a40e8d506e40bd8f673477760bdf79\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\e983f2e79b10411e9633b11116800863\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\e983f2e79b10411e9633b11116800863\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\ea07df11a6c2420987b8a7b2253bdd01\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\ea07df11a6c2420987b8a7b2253bdd01\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "32877c9bd68d437a8bbf0bf5a96c8610df32356e867dd5609a41c698edb101f1"
+    },
+    {
+      "source": "work\\stickers\\ea6bab1b9a574aabbfb636aa57bfb46e\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\ea6bab1b9a574aabbfb636aa57bfb46e\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\eb3e7ec0365740ca9e6bf02a9f3689c9\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\eb3e7ec0365740ca9e6bf02a9f3689c9\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\ebfe4109e8ac4883b702d4f3ef5d7cd9\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\ebfe4109e8ac4883b702d4f3ef5d7cd9\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\ec3d88b27caf43238f43337d3298eef8\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\ec3d88b27caf43238f43337d3298eef8\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\ec776eecac004f27b8e97a9a9fac6d05\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\ec776eecac004f27b8e97a9a9fac6d05\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\edbbb5f2b50e41c4a663eafb0ffd7ed7\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\edbbb5f2b50e41c4a663eafb0ffd7ed7\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\ee5dad3df67e41c1aaaaa45eb78502d3\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\ee5dad3df67e41c1aaaaa45eb78502d3\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\ee851f6f44334c0c9bd5d7ab7fe76cee\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\ee851f6f44334c0c9bd5d7ab7fe76cee\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\ef0097152b944fb0acdced11d7ae4383\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\ef0097152b944fb0acdced11d7ae4383\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\ef88ee4ecc504e498652f2a4cc5b3206\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\ef88ee4ecc504e498652f2a4cc5b3206\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\f01f265b96d84f7dbad43f44230776b2\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\f01f265b96d84f7dbad43f44230776b2\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\f07ee251d3684e7bb6c2eda65df5f134\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\f07ee251d3684e7bb6c2eda65df5f134\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\f1a1dd74b98742e08c4d83e8099b94a8\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\f1a1dd74b98742e08c4d83e8099b94a8\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\f49a3786f7334064beed573e9c8621f9\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\f49a3786f7334064beed573e9c8621f9\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\f4f4f22821534fa4bdc455275a2b0be5\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\f4f4f22821534fa4bdc455275a2b0be5\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\f601805dfe4d458d8b58cebdc56c5fbb\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\f601805dfe4d458d8b58cebdc56c5fbb\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b6b12da2943ba77dc29f4fa33386878540fa9390c9edd47b49d83e1c290ced38"
+    },
+    {
+      "source": "work\\stickers\\f754b8e29de547709de4ff124c80e6bc\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\f754b8e29de547709de4ff124c80e6bc\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\f867b5e321f642a483e7e8057b8a64d9\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\f867b5e321f642a483e7e8057b8a64d9\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\f87897f1a03947589e43b4873431cd55\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\f87897f1a03947589e43b4873431cd55\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b34f60a3fbdd4973bfbc565dd4e0e9675131d9faf4c5fac23381c0c22f26fe79"
+    },
+    {
+      "source": "work\\stickers\\f8e8572a0f7f4d46bd9356e4f0c03032\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\f8e8572a0f7f4d46bd9356e4f0c03032\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\f9f1b8a263b149e2be5c7c5e88227edc\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\f9f1b8a263b149e2be5c7c5e88227edc\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\f9fb66867abc430ebfd39937daeb05b6\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\f9fb66867abc430ebfd39937daeb05b6\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "73eacbad3fe6607ad3b58ec832cebd7207b31e89726fdd5ae5a7a06d2aaf7523"
+    },
+    {
+      "source": "work\\stickers\\fa15d5dfc4b249919d4f613321c715be\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\fa15d5dfc4b249919d4f613321c715be\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\fb68127e920a40839890a16f7e654376\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\fb68127e920a40839890a16f7e654376\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\fb6d64683815480192ebc8f67394b8b0\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\fb6d64683815480192ebc8f67394b8b0\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\fd00d4998001483bae24459e51f1361d\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\fd00d4998001483bae24459e51f1361d\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\fd32f69ae5f74823979d9fd93d2c4ff2\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\fd32f69ae5f74823979d9fd93d2c4ff2\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\fd39753ed5f847a7a6378575e1c78685\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\fd39753ed5f847a7a6378575e1c78685\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "5289bd75acad27683cf733e8822c3cae9f69970f74655ca01531a4d4fb810182"
+    },
+    {
+      "source": "work\\stickers\\fda773e620a04bc9aa83d9531e66aa3a\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\fda773e620a04bc9aa83d9531e66aa3a\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\fe8d24812d8047cdbbd1e7b84faa48ee\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\fe8d24812d8047cdbbd1e7b84faa48ee\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\fea2fa70a84949b5b44ae84e9f4d4543\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\fea2fa70a84949b5b44ae84e9f4d4543\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    },
+    {
+      "source": "work\\stickers\\ff3b8ca6ea1e471d98c5900be18ad9db\\perfil_produccion.json",
+      "backup": "artifacts\\sticker-studio-production-candidate\\freeze-backup\\work\\stickers\\ff3b8ca6ea1e471d98c5900be18ad9db\\perfil_produccion.json",
+      "bytes": 209,
+      "sha256": "b39d9d203e38b25fe1a530d31aa2e5f7c9bb5797aee87e7f3b84788f90e5c98c"
+    }
+  ],
+  "calibrations_modified_by_freeze": false
+}

@@ -16,6 +16,15 @@ PRODUCTION_PROFILES: dict[str, float] = {
     "Cuádruple": MAX_CONTINUOUS_LENGTH_CM,
 }
 
+# Toda salida física usa la misma calibración; la cantidad de planchas de la
+# tira no modifica el tamaño final del diseño.
+EPSON_SECTION_SCALES: dict[int, float] = {count: 97.27 for count in range(1, 5)}
+
+
+def epson_scale_for_sections(section_count: int) -> float:
+    """Devuelve la escala fija de impresión para cualquier tira."""
+    return EPSON_SECTION_SCALES[max(1, min(4, int(section_count or 1)))]
+
 
 @dataclass
 class ContinuousSection:
@@ -92,6 +101,11 @@ class ContinuousProduction:
     @property
     def total_stickers(self) -> int:
         return sum(max(0, int(section.stickers or 0)) for section in self.sections)
+
+    @property
+    def print_scale_percent(self) -> float:
+        """Escala de impresión calculada a partir de las planchas acopladas."""
+        return epson_scale_for_sections(len(self.sections))
 
     @property
     def materials(self) -> list[str]:

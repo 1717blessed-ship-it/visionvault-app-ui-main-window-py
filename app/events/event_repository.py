@@ -15,6 +15,19 @@ from datetime import datetime, timedelta
 logger = logging.getLogger(__name__)
 
 
+class DeviceRegistration(int):
+    """ID entero compatible con el desempaquetado histórico (id, token)."""
+
+    def __new__(cls, device_id: int, session_token: str):
+        obj = int.__new__(cls, int(device_id))
+        obj.session_token = session_token
+        return obj
+
+    def __iter__(self):
+        yield int(self)
+        yield self.session_token
+
+
 class EventRepository:
     """Gestiona las tablas app_events, notification_outbox, mobile_devices y pairing_codes."""
 
@@ -81,6 +94,32 @@ class EventRepository:
         )
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_mobile_devices_token ON mobile_devices(push_token)"
+        )
+        # Las instalaciones existentes pueden haber creado ``mobile_devices``
+        # antes de que se agregara la autenticación de la API móvil.  SQLite
+        # no modifica una tabla ya existente con CREATE TABLE IF NOT EXISTS,
+        # por eso la migración debe ser explícita e idempotente.
+        mobile_device_columns = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(mobile_devices)")
+        }
+        for column, definition in (
+            ("user_id", "INTEGER"),
+            ("app_version", "TEXT NOT NULL DEFAULT ''"),
+            ("session_token_hash", "TEXT"),
+            ("session_expires_at", "TEXT"),
+            ("session_last_used_at", "TEXT"),
+        ):
+            if column not in mobile_device_columns:
+                self.conn.execute(
+                    f"ALTER TABLE mobile_devices ADD COLUMN {column} {definition}"
+                )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mobile_devices_session_token "
+            "ON mobile_devices(session_token_hash)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mobile_devices_user "
+            "ON mobile_devices(user_id, active)"
         )
         # Preferencias de notificación por dispositivo
         self.conn.execute(
@@ -253,6 +292,7 @@ class EventRepository:
         platform: str,
         device_name: str = "",
         user_id: int | None = None,
+        app_version: str = "",
     ) -> tuple[int, str]:
         """Registra o actualiza un dispositivo móvil y genera session token.
         
@@ -261,39 +301,106 @@ class EventRepository:
         now = datetime.now().isoformat(timespec="seconds")
         session_token = secrets.token_urlsafe(32)
         session_token_hash = self._hash_session_token(session_token)
-        session_expires_at = (datetime.now() + timedelta(days=30)).isoformat(timespec="seconds")
+        session_expires_at = (datetime.now() + timedelta(days=90)).isoformat(timespec="seconds")
         
         existing = self.conn.execute(
-            "SELECT id FROM mobile_devices WHERE push_token = ?", (push_token,)
+            "SELECT id, user_id FROM mobile_devices WHERE push_token = ?",
+            (push_token,),
         ).fetchone()
+        if (
+            existing
+            and user_id is not None
+            and existing["user_id"] is not None
+            and int(existing["user_id"]) != int(user_id)
+        ):
+            # Un token FCM identifica el teléfono físico, no al vendedor. Si el
+            # equipo cambia de cuenta conservamos el dispositivo anterior como
+            # revocado (y con él la propiedad de sus pedidos), y creamos una
+            # identidad lógica nueva para evitar transferir datos entre cuentas.
+            retired_push_token = (
+                f"revoked:{int(existing['id'])}:{secrets.token_urlsafe(12)}"
+            )
+            self.conn.execute(
+                """UPDATE mobile_devices
+                      SET push_token = ?, active = 0, last_seen_at = ?,
+                          session_token_hash = NULL, session_expires_at = NULL
+                    WHERE id = ?""",
+                (retired_push_token, now, int(existing["id"])),
+            )
+            existing = None
         if existing:
             device_id = existing["id"]
+            effective_user_id = (
+                int(user_id)
+                if user_id is not None
+                else (
+                    int(existing["user_id"])
+                    if existing["user_id"] is not None
+                    else None
+                )
+            )
             self.conn.execute(
                 """UPDATE mobile_devices SET device_name = ?, last_seen_at = ?, active = 1,
-                   session_token_hash = ?, session_expires_at = ?, session_last_used_at = ?
+                   user_id = ?, platform = ?, app_version = ?, session_token_hash = ?,
+                   session_expires_at = ?, session_last_used_at = ?
                    WHERE id = ?""",
-                (device_name, now, session_token_hash, session_expires_at, now, device_id),
+                (
+                    device_name,
+                    now,
+                    effective_user_id,
+                    platform,
+                    app_version,
+                    session_token_hash,
+                    session_expires_at,
+                    now,
+                    device_id,
+                ),
             )
             self.conn.commit()
             logger.info("Dispositivo actualizado con nuevo session token: id=%d", device_id)
-            return device_id, session_token
+            return DeviceRegistration(device_id, session_token)
         
         cursor = self.conn.execute(
             """INSERT INTO mobile_devices(user_id, device_name, platform, push_token, active, last_seen_at, created_at,
-               session_token_hash, session_expires_at, session_last_used_at)
-               VALUES(?, ?, ?, ?, 1, ?, ?, ?, ?, ?)""",
-            (user_id, device_name, platform, push_token, now, now, session_token_hash, session_expires_at, now),
+               app_version, session_token_hash, session_expires_at, session_last_used_at)
+               VALUES(?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)""",
+            (
+                user_id,
+                device_name,
+                platform,
+                push_token,
+                now,
+                now,
+                app_version,
+                session_token_hash,
+                session_expires_at,
+                now,
+            ),
         )
         self.conn.commit()
         device_id = cursor.lastrowid
         logger.info("Nuevo dispositivo registrado con session token: id=%d", device_id)
-        return device_id, session_token
+        return DeviceRegistration(device_id, session_token)
 
     def active_devices(self) -> list[dict]:
         """Lista dispositivos activos."""
-        rows = self.conn.execute(
-            "SELECT * FROM mobile_devices WHERE active = 1 ORDER BY last_seen_at DESC"
-        ).fetchall()
+        users_table = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'mobile_users'"
+        ).fetchone()
+        if users_table:
+            rows = self.conn.execute(
+                """SELECT d.*, u.username, u.display_name
+                     FROM mobile_devices d
+                     LEFT JOIN mobile_users u ON u.id = d.user_id
+                    WHERE d.active = 1
+                    ORDER BY d.last_seen_at DESC"""
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM mobile_devices "
+                "WHERE active = 1 ORDER BY last_seen_at DESC"
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def deactivate_device(self, device_id: int) -> None:
@@ -333,7 +440,8 @@ class EventRepository:
         now = datetime.now().isoformat(timespec="seconds")
         
         device = self.conn.execute(
-            """SELECT id, device_name, platform, push_token, active, session_expires_at
+            """SELECT id, user_id, device_name, platform, push_token, active,
+                      session_expires_at, created_at, app_version
                FROM mobile_devices
                WHERE session_token_hash = ? AND active = 1""",
             (session_token_hash,),
@@ -347,15 +455,55 @@ class EventRepository:
         if device["session_expires_at"] and device["session_expires_at"] < now:
             logger.warning("Session token expirado para dispositivo id=%d", device["id"])
             return None
+
+        # Las cuentas nuevas son revocables desde Studio. Los dispositivos
+        # históricos sin user_id siguen funcionando hasta que se vuelvan a enlazar.
+        if device["user_id"] is not None:
+            users_table = self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'mobile_users'"
+            ).fetchone()
+            if users_table:
+                user = self.conn.execute(
+                    """SELECT username, display_name, active
+                         FROM mobile_users WHERE id = ?""",
+                    (int(device["user_id"]),),
+                ).fetchone()
+                if not user or not bool(user["active"]):
+                    logger.warning(
+                        "Cuenta móvil inactiva para dispositivo id=%d",
+                        device["id"],
+                    )
+                    return None
+            else:
+                user = None
+        else:
+            user = None
         
-        # Actualizar last_used_at
+        # Sesión deslizante: mientras el vendedor use la app, no debe volver a
+        # ingresar credenciales. Studio siempre puede revocar el dispositivo.
+        renewed_expires_at = (
+            datetime.now() + timedelta(days=90)
+        ).isoformat(timespec="seconds")
         self.conn.execute(
-            "UPDATE mobile_devices SET session_last_used_at = ? WHERE id = ?",
-            (now, device["id"]),
+            """UPDATE mobile_devices
+                  SET session_last_used_at = ?, session_expires_at = ?
+                WHERE id = ?""",
+            (now, renewed_expires_at, device["id"]),
         )
         self.conn.commit()
         
-        return dict(device)
+        # Convertir a dict con nombres de campos estables
+        device_dict = dict(device)
+        # Mapear created_at a registered_at para compatibilidad
+        device_dict["registered_at"] = device_dict["created_at"]
+        # is_paused se deriva de active (0 = pausado, 1 = activo)
+        device_dict["is_paused"] = 0 if device_dict["active"] == 1 else 1
+        if user:
+            device_dict["username"] = str(user["username"])
+            device_dict["display_name"] = str(user["display_name"] or "")
+        
+        return device_dict
 
     # ── Preferencias ───────────────────────────────────────────────────────
 
@@ -429,6 +577,7 @@ class EventRepository:
         platform: str,
         device_name: str = "",
         app_version: str = "",
+        user_id: int | None = None,
     ) -> tuple[bool, str, int | None, str]:
         """Registra un dispositivo usando código de emparejamiento.
         
@@ -449,6 +598,8 @@ class EventRepository:
             push_token=push_token,
             platform=platform,
             device_name=device_name,
+            user_id=user_id,
+            app_version=app_version,
         )
         
         return True, "Dispositivo registrado exitosamente", device_id, session_token

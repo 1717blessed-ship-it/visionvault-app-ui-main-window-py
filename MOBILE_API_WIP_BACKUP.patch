@@ -1,0 +1,4058 @@
+﻿diff --git a/app/api/mobile_jobs.py b/app/api/mobile_jobs.py
+index fd12a53..78dbbd5 100644
+--- a/app/api/mobile_jobs.py
++++ b/app/api/mobile_jobs.py
+@@ -34,6 +34,37 @@ from app.workflow.timeline import (
+ 
+ logger = logging.getLogger(__name__)
+ 
++# ÔöÇÔöÇ Helpers para routing de ordenes ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
++# /api/v1/mobile/orders/{id}/status  ÔåÆ  (order_id, "/status")
++_ORDER_V1_PREFIX = "/api/v1/mobile/orders/"
++
++def _match_order_route(path: str, suffix: str) -> bool:
++    return path.startswith(_ORDER_V1_PREFIX) and path.endswith(suffix)
++
++def _extract_order_id(path: str, suffix: str) -> int | None:
++    """Extrae el order_id de una ruta /api/v1/mobile/orders/{id}/<suffix>."""
++    prefix_len = len(_ORDER_V1_PREFIX)
++    remainder = path[prefix_len:]                       # "{id}/suffix"
++    parts = remainder.split("/")
++    if len(parts) == 2 and parts[0].isdigit() and parts[1] == suffix[1:]:
++        return int(parts[0])
++    return None
++
++def _match_order_job_route(path: str) -> bool:
++    """True si path = /api/v1/mobile/orders/{oid}/jobs/{jid}."""
++    if not path.startswith(_ORDER_V1_PREFIX):
++        return False
++    remainder = path[len(_ORDER_V1_PREFIX):]
++    parts = remainder.split("/")
++    return len(parts) == 3 and parts[1] == "jobs" and parts[0].isdigit() and parts[2].isdigit()
++
++def _extract_order_job_ids(path: str) -> tuple[int, int] | None:
++    remainder = path[len(_ORDER_V1_PREFIX):]
++    parts = remainder.split("/")
++    if len(parts) == 3 and parts[1] == "jobs" and parts[0].isdigit() and parts[2].isdigit():
++        return int(parts[0]), int(parts[2])
++    return None
++
+ 
+ # Whitelist de tipos de eventos permitidos para preferencias de notificaciones
+ ALLOWED_NOTIFICATION_EVENT_TYPES: Final[frozenset[str]] = frozenset({
+@@ -146,12 +177,12 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
+     def do_POST(self) -> None:
+         """Maneja requests POST."""
+         parsed = urlparse(self.path)
+-        
++
+         # Validar autenticaci├│n
+         device = self._validate_auth()
+         if not device:
+             return
+-        
++
+         # Rutas legacy
+         if parsed.path.startswith("/api/mobile/jobs/") and parsed.path.endswith("/stage"):
+             job_id = parsed.path.split("/")[-2]
+@@ -168,6 +199,47 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
+                 self._send_error(400, "Invalid job ID")
+         elif parsed.path == "/api/v1/mobile/device/preferences":
+             self._update_device_preferences(device)
++        elif _match_order_route(parsed.path, "/deliver"):
++            order_id = _extract_order_id(parsed.path, "/deliver")
++            if order_id is not None:
++                self._mark_delivered(order_id, device)
++            else:
++                self._send_error(400, "Invalid order ID")
++        elif _match_order_route(parsed.path, "/payments"):
++            order_id = _extract_order_id(parsed.path, "/payments")
++            if order_id is not None:
++                self._register_payment(order_id, device)
++            else:
++                self._send_error(400, "Invalid order ID")
++        else:
++            self._send_error(404, "Endpoint not found")
++
++    def do_PATCH(self) -> None:
++        """Maneja requests PATCH para actualizaciones parciales."""
++        parsed = urlparse(self.path)
++
++        device = self._validate_auth()
++        if not device:
++            return
++
++        if _match_order_route(parsed.path, "/status"):
++            order_id = _extract_order_id(parsed.path, "/status")
++            if order_id is not None:
++                self._update_order_status(order_id, device)
++            else:
++                self._send_error(400, "Invalid order ID")
++        elif _match_order_route(parsed.path, "/priority"):
++            order_id = _extract_order_id(parsed.path, "/priority")
++            if order_id is not None:
++                self._update_order_priority(order_id, device)
++            else:
++                self._send_error(400, "Invalid order ID")
++        elif _match_order_job_route(parsed.path):
++            ids = _extract_order_job_ids(parsed.path)
++            if ids is not None:
++                self._update_job_fields(*ids, device)
++            else:
++                self._send_error(400, "Invalid order or job ID")
+         else:
+             self._send_error(404, "Endpoint not found")
+ 
+@@ -443,6 +515,288 @@ class MobileJobsHandler(BaseHTTPRequestHandler):
+             logger.error("Error changing job stage: %s", e)
+             self._send_error(500, f"Error changing job stage: {e}")
+ 
++    # ÔöÇÔöÇ Quick-edit handlers ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
++
++    def _read_json_body(self) -> dict | None:
++        """Lee y parsea el body JSON de un request, con validaciones comunes."""
++        content_length = int(self.headers.get("Content-Length", 0))
++        if content_length == 0:
++            self._send_error(400, "Request body is required")
++            return None
++        if content_length > 10000:
++            self._send_error(413, "Request body too large (max 10KB)")
++            return None
++        try:
++            return json.loads(self.rfile.read(content_length).decode("utf-8"))
++        except json.JSONDecodeError:
++            self._send_error(400, "Invalid JSON body")
++            return None
++
++    def _update_order_status(self, order_id: int, device: dict[str, Any]) -> None:
++        """PATCH /api/v1/mobile/orders/{id}/status ÔÇö Cambia el estado general."""
++        data = self._read_json_body()
++        if data is None:
++            return
++        new_status = data.get("status", "").strip()
++        if not new_status:
++            self._send_error(400, "status field is required")
++            return
++        if len(new_status) > 50:
++            self._send_error(400, "status too long (max 50 characters)")
++            return
++        valid_statuses = {"Pendiente", "En producci├│n", "Finalizado", "Entregado", "Archivado"}
++        if new_status not in valid_statuses:
++            self._send_error(400, f"Invalid status. Valid options: {', '.join(sorted(valid_statuses))}")
++            return
++        try:
++            order_check = self.event_repo.conn.execute(
++                "SELECT id, is_archived FROM orders WHERE id = ?", (order_id,)
++            ).fetchone()
++            if not order_check:
++                self._send_error(404, f"Order {order_id} not found")
++                return
++            if order_check["is_archived"]:
++                self._send_error(400, "Cannot modify an archived order")
++                return
++            self.event_repo.conn.execute(
++                "UPDATE orders SET status = ?, updated_at = datetime('now') WHERE id = ?",
++                (new_status, order_id),
++            )
++            self.event_repo.conn.execute(
++                """INSERT INTO order_events(order_id, event_type, message, data_json, created_at)
++                   VALUES(?, 'status.changed', ?, ?, datetime('now'))""",
++                (order_id, f"Estado actualizado a: {new_status}", json.dumps({"source": "mobile", "device_id": device["id"]})),
++            )
++            self.event_repo.conn.commit()
++            row = self.event_repo.conn.execute(
++                "SELECT id, status, updated_at FROM orders WHERE id = ?", (order_id,)
++            ).fetchone()
++            self._send_json_response(200, {"success": True, "order": dict(row)})
++        except Exception as e:
++            logger.error("Error updating order status: %s", e)
++            self._send_error(500, f"Error updating order status: {e}")
++
++    def _update_order_priority(self, order_id: int, device: dict[str, Any]) -> None:
++        """PATCH /api/v1/mobile/orders/{id}/priority ÔÇö Cambia la prioridad."""
++        data = self._read_json_body()
++        if data is None:
++            return
++        priority = data.get("print_priority")
++        if priority is None:
++            self._send_error(400, "print_priority field is required")
++            return
++        try:
++            priority = int(priority)
++        except (TypeError, ValueError):
++            self._send_error(400, "print_priority must be an integer (0-4)")
++            return
++        if priority < 0 or priority > 4:
++            self._send_error(400, "print_priority must be between 0 and 4")
++            return
++        try:
++            order_check = self.event_repo.conn.execute(
++                "SELECT id, is_archived FROM orders WHERE id = ?", (order_id,)
++            ).fetchone()
++            if not order_check:
++                self._send_error(404, f"Order {order_id} not found")
++                return
++            if order_check["is_archived"]:
++                self._send_error(400, "Cannot modify an archived order")
++                return
++            self.event_repo.conn.execute(
++                "UPDATE orders SET print_priority = ?, updated_at = datetime('now') WHERE id = ?",
++                (priority, order_id),
++            )
++            self.event_repo.conn.execute(
++                """INSERT INTO order_events(order_id, event_type, message, data_json, created_at)
++                   VALUES(?, 'priority.changed', ?, ?, datetime('now'))""",
++                (order_id, f"Prioridad actualizada a: {priority}", json.dumps({"source": "mobile", "device_id": device["id"]})),
++            )
++            self.event_repo.conn.commit()
++            row = self.event_repo.conn.execute(
++                "SELECT id, print_priority, updated_at FROM orders WHERE id = ?", (order_id,)
++            ).fetchone()
++            self._send_json_response(200, {"success": True, "order": dict(row)})
++        except Exception as e:
++            logger.error("Error updating order priority: %s", e)
++            self._send_error(500, f"Error updating order priority: {e}")
++
++    def _update_job_fields(self, order_id: int, job_id: int, device: dict[str, Any]) -> None:
++        """PATCH /api/v1/mobile/orders/{oid}/jobs/{jid} ÔÇö Modifica cantidad/tama├▒o."""
++        data = self._read_json_body()
++        if data is None:
++            return
++        quantity = data.get("quantity")
++        size = data.get("size")
++        if quantity is None and size is None:
++            self._send_error(400, "At least one of 'quantity' or 'size' is required")
++            return
++        try:
++            order_check = self.event_repo.conn.execute(
++                "SELECT id, is_archived FROM orders WHERE id = ?", (order_id,)
++            ).fetchone()
++            if not order_check:
++                self._send_error(404, f"Order {order_id} not found")
++                return
++            if order_check["is_archived"]:
++                self._send_error(400, "Cannot modify an archived order")
++                return
++            job_check = self.event_repo.conn.execute(
++                "SELECT id FROM order_jobs WHERE id = ? AND order_id = ?", (job_id, order_id)
++            ).fetchone()
++            if not job_check:
++                self._send_error(404, f"Job {job_id} not found in order {order_id}")
++                return
++            set_clauses, params = [], []
++            if quantity is not None:
++                q = max(1, int(quantity))
++                set_clauses.append("quantity = ?")
++                params.append(q)
++            if size is not None:
++                s = str(size).strip()[:20]
++                set_clauses.append("size = ?")
++                params.append(s)
++            set_clauses.append("updated_at = datetime('now')")
++            params.append(job_id)
++            self.event_repo.conn.execute(
++                f"UPDATE order_jobs SET {', '.join(set_clauses)} WHERE id = ?", params,
++            )
++            # Recalcular resumen del pedido
++            jobs = [dict(r) for r in self.event_repo.conn.execute(
++                "SELECT * FROM order_jobs WHERE order_id = ? ORDER BY sort_order, id", (order_id,)
++            )]
++            if jobs:
++                total_qty = sum(max(1, int(j.get("quantity") or 1)) for j in jobs)
++                self.event_repo.conn.execute(
++                    "UPDATE orders SET quantity = ?, updated_at = datetime('now') WHERE id = ?",
++                    (total_qty, order_id),
++                )
++            self.event_repo.conn.execute(
++                """INSERT INTO order_events(order_id, event_type, message, data_json, created_at)
++                   VALUES(?, 'job.updated', ?, ?, datetime('now'))""",
++                (order_id, f"Trabajo #{job_id} actualizado", json.dumps({"source": "mobile", "job_id": job_id, "device_id": device["id"]})),
++            )
++            self.event_repo.conn.commit()
++            row = self.event_repo.conn.execute(
++                "SELECT id, quantity, size, updated_at FROM order_jobs WHERE id = ?", (job_id,)
++            ).fetchone()
++            self._send_json_response(200, {"success": True, "job": dict(row)})
++        except Exception as e:
++            logger.error("Error updating job fields: %s", e)
++            self._send_error(500, f"Error updating job: {e}")
++
++    def _register_payment(self, order_id: int, device: dict[str, Any]) -> None:
++        """POST /api/v1/mobile/orders/{id}/payments ÔÇö Registra un cobro."""
++        data = self._read_json_body()
++        if data is None:
++            return
++        amount = data.get("amount")
++        if amount is None:
++            self._send_error(400, "amount field is required")
++            return
++        try:
++            amount = round(float(amount), 2)
++        except (TypeError, ValueError):
++            self._send_error(400, "amount must be a number")
++            return
++        if amount <= 0:
++            self._send_error(400, "amount must be greater than zero")
++            return
++        method = str(data.get("method", "")).strip()[:50]
++        note = str(data.get("note", "")).strip()[:200]
++        try:
++            order_check = self.event_repo.conn.execute(
++                "SELECT id, is_archived FROM orders WHERE id = ?", (order_id,)
++            ).fetchone()
++            if not order_check:
++                self._send_error(404, f"Order {order_id} not found")
++                return
++            if order_check["is_archived"]:
++                self._send_error(400, "Cannot modify an archived order")
++                return
++            now_str = datetime.now().isoformat(timespec="seconds")
++            self.event_repo.conn.execute(
++                """INSERT INTO order_payments(order_id, amount, method, note, paid_at, created_at)
++                   VALUES(?, ?, ?, ?, ?, ?)""",
++                (order_id, amount, method, note, now_str, now_str),
++            )
++            # Recalcular financials
++            paid = self.event_repo.conn.execute(
++                "SELECT COALESCE(SUM(amount), 0) FROM order_payments WHERE order_id = ?", (order_id,)
++            ).fetchone()[0]
++            order_row = self.event_repo.conn.execute(
++                "SELECT price, discount_percent, budget_total FROM orders WHERE id = ?", (order_id,)
++            ).fetchone()
++            budget_total = float(order_row["budget_total"] or 0) if order_row else 0.0
++            payment_status = "Pagado" if budget_total > 0 and (budget_total - float(paid)) <= 0.009 else ("Se├▒a recibida" if paid else "Pendiente")
++            self.event_repo.conn.execute(
++                "UPDATE orders SET paid_amount = ?, payment_status = ?, updated_at = ? WHERE id = ?",
++                (float(paid), payment_status, now_str, order_id),
++            )
++            self.event_repo.conn.execute(
++                """INSERT INTO order_events(order_id, event_type, message, data_json, created_at)
++                   VALUES(?, 'payment.received', ?, ?, ?)""",
++                (order_id, f"Cobro registrado: ${amount:,.2f}" + (f" ┬À {method}" if method else ""), json.dumps({"amount": amount, "method": method, "source": "mobile", "device_id": device["id"]}), now_str),
++            )
++            self.event_repo.conn.commit()
++            self._send_json_response(200, {
++                "success": True,
++                "payment": {"amount": amount, "method": method, "paid_at": now_str},
++                "financials": {"budget_total": budget_total, "paid_amount": float(paid), "payment_status": payment_status},
++            })
++        except Exception as e:
++            logger.error("Error registering payment: %s", e)
++            self._send_error(500, f"Error registering payment: {e}")
++
++    def _mark_delivered(self, order_id: int, device: dict[str, Any]) -> None:
++        """POST /api/v1/mobile/orders/{id}/deliver ÔÇö Marca pedido como entregado."""
++        try:
++            order_check = self.event_repo.conn.execute(
++                "SELECT id, status, is_archived FROM orders WHERE id = ?", (order_id,)
++            ).fetchone()
++            if not order_check:
++                self._send_error(404, f"Order {order_id} not found")
++                return
++            if order_check["is_archived"]:
++                self._send_error(400, "Cannot modify an archived order")
++                return
++            old_status = order_check["status"]
++            now_str = datetime.now().isoformat(timespec="seconds")
++            with self.event_repo.conn:
++                self.event_repo.conn.execute(
++                    "UPDATE order_jobs SET status = 'Entregado', updated_at = ? WHERE order_id = ?",
++                    (now_str, order_id),
++                )
++                self.event_repo.conn.execute(
++                    "UPDATE orders SET status = 'Entregado', updated_at = ? WHERE id = ?",
++                    (now_str, order_id),
++                )
++            self.event_repo.conn.execute(
++                """INSERT INTO order_events(order_id, event_type, message, data_json, created_at)
++                   VALUES(?, 'order.delivered', ?, ?, ?)""",
++                (order_id, f"Pedido marcado como Entregado (anterior: {old_status})", json.dumps({"source": "mobile", "old_status": old_status, "device_id": device["id"]}), now_str),
++            )
++            self.event_repo.conn.commit()
++            try:
++                self.event_bus.publish(
++                    event_type="order.delivered",
++                    title="Pedido entregado",
++                    message=f"Pedido #{order_id} marcado como Entregado",
++                    priority="high",
++                    entity_type="order",
++                    entity_id=order_id,
++                    payload={"old_status": old_status, "device_id": device["id"]},
++                )
++            except Exception:
++                pass
++            row = self.event_repo.conn.execute(
++                "SELECT id, status, updated_at FROM orders WHERE id = ?", (order_id,)
++            ).fetchone()
++            self._send_json_response(200, {"success": True, "order": dict(row)})
++        except Exception as e:
++            logger.error("Error marking order delivered: %s", e)
++            self._send_error(500, f"Error marking order delivered: {e}")
++
+     def _get_stages(self) -> None:
+         """Obtiene el cat├ílogo completo de etapas desde fuente oficial."""
+         try:
+diff --git a/app/database/database.py b/app/database/database.py
+index ce6bb31..df52585 100644
+--- a/app/database/database.py
++++ b/app/database/database.py
+@@ -1078,6 +1078,85 @@ class ImageDatabase:
+         self.connection.commit()
+         self.add_order_event(order_id, "Estado", f"Estado actualizado a: {status}.")
+ 
++    def update_order_priority(self, order_id: int, print_priority: int) -> dict:
++        from datetime import datetime
++
++        print_priority = min(4, max(0, int(print_priority or 0)))
++        now = datetime.now().isoformat(timespec="seconds")
++        self.connection.execute(
++            "UPDATE orders SET print_priority = ?, updated_at = ? WHERE id = ?",
++            (print_priority, now, order_id),
++        )
++        self.connection.commit()
++        self.add_order_event(order_id, "Prioridad", f"Prioridad actualizada a: {print_priority}.")
++        row = self.connection.execute(
++            "SELECT id, print_priority, updated_at FROM orders WHERE id = ?", (order_id,)
++        ).fetchone()
++        return dict(row) if row else {"id": order_id, "print_priority": print_priority, "updated_at": now}
++
++    def update_job_fields(self, order_id: int, job_id: int, quantity: int | None = None, size: str | None = None) -> dict:
++        from datetime import datetime
++
++        now = datetime.now().isoformat(timespec="seconds")
++        job = self.connection.execute(
++            "SELECT id, order_id, quantity, size FROM order_jobs WHERE id = ? AND order_id = ?",
++            (job_id, order_id),
++        ).fetchone()
++        if not job:
++            raise ValueError("Trabajo no encontrado en este pedido.")
++        new_quantity = max(1, int(quantity if quantity is not None else job["quantity"]))
++        new_size = str(size if size is not None else job["size"]).strip()
++        self.connection.execute(
++            "UPDATE order_jobs SET quantity = ?, size = ?, updated_at = ? WHERE id = ?",
++            (new_quantity, new_size, now, job_id),
++        )
++        self._sync_order_from_jobs(order_id, now)
++        self.connection.commit()
++        self.add_order_event(order_id, "Trabajo", f"Trabajo #{job_id}: cantidad={new_quantity}, tama├▒o={new_size}.")
++        row = self.connection.execute(
++            "SELECT id, quantity, size, updated_at FROM order_jobs WHERE id = ?", (job_id,)
++        ).fetchone()
++        return dict(row) if row else {"id": job_id, "quantity": new_quantity, "size": new_size, "updated_at": now}
++
++    def mark_order_delivered(self, order_id: int) -> dict:
++        from datetime import datetime
++
++        now = datetime.now().isoformat(timespec="seconds")
++        order = self.connection.execute(
++            "SELECT id, status FROM orders WHERE id = ? AND is_archived = 0", (order_id,)
++        ).fetchone()
++        if not order:
++            raise ValueError("Pedido no encontrado o archivado.")
++        current = order["status"]
++        if current == "Entregado":
++            raise ValueError("El pedido ya est├í marcado como Entregado.")
++        with self.connection:
++            self.connection.execute(
++                "UPDATE order_jobs SET status = 'Entregado', updated_at = ? WHERE order_id = ?",
++                (now, order_id),
++            )
++            self.connection.execute(
++                "UPDATE orders SET status = 'Entregado', updated_at = ? WHERE id = ?",
++                (now, order_id),
++            )
++        self.add_order_event(order_id, "Entrega", f"Pedido marcado como Entregado (estado anterior: {current}).")
++        try:
++            self.event_repo.publish_event(
++                event_type="order.delivered",
++                priority="high",
++                title="Pedido entregado",
++                message=f"Pedido #{order_id} marcado como Entregado",
++                entity_type="order",
++                entity_id=order_id,
++                payload={"old_status": current},
++            )
++        except Exception:
++            pass
++        row = self.connection.execute(
++            "SELECT id, status, updated_at FROM orders WHERE id = ?", (order_id,)
++        ).fetchone()
++        return dict(row) if row else {"id": order_id, "status": "Entregado", "updated_at": now}
++
+     def archive_order(self, order_id: int) -> None:
+         """Marca el pedido como Archivado sin eliminar ning├║n dato."""
+         self.update_order_status(order_id, "Archivado")
+diff --git a/mobile/doccione_mobile/lib/database/clients_repository.dart b/mobile/doccione_mobile/lib/database/clients_repository.dart
+index 739f839..c68306e 100644
+--- a/mobile/doccione_mobile/lib/database/clients_repository.dart
++++ b/mobile/doccione_mobile/lib/database/clients_repository.dart
+@@ -9,11 +9,11 @@ class ClientsRepository {
+   ClientsRepository(this._dbHelper);
+ 
+   /// Upsert a single client (insert or update if exists)
+-  Future<void> upsertClient(Map<String, dynamic> clientData) async {
+-    final db = await _dbHelper.database;
++  Future<void> upsertClient(Map<String, dynamic> clientData, {Transaction? txn}) async {
++    final executor = txn ?? await _dbHelper.database;
+     final client = Client.fromMap(clientData);
+-    
+-    await db.insert(
++
++    await executor.insert(
+       'clients',
+       client.toMap(),
+       conflictAlgorithm: ConflictAlgorithm.replace,
+@@ -21,9 +21,9 @@ class ClientsRepository {
+   }
+ 
+   /// Upsert multiple clients in a batch operation
+-  Future<void> upsertClients(List<Map<String, dynamic>> clientsData) async {
+-    final db = await _dbHelper.database;
+-    final batch = db.batch();
++  Future<void> upsertClients(List<Map<String, dynamic>> clientsData, {Transaction? txn}) async {
++    final executor = txn ?? await _dbHelper.database;
++    final batch = executor.batch();
+ 
+     for (final clientData in clientsData) {
+       final client = Client.fromMap(clientData);
+diff --git a/mobile/doccione_mobile/lib/database/database_helper.dart b/mobile/doccione_mobile/lib/database/database_helper.dart
+index 48f1e17..bcd12b6 100644
+--- a/mobile/doccione_mobile/lib/database/database_helper.dart
++++ b/mobile/doccione_mobile/lib/database/database_helper.dart
+@@ -4,7 +4,7 @@ import 'package:path_provider/path_provider.dart';
+ 
+ /// Helper class for SQLite database operations with versioning support
+ class DatabaseHelper {
+-  static const int _databaseVersion = 2;
++  static const int _databaseVersion = 3;
+   static const String _databaseName = 'doccione_mobile.db';
+ 
+   static DatabaseHelper? _instance;
+@@ -60,9 +60,15 @@ class DatabaseHelper {
+     await db.execute('''
+       CREATE TABLE jobs (
+         id TEXT PRIMARY KEY,
++        order_id TEXT,
+         job_number TEXT,
+         title TEXT,
++        material TEXT,
++        size TEXT,
++        quantity INTEGER,
+         status TEXT,
++        notes TEXT,
++        sort_order INTEGER,
+         priority TEXT,
+         client_id TEXT,
+         assigned_to TEXT,
+@@ -85,7 +91,18 @@ class DatabaseHelper {
+         order_number TEXT,
+         job_id TEXT,
+         client_id TEXT,
++        client TEXT,
++        whatsapp TEXT,
+         status TEXT,
++        material TEXT,
++        size TEXT,
++        quantity INTEGER,
++        delivery_date TEXT,
++        print_priority TEXT,
++        is_archived INTEGER,
++        observations TEXT,
++        order_concept TEXT,
++        order_description TEXT,
+         total_amount REAL,
+         currency TEXT,
+         order_date TEXT,
+@@ -161,6 +178,29 @@ class DatabaseHelper {
+         });
+       }
+     }
++
++    if (oldVersion < 3) {
++      // Phase 4: add columns to jobs table
++      await db.execute('ALTER TABLE jobs ADD COLUMN order_id TEXT');
++      await db.execute('ALTER TABLE jobs ADD COLUMN material TEXT');
++      await db.execute('ALTER TABLE jobs ADD COLUMN size TEXT');
++      await db.execute('ALTER TABLE jobs ADD COLUMN quantity INTEGER');
++      await db.execute('ALTER TABLE jobs ADD COLUMN notes TEXT');
++      await db.execute('ALTER TABLE jobs ADD COLUMN sort_order INTEGER');
++
++      // Phase 4: add columns to orders table
++      await db.execute('ALTER TABLE orders ADD COLUMN client TEXT');
++      await db.execute('ALTER TABLE orders ADD COLUMN whatsapp TEXT');
++      await db.execute('ALTER TABLE orders ADD COLUMN material TEXT');
++      await db.execute('ALTER TABLE orders ADD COLUMN size TEXT');
++      await db.execute('ALTER TABLE orders ADD COLUMN quantity INTEGER');
++      await db.execute('ALTER TABLE orders ADD COLUMN delivery_date TEXT');
++      await db.execute('ALTER TABLE orders ADD COLUMN print_priority TEXT');
++      await db.execute('ALTER TABLE orders ADD COLUMN is_archived INTEGER');
++      await db.execute('ALTER TABLE orders ADD COLUMN observations TEXT');
++      await db.execute('ALTER TABLE orders ADD COLUMN order_concept TEXT');
++      await db.execute('ALTER TABLE orders ADD COLUMN order_description TEXT');
++    }
+   }
+ 
+   /// Close the database connection
+diff --git a/mobile/doccione_mobile/lib/database/jobs_repository.dart b/mobile/doccione_mobile/lib/database/jobs_repository.dart
+index 5fe75bb..b2de27e 100644
+--- a/mobile/doccione_mobile/lib/database/jobs_repository.dart
++++ b/mobile/doccione_mobile/lib/database/jobs_repository.dart
+@@ -9,11 +9,11 @@ class JobsRepository {
+   JobsRepository(this._dbHelper);
+ 
+   /// Upsert a single job (insert or update if exists)
+-  Future<void> upsertJob(Map<String, dynamic> jobData) async {
+-    final db = await _dbHelper.database;
++  Future<void> upsertJob(Map<String, dynamic> jobData, {Transaction? txn}) async {
++    final executor = txn ?? await _dbHelper.database;
+     final job = Job.fromMap(jobData);
+-    
+-    await db.insert(
++
++    await executor.insert(
+       'jobs',
+       job.toMap(),
+       conflictAlgorithm: ConflictAlgorithm.replace,
+@@ -21,9 +21,9 @@ class JobsRepository {
+   }
+ 
+   /// Upsert multiple jobs in a batch operation
+-  Future<void> upsertJobs(List<Map<String, dynamic>> jobsData) async {
+-    final db = await _dbHelper.database;
+-    final batch = db.batch();
++  Future<void> upsertJobs(List<Map<String, dynamic>> jobsData, {Transaction? txn}) async {
++    final executor = txn ?? await _dbHelper.database;
++    final batch = executor.batch();
+ 
+     for (final jobData in jobsData) {
+       final job = Job.fromMap(jobData);
+diff --git a/mobile/doccione_mobile/lib/database/orders_repository.dart b/mobile/doccione_mobile/lib/database/orders_repository.dart
+index b5fad8c..55099bd 100644
+--- a/mobile/doccione_mobile/lib/database/orders_repository.dart
++++ b/mobile/doccione_mobile/lib/database/orders_repository.dart
+@@ -16,11 +16,11 @@ class OrdersRepository {
+   OrdersRepository(this._dbHelper);
+ 
+   /// Upsert a single order (insert or update if exists)
+-  Future<void> upsertOrder(Map<String, dynamic> orderData) async {
+-    final db = await _dbHelper.database;
++  Future<void> upsertOrder(Map<String, dynamic> orderData, {Transaction? txn}) async {
++    final executor = txn ?? await _dbHelper.database;
+     final order = Order.fromMap(orderData);
+-    
+-    await db.insert(
++
++    await executor.insert(
+       'orders',
+       order.toMap(),
+       conflictAlgorithm: ConflictAlgorithm.replace,
+@@ -28,9 +28,9 @@ class OrdersRepository {
+   }
+ 
+   /// Upsert multiple orders in a batch operation
+-  Future<void> upsertOrders(List<Map<String, dynamic>> ordersData) async {
+-    final db = await _dbHelper.database;
+-    final batch = db.batch();
++  Future<void> upsertOrders(List<Map<String, dynamic>> ordersData, {Transaction? txn}) async {
++    final executor = txn ?? await _dbHelper.database;
++    final batch = executor.batch();
+ 
+     for (final orderData in ordersData) {
+       final order = Order.fromMap(orderData);
+diff --git a/mobile/doccione_mobile/lib/database/sync_state_repository.dart b/mobile/doccione_mobile/lib/database/sync_state_repository.dart
+index 2f15e6f..a837266 100644
+--- a/mobile/doccione_mobile/lib/database/sync_state_repository.dart
++++ b/mobile/doccione_mobile/lib/database/sync_state_repository.dart
+@@ -31,9 +31,9 @@ class SyncStateRepository {
+   }
+ 
+   /// Set the current next cursor
+-  Future<void> setCurrentNextCursor(String? cursor) async {
+-    final db = await _dbHelper.database;
+-    await db.update(
++  Future<void> setCurrentNextCursor(String? cursor, {Transaction? txn}) async {
++    final executor = txn ?? await _dbHelper.database;
++    await executor.update(
+       'sync_state',
+       {'current_next_cursor': cursor},
+       where: 'id = ?',
+@@ -83,9 +83,9 @@ class SyncStateRepository {
+   }
+ 
+   /// Complete a full sync (clear cursor, update snapshot)
+-  Future<void> completeSync(String snapshot) async {
+-    final db = await _dbHelper.database;
+-    await db.update(
++  Future<void> completeSync(String snapshot, {Transaction? txn}) async {
++    final executor = txn ?? await _dbHelper.database;
++    await executor.update(
+       'sync_state',
+       {
+         'last_completed_snapshot': snapshot,
+diff --git a/mobile/doccione_mobile/lib/models/client.dart b/mobile/doccione_mobile/lib/models/client.dart
+index 124635b..f22753f 100644
+--- a/mobile/doccione_mobile/lib/models/client.dart
++++ b/mobile/doccione_mobile/lib/models/client.dart
+@@ -40,7 +40,7 @@ class Client {
+ 
+   factory Client.fromMap(Map<String, dynamic> map) {
+     return Client(
+-      id: map['id'] as String,
++      id: map['id'].toString(),
+       name: map['name'] as String?,
+       email: map['email'] as String?,
+       phone: map['phone'] as String?,
+diff --git a/mobile/doccione_mobile/lib/models/job.dart b/mobile/doccione_mobile/lib/models/job.dart
+index 1542069..ba503f3 100644
+--- a/mobile/doccione_mobile/lib/models/job.dart
++++ b/mobile/doccione_mobile/lib/models/job.dart
+@@ -64,8 +64,8 @@ class Job {
+ 
+   factory Job.fromMap(Map<String, dynamic> map) {
+     return Job(
+-      id: map['id'] as String,
+-      orderId: map['order_id'] as String?,
++      id: map['id'].toString(),
++      orderId: map['order_id']?.toString(),
+       jobNumber: map['job_number'] as String?,
+       title: map['title'] as String?,
+       material: map['material'] as String?,
+@@ -75,7 +75,7 @@ class Job {
+       notes: map['notes'] as String?,
+       sortOrder: map['sort_order'] as int?,
+       priority: map['priority'] as String?,
+-      clientId: map['client_id'] as String?,
++      clientId: map['client_id']?.toString(),
+       assignedTo: map['assigned_to'] as String?,
+       dueDate: map['due_date'] as String?,
+       createdAt: map['created_at'] as String?,
+diff --git a/mobile/doccione_mobile/lib/models/order.dart b/mobile/doccione_mobile/lib/models/order.dart
+index 219d75d..00de512 100644
+--- a/mobile/doccione_mobile/lib/models/order.dart
++++ b/mobile/doccione_mobile/lib/models/order.dart
+@@ -79,10 +79,10 @@ class Order {
+ 
+   factory Order.fromMap(Map<String, dynamic> map) {
+     return Order(
+-      id: map['id'] as String,
++      id: map['id'].toString(),
+       orderNumber: map['order_number'] as String?,
+-      jobId: map['job_id'] as String?,
+-      clientId: map['client_id'] as String?,
++      jobId: map['job_id']?.toString(),
++      clientId: map['client_id']?.toString(),
+       client: map['client'] as String?,
+       whatsapp: map['whatsapp'] as String?,
+       status: map['status'] as String?,
+@@ -90,7 +90,7 @@ class Order {
+       size: map['size'] as String?,
+       quantity: map['quantity'] as int?,
+       deliveryDate: map['delivery_date'] as String?,
+-      printPriority: map['print_priority'] as String?,
++      printPriority: map['print_priority']?.toString(),
+       isArchived: map['is_archived'] == 1,
+       observations: map['observations'] as String?,
+       orderConcept: map['order_concept'] as String?,
+diff --git a/mobile/doccione_mobile/lib/screens/dashboard_screen.dart b/mobile/doccione_mobile/lib/screens/dashboard_screen.dart
+index 7d3f971..11a9eba 100644
+--- a/mobile/doccione_mobile/lib/screens/dashboard_screen.dart
++++ b/mobile/doccione_mobile/lib/screens/dashboard_screen.dart
+@@ -246,7 +246,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
+                 ),
+               )
+             else
+-              DashboardMetricsCard(metrics: _metrics),
++              DashboardMetricsCard(metrics: _metrics, sessionToken: widget.sessionToken),
+             
+             const SizedBox(height: 16),
+ 
+@@ -258,7 +258,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
+                   Navigator.push(
+                     context,
+                     MaterialPageRoute(
+-                      builder: (context) => const OrdersListScreen(),
++                      builder: (context) => OrdersListScreen(sessionToken: widget.sessionToken),
+                     ),
+                   );
+                 },
+diff --git a/mobile/doccione_mobile/lib/screens/order_detail_screen.dart b/mobile/doccione_mobile/lib/screens/order_detail_screen.dart
+index 577dd8f..43feab1 100644
+--- a/mobile/doccione_mobile/lib/screens/order_detail_screen.dart
++++ b/mobile/doccione_mobile/lib/screens/order_detail_screen.dart
+@@ -1,262 +1,344 @@
++import 'dart:async';
+ import 'package:flutter/material.dart';
++import 'package:doccione_mobile/models/order.dart';
+ import 'package:doccione_mobile/models/order_with_details.dart';
+ import 'package:doccione_mobile/widgets/job_detail_card.dart';
++import 'package:doccione_mobile/widgets/quick_action_sheet.dart';
++import 'package:doccione_mobile/services/quick_edit_api_client.dart';
+ 
+ /// Screen to display detailed information about an order
+-class OrderDetailScreen extends StatelessWidget {
++class OrderDetailScreen extends StatefulWidget {
+   final OrderWithDetails orderDetails;
+   final VoidCallback? onContactWhatsApp;
++  final QuickEditApiClient? apiClient;
++  final VoidCallback? onRefresh;
+ 
+   const OrderDetailScreen({
+     super.key,
+     required this.orderDetails,
+     this.onContactWhatsApp,
++    this.apiClient,
++    this.onRefresh,
+   });
+ 
+   @override
+-  Widget build(BuildContext context) {
+-    final order = orderDetails.order;
++  State<OrderDetailScreen> createState() => _OrderDetailScreenState();
++}
++
++class _OrderDetailScreenState extends State<OrderDetailScreen>
++    with SingleTickerProviderStateMixin {
++  late OrderWithDetails _orderDetails;
++  DateTime? _lastSyncTime;
++  bool _isSaving = false;
++
++  // ÔöÇÔöÇ Status change animation ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
++  late AnimationController _statusAnimController;
++  late Animation<Color?> _statusColorAnimation;
++  Color? _statusFlashColor;
++
++  @override
++  void initState() {
++    super.initState();
++    _orderDetails = widget.orderDetails;
++    _lastSyncTime = DateTime.now();
++    _statusAnimController = AnimationController(
++      vsync: this,
++      duration: const Duration(milliseconds: 600),
++    );
++  }
++
++  @override
++  void dispose() {
++    _statusAnimController.dispose();
++    super.dispose();
++  }
++
++  @override
++  void didUpdateWidget(covariant OrderDetailScreen oldWidget) {
++    super.didUpdateWidget(oldWidget);
++    if (widget.orderDetails != oldWidget.orderDetails) {
++      _orderDetails = widget.orderDetails;
++    }
++  }
++
++  Order get _order => _orderDetails.order;
++  bool get _hasApi => widget.apiClient != null;
++  int? get _orderId => int.tryParse(_order.id);
++
++  void _openQuickAction(QuickAction action, {int? jobId, String? currentStage, int? currentQuantity, String? currentSize}) {
++    if (!_hasApi || _orderId == null) return;
++    setState(() => _isSaving = true);
++    QuickActionSheet.show(
++      context,
++      action: action,
++      api: widget.apiClient!,
++      orderId: _orderId!,
++      onSuccess: () => _applyEdit(action),
++      jobId: jobId,
++      currentStatus: _order.status,
++      currentPriority: int.tryParse(_order.printPriority ?? '') ?? 0,
++      currentStage: currentStage,
++      currentQuantity: currentQuantity,
++      currentSize: currentSize,
++    );
++  }
+ 
++  void _applyEdit(QuickAction action) {
++    setState(() {
++      _isSaving = false;
++      _lastSyncTime = DateTime.now();
++      switch (action) {
++        case QuickAction.status:
++          widget.onRefresh?.call();
++          _flashStatusBadge();
++          return;
++        case QuickAction.priority:
++          widget.onRefresh?.call();
++          return;
++        case QuickAction.delivery:
++          _orderDetails = OrderWithDetails(
++            order: _order.copyWith(status: 'Entregado'),
++            client: _orderDetails.client,
++            jobs: _orderDetails.jobs.map((j) => j.copyWith(status: 'Entregado')).toList(),
++          );
++          _flashStatusBadge();
++          break;
++        case QuickAction.payment:
++          widget.onRefresh?.call();
++          return;
++        case QuickAction.jobStage:
++        case QuickAction.jobQuantitySize:
++          widget.onRefresh?.call();
++          return;
++      }
++    });
++  }
++
++  void _flashStatusBadge() {
++    final currentBg = _getStatusColor(_order.status ?? '');
++    _statusColorAnimation = ColorTween(
++      begin: Colors.green.shade300,
++      end: currentBg,
++    ).animate(CurvedAnimation(
++      parent: _statusAnimController,
++      curve: Curves.easeOut,
++    ));
++    _statusAnimController.forward(from: 0).then((_) {
++      setState(() => _statusFlashColor = null);
++    });
++  }
++
++  Color _getStatusColor(String status) {
++    switch (status.toLowerCase()) {
++      case 'pending': return Colors.blue.shade50;
++      case 'production': return Colors.orange.shade50;
++      case 'completed': return Colors.green.shade50;
++      case 'delivered': return Colors.purple.shade50;
++      case 'cancelled': return Colors.red.shade50;
++      default: return Colors.grey.shade50;
++    }
++  }
++
++  void _onJobEdited(int jobIndex, {String? status, int? quantity, String? size}) {
++    final jobs = List.of(_orderDetails.jobs);
++    if (jobIndex < 0 || jobIndex >= jobs.length) return;
++    final old = jobs[jobIndex];
++    jobs[jobIndex] = old.copyWith(
++      status: status ?? old.status,
++      quantity: quantity ?? old.quantity,
++      size: size ?? old.size,
++    );
++    setState(() {
++      _orderDetails = OrderWithDetails(
++        order: _orderDetails.order,
++        client: _orderDetails.client,
++        jobs: jobs,
++      );
++      _lastSyncTime = DateTime.now();
++    });
++  }
++
++  @override
++  Widget build(BuildContext context) {
+     return Scaffold(
+       appBar: AppBar(
+-        title: Text('Pedido #${order.orderNumber ?? order.id.substring(0, 8)}'),
++        title: Text('Pedido #${_order.orderNumber ?? (_order.id.length > 8 ? _order.id.substring(0, 8) : _order.id)}'),
+         actions: [
+-          // WhatsApp button - only show if callback provided and number available
+-          if (onContactWhatsApp != null && _hasWhatsAppNumber())
++          if (_hasApi && _orderId != null)
++            PopupMenuButton<String>(
++              icon: const Icon(Icons.edit),
++              tooltip: 'Edici├│n r├ípida',
++              onSelected: (action) => _handleQuickAction(action),
++              itemBuilder: (context) => [
++                const PopupMenuItem(value: 'status', child: Text('Cambiar estado')),
++                const PopupMenuItem(value: 'priority', child: Text('Cambiar prioridad')),
++                const PopupMenuItem(value: 'deliver', child: Text('Marcar entregado')),
++                const PopupMenuItem(value: 'payment', child: Text('Registrar cobro')),
++              ],
++            ),
++          if (widget.onContactWhatsApp != null && _hasWhatsAppNumber())
+             IconButton(
+               icon: const Icon(Icons.chat),
+-              onPressed: onContactWhatsApp,
++              onPressed: widget.onContactWhatsApp,
+               tooltip: 'Contactar por WhatsApp',
+             ),
+         ],
+       ),
+-      body: SingleChildScrollView(
+-        child: Column(
+-          crossAxisAlignment: CrossAxisAlignment.start,
+-          children: [
+-            // Order header card
+-            Card(
+-              margin: const EdgeInsets.all(16),
+-              child: Padding(
+-                padding: const EdgeInsets.all(16),
+-                child: Column(
+-                  crossAxisAlignment: CrossAxisAlignment.start,
++      body: Column(
++        children: [
++          _buildSyncIndicator(),
++          Expanded(
++            child: SingleChildScrollView(
++              child: _buildContent(),
++            ),
++          ),
++        ],
++      ),
++    );
++  }
++
++  Widget _buildSyncIndicator() {
++    if (!_hasApi) return const SizedBox.shrink();
++    return Container(
++      width: double.infinity,
++      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
++      color: _isSaving ? Colors.orange.shade50 : Colors.green.shade50,
++      child: Row(
++        children: [
++          Icon(
++            _isSaving ? Icons.sync : Icons.check_circle_outline,
++            size: 14,
++            color: _isSaving ? Colors.orange.shade700 : Colors.green.shade700,
++          ),
++          const SizedBox(width: 6),
++          Text(
++            _isSaving ? 'Guardando...' : _formatSyncTime(),
++            style: TextStyle(
++              fontSize: 12,
++              color: _isSaving ? Colors.orange.shade700 : Colors.green.shade700,
++            ),
++          ),
++        ],
++      ),
++    );
++  }
++
++  String _formatSyncTime() {
++    if (_lastSyncTime == null) return 'Sincronizado';
++    final diff = DateTime.now().difference(_lastSyncTime!);
++    if (diff.inSeconds < 5) return 'Sincronizado ahora';
++    if (diff.inSeconds < 60) return 'Sincronizado hace ${diff.inSeconds}s';
++    if (diff.inMinutes < 60) return 'Sincronizado hace ${diff.inMinutes}m';
++    return 'Sincronizado hace ${diff.inHours}h';
++  }
++
++  Widget _buildContent() {
++    return Column(
++      crossAxisAlignment: CrossAxisAlignment.start,
++      children: [
++        Card(
++          margin: const EdgeInsets.all(16),
++          child: Padding(
++            padding: const EdgeInsets.all(16),
++            child: Column(
++              crossAxisAlignment: CrossAxisAlignment.start,
++              children: [
++                Row(
+                   children: [
+-                    // Status and Priority
+-                    Row(
+-                      children: [
+-                        _buildStatusBadge(context),
+-                        const SizedBox(width: 8),
+-                        if (order.printPriority != null && order.printPriority!.isNotEmpty)
+-                          _buildPriorityBadge(context),
+-                      ],
+-                    ),
+-                    const SizedBox(height: 16),
+-                    // Client
+-                    _buildInfoSection(
+-                      context,
+-                      Icons.person,
+-                      'Cliente',
+-                      orderDetails.client?.name ?? order.client ?? 'Sin cliente',
+-                    ),
+-                    // WhatsApp
+-                    if (_getWhatsAppNumber() != null)
+-                      _buildInfoSection(
+-                        context,
+-                        Icons.phone,
+-                        'WhatsApp',
+-                        _getWhatsAppNumber()!,
+-                      ),
+-                    // Order Date
+-                    _buildInfoSection(
+-                      context,
+-                      Icons.calendar_today,
+-                      'Fecha del pedido',
+-                      orderDetails.formattedOrderDate,
+-                    ),
+-                    // Delivery Date
+-                    _buildInfoSection(
+-                      context,
+-                      Icons.event,
+-                      'Fecha de entrega',
+-                      orderDetails.formattedDeliveryDate,
+-                    ),
+-                    // Material
+-                    if (order.material != null && order.material!.isNotEmpty)
+-                      _buildInfoSection(
+-                        context,
+-                        Icons.category,
+-                        'Material',
+-                        order.material!,
+-                      ),
+-                    // Size
+-                    if (order.size != null && order.size!.isNotEmpty)
+-                      _buildInfoSection(
+-                        context,
+-                        Icons.straighten,
+-                        'Tama├▒o',
+-                        order.size!,
+-                      ),
+-                    // Quantity
+-                    if (order.quantity != null)
+-                      _buildInfoSection(
+-                        context,
+-                        Icons.format_list_numbered,
+-                        'Cantidad',
+-                        '${order.quantity}',
+-                      ),
++                    _buildStatusBadge(context),
++                    const SizedBox(width: 8),
++                    if (_order.printPriority != null && _order.printPriority!.isNotEmpty)
++                      _buildPriorityBadge(context),
+                   ],
+                 ),
+-              ),
++                const SizedBox(height: 16),
++                _buildInfoSection(context, Icons.person, 'Cliente', _orderDetails.client?.name ?? _order.client ?? 'Sin cliente'),
++                if (_getWhatsAppNumber() != null)
++                  _buildInfoSection(context, Icons.phone, 'WhatsApp', _getWhatsAppNumber()!),
++                _buildInfoSection(context, Icons.calendar_today, 'Fecha del pedido', _orderDetails.formattedOrderDate),
++                _buildInfoSection(context, Icons.event, 'Fecha de entrega', _orderDetails.formattedDeliveryDate),
++                if (_order.material != null && _order.material!.isNotEmpty)
++                  _buildInfoSection(context, Icons.category, 'Material', _order.material!),
++                if (_order.size != null && _order.size!.isNotEmpty)
++                  _buildInfoSection(context, Icons.straighten, 'Tama├▒o', _order.size!),
++                if (_order.quantity != null)
++                  _buildInfoSection(context, Icons.format_list_numbered, 'Cantidad', '${_order.quantity}'),
++              ],
+             ),
+-            // Concept
+-            if (order.orderConcept != null && order.orderConcept!.isNotEmpty)
+-              Card(
+-                margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+-                child: Padding(
+-                  padding: const EdgeInsets.all(16),
+-                  child: Column(
+-                    crossAxisAlignment: CrossAxisAlignment.start,
+-                    children: [
+-                      Row(
+-                        children: [
+-                          Icon(Icons.lightbulb_outline, color: Colors.grey[600]),
+-                          const SizedBox(width: 8),
+-                          Text(
+-                            'Concepto',
+-                            style: Theme.of(context).textTheme.titleSmall?.copyWith(
+-                                  fontWeight: FontWeight.bold,
+-                                ),
+-                          ),
+-                        ],
+-                      ),
+-                      const SizedBox(height: 8),
+-                      Text(
+-                        order.orderConcept!,
+-                        style: Theme.of(context).textTheme.bodyMedium,
+-                      ),
+-                    ],
+-                  ),
+-                ),
+-              ),
+-            // Description
+-            if (order.orderDescription != null && order.orderDescription!.isNotEmpty)
+-              Card(
+-                margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+-                child: Padding(
+-                  padding: const EdgeInsets.all(16),
+-                  child: Column(
+-                    crossAxisAlignment: CrossAxisAlignment.start,
+-                    children: [
+-                      Row(
+-                        children: [
+-                          Icon(Icons.description_outlined, color: Colors.grey[600]),
+-                          const SizedBox(width: 8),
+-                          Text(
+-                            'Descripci├│n',
+-                            style: Theme.of(context).textTheme.titleSmall?.copyWith(
+-                                  fontWeight: FontWeight.bold,
+-                                ),
+-                          ),
+-                        ],
+-                      ),
+-                      const SizedBox(height: 8),
+-                      Text(
+-                        order.orderDescription!,
+-                        style: Theme.of(context).textTheme.bodyMedium,
+-                      ),
+-                    ],
+-                  ),
+-                ),
+-              ),
+-            // Observations
+-            if (order.observations != null && order.observations!.isNotEmpty)
+-              Card(
+-                margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+-                child: Padding(
+-                  padding: const EdgeInsets.all(16),
+-                  child: Column(
+-                    crossAxisAlignment: CrossAxisAlignment.start,
+-                    children: [
+-                      Row(
+-                        children: [
+-                          Icon(Icons.note_outlined, color: Colors.grey[600]),
+-                          const SizedBox(width: 8),
+-                          Text(
+-                            'Observaciones',
+-                            style: Theme.of(context).textTheme.titleSmall?.copyWith(
+-                                  fontWeight: FontWeight.bold,
+-                                ),
+-                          ),
+-                        ],
+-                      ),
+-                      const SizedBox(height: 8),
+-                      Text(
+-                        order.observations!,
+-                        style: Theme.of(context).textTheme.bodyMedium,
+-                      ),
+-                    ],
+-                  ),
+-                ),
+-              ),
+-            // Jobs section
+-            Padding(
+-              padding: const EdgeInsets.fromLTRB(16, 24, 16, 12),
+-              child: Row(
+-                children: [
+-                  Icon(Icons.work_outline, color: Colors.grey[700]),
+-                  const SizedBox(width: 8),
+-                  Text(
+-                    'Trabajos (${orderDetails.jobsCount})',
+-                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
+-                          fontWeight: FontWeight.bold,
+-                        ),
+-                  ),
+-                ],
++          ),
++        ),
++        if (_order.orderConcept != null && _order.orderConcept!.isNotEmpty)
++          _buildConceptCard(context),
++        if (_order.orderDescription != null && _order.orderDescription!.isNotEmpty)
++          _buildDescriptionCard(context),
++        if (_order.observations != null && _order.observations!.isNotEmpty)
++          _buildObservationsCard(context),
++        Padding(
++          padding: const EdgeInsets.fromLTRB(16, 24, 16, 12),
++          child: Row(
++            children: [
++              Icon(Icons.work_outline, color: Colors.grey[700]),
++              const SizedBox(width: 8),
++              Text(
++                'Trabajos (${_orderDetails.jobsCount})',
++                style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
+               ),
++            ],
++          ),
++        ),
++        if (_orderDetails.hasJobs)
++          Padding(
++            padding: const EdgeInsets.symmetric(horizontal: 16),
++            child: Column(
++              children: _orderDetails.jobs
++                  .asMap()
++                  .entries
++                  .map(
++                    (entry) => JobDetailCard(
++                      job: entry.value,
++                      index: entry.key,
++                      apiClient: widget.apiClient,
++                      orderId: _orderId,
++                      onRefresh: widget.onRefresh,
++                      onJobEdited: (status, quantity, size) => _onJobEdited(entry.key, status: status, quantity: quantity, size: size),
++                    ),
++                  )
++                  .toList(),
+             ),
+-            // Jobs list
+-            if (orderDetails.hasJobs)
+-              Padding(
+-                padding: const EdgeInsets.symmetric(horizontal: 16),
+-                child: Column(
+-                  children: orderDetails.jobs
+-                      .asMap()
+-                      .entries
+-                      .map(
+-                        (entry) => JobDetailCard(
+-                          job: entry.value,
+-                          index: entry.key,
+-                        ),
+-                      )
+-                      .toList(),
+-                ),
+-              )
+-            else
+-              Padding(
+-                padding: const EdgeInsets.all(16),
+-                child: Center(
+-                  child: Text(
+-                    'No hay trabajos asociados a este pedido',
+-                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+-                          color: Colors.grey[600],
+-                        ),
+-                  ),
+-                ),
++          )
++        else
++          Padding(
++            padding: const EdgeInsets.all(16),
++            child: Center(
++              child: Text(
++                'No hay trabajos asociados a este pedido',
++                style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: Colors.grey[600]),
+               ),
+-            const SizedBox(height: 24),
+-          ],
+-        ),
+-      ),
++            ),
++          ),
++        const SizedBox(height: 24),
++      ],
+     );
+   }
+ 
+-  Widget _buildInfoSection(
+-    BuildContext context,
+-    IconData icon,
+-    String label,
+-    String value,
+-  ) {
++  void _handleQuickAction(String action) {
++    switch (action) {
++      case 'status':
++        _openQuickAction(QuickAction.status);
++        break;
++      case 'priority':
++        _openQuickAction(QuickAction.priority);
++        break;
++      case 'deliver':
++        _openQuickAction(QuickAction.delivery);
++        break;
++      case 'payment':
++        _openQuickAction(QuickAction.payment);
++        break;
++    }
++  }
++
++  Widget _buildInfoSection(BuildContext context, IconData icon, String label, String value) {
+     return Padding(
+       padding: const EdgeInsets.only(bottom: 12),
+       child: Row(
+@@ -268,20 +350,9 @@ class OrderDetailScreen extends StatelessWidget {
+             child: Column(
+               crossAxisAlignment: CrossAxisAlignment.start,
+               children: [
+-                Text(
+-                  label,
+-                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+-                        color: Colors.grey[600],
+-                        fontWeight: FontWeight.w500,
+-                      ),
+-                ),
++                Text(label, style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.grey[600], fontWeight: FontWeight.w500)),
+                 const SizedBox(height: 2),
+-                Text(
+-                  value,
+-                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+-                        fontWeight: FontWeight.w500,
+-                      ),
+-                ),
++                Text(value, style: Theme.of(context).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w500)),
+               ],
+             ),
+           ),
+@@ -291,13 +362,12 @@ class OrderDetailScreen extends StatelessWidget {
+   }
+ 
+   Widget _buildStatusBadge(BuildContext context) {
+-    final status = orderDetails.order.status ?? 'unknown';
+-    
++    final status = _order.status ?? 'unknown';
+     Color backgroundColor;
+     Color textColor;
+     String label;
+     IconData icon;
+-    
++
+     switch (status.toLowerCase()) {
+       case 'pending':
+         backgroundColor = Colors.blue.shade50;
+@@ -335,39 +405,39 @@ class OrderDetailScreen extends StatelessWidget {
+         label = status;
+         icon = Icons.help_outline;
+     }
+-    
+-    return Container(
+-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+-      decoration: BoxDecoration(
+-        color: backgroundColor,
+-        borderRadius: BorderRadius.circular(16),
+-      ),
+-      child: Row(
+-        mainAxisSize: MainAxisSize.min,
+-        children: [
+-          Icon(icon, size: 16, color: textColor),
+-          const SizedBox(width: 6),
+-          Text(
+-            label,
+-            style: TextStyle(
+-              color: textColor,
+-              fontSize: 13,
+-              fontWeight: FontWeight.w600,
+-            ),
++
++    return AnimatedBuilder(
++      animation: _statusAnimController,
++      builder: (context, child) {
++        final bgColor = _statusAnimController.isAnimating && _statusColorAnimation.value != null
++            ? _statusColorAnimation.value!
++            : backgroundColor;
++        return Container(
++          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
++          decoration: BoxDecoration(
++            color: bgColor,
++            borderRadius: BorderRadius.circular(16),
+           ),
+-        ],
+-      ),
++          child: Row(
++            mainAxisSize: MainAxisSize.min,
++            children: [
++              Icon(icon, size: 16, color: textColor),
++              const SizedBox(width: 6),
++              Text(label, style: TextStyle(color: textColor, fontSize: 13, fontWeight: FontWeight.w600)),
++            ],
++          ),
++        );
++      },
+     );
+   }
+ 
+   Widget _buildPriorityBadge(BuildContext context) {
+-    final priority = orderDetails.order.printPriority!.toLowerCase();
+-    
++    final priority = _order.printPriority!.toLowerCase();
+     Color backgroundColor;
+     Color textColor;
+     String label;
+     IconData icon;
+-    
++
+     switch (priority) {
+       case 'high':
+       case 'alta':
+@@ -396,7 +466,7 @@ class OrderDetailScreen extends StatelessWidget {
+         label = priority;
+         icon = Icons.flag;
+     }
+-    
++
+     return Container(
+       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+       decoration: BoxDecoration(
+@@ -408,27 +478,68 @@ class OrderDetailScreen extends StatelessWidget {
+         children: [
+           Icon(icon, size: 16, color: textColor),
+           const SizedBox(width: 6),
+-          Text(
+-            label,
+-            style: TextStyle(
+-              color: textColor,
+-              fontSize: 13,
+-              fontWeight: FontWeight.w600,
+-            ),
+-          ),
++          Text(label, style: TextStyle(color: textColor, fontSize: 13, fontWeight: FontWeight.w600)),
+         ],
+       ),
+     );
+   }
+ 
+-  bool _hasWhatsAppNumber() {
+-    return _getWhatsAppNumber() != null;
++  Widget _buildConceptCard(BuildContext context) {
++    return Card(
++      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
++      child: Padding(
++        padding: const EdgeInsets.all(16),
++        child: Column(
++          crossAxisAlignment: CrossAxisAlignment.start,
++          children: [
++            Row(children: [Icon(Icons.lightbulb_outline, color: Colors.grey[600]), const SizedBox(width: 8), Text('Concepto', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.bold))]),
++            const SizedBox(height: 8),
++            Text(_order.orderConcept!, style: Theme.of(context).textTheme.bodyMedium),
++          ],
++        ),
++      ),
++    );
+   }
+ 
++  Widget _buildDescriptionCard(BuildContext context) {
++    return Card(
++      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
++      child: Padding(
++        padding: const EdgeInsets.all(16),
++        child: Column(
++          crossAxisAlignment: CrossAxisAlignment.start,
++          children: [
++            Row(children: [Icon(Icons.description_outlined, color: Colors.grey[600]), const SizedBox(width: 8), Text('Descripci├│n', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.bold))]),
++            const SizedBox(height: 8),
++            Text(_order.orderDescription!, style: Theme.of(context).textTheme.bodyMedium),
++          ],
++        ),
++      ),
++    );
++  }
++
++  Widget _buildObservationsCard(BuildContext context) {
++    return Card(
++      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
++      child: Padding(
++        padding: const EdgeInsets.all(16),
++        child: Column(
++          crossAxisAlignment: CrossAxisAlignment.start,
++          children: [
++            Row(children: [Icon(Icons.note_outlined, color: Colors.grey[600]), const SizedBox(width: 8), Text('Observaciones', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.bold))]),
++            const SizedBox(height: 8),
++            Text(_order.observations!, style: Theme.of(context).textTheme.bodyMedium),
++          ],
++        ),
++      ),
++    );
++  }
++
++  bool _hasWhatsAppNumber() => _getWhatsAppNumber() != null;
++
+   String? _getWhatsAppNumber() {
+-    // Only use order.whatsapp field - no fallback to client.phone
+-    if (orderDetails.order.whatsapp != null && orderDetails.order.whatsapp!.isNotEmpty) {
+-      return orderDetails.order.whatsapp;
++    if (_order.whatsapp != null && _order.whatsapp!.isNotEmpty) {
++      return _order.whatsapp;
+     }
+     return null;
+   }
+diff --git a/mobile/doccione_mobile/lib/screens/orders_list_screen.dart b/mobile/doccione_mobile/lib/screens/orders_list_screen.dart
+index a0c6569..f32f7b9 100644
+--- a/mobile/doccione_mobile/lib/screens/orders_list_screen.dart
++++ b/mobile/doccione_mobile/lib/screens/orders_list_screen.dart
+@@ -1,16 +1,20 @@
+ import 'package:flutter/material.dart';
+ import 'package:doccione_mobile/database/database_helper.dart';
+ import 'package:doccione_mobile/database/orders_repository.dart';
++import 'package:doccione_mobile/database/server_config_repository.dart';
+ import 'package:doccione_mobile/models/order_with_details.dart';
+ import 'package:doccione_mobile/widgets/order_card.dart';
+ import 'package:doccione_mobile/screens/order_detail_screen.dart';
++import 'package:doccione_mobile/services/quick_edit_api_client.dart';
+ 
+ class OrdersListScreen extends StatefulWidget {
+   final String? initialStatus;
++  final String? sessionToken;
+ 
+   const OrdersListScreen({
+     super.key,
+     this.initialStatus,
++    this.sessionToken,
+   });
+ 
+   @override
+@@ -21,7 +25,8 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
+   final DatabaseHelper _dbHelper = DatabaseHelper();
+   late final OrdersRepository _ordersRepo;
+   final TextEditingController _searchController = TextEditingController();
+-  
++  QuickEditApiClient? _quickEditClient;
++
+   List<OrderWithDetails> _orders = [];
+   bool _isLoading = true;
+   bool _isSyncing = false;
+@@ -45,9 +50,24 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
+     super.initState();
+     _ordersRepo = OrdersRepository(_dbHelper);
+     _selectedStatus = widget.initialStatus;
++    _initQuickEditClient();
+     _loadOrders();
+   }
+ 
++  Future<void> _initQuickEditClient() async {
++    if (widget.sessionToken == null) return;
++    final repo = ServerConfigRepository(_dbHelper);
++    final config = await repo.getConfig();
++    if (mounted) {
++      setState(() {
++        _quickEditClient = QuickEditApiClient(
++          baseUrl: config.baseUrl,
++          authToken: widget.sessionToken,
++        );
++      });
++    }
++  }
++
+   @override
+   void dispose() {
+     _searchController.dispose();
+@@ -236,7 +256,9 @@ class _OrdersListScreenState extends State<OrdersListScreen> {
+                                   MaterialPageRoute(
+                                     builder: (context) => OrderDetailScreen(
+                                       orderDetails: orderDetails,
+-                                      onContactWhatsApp: null, // TODO: Implement WhatsApp integration
++                                      onContactWhatsApp: null,
++                                      apiClient: _quickEditClient,
++                                      onRefresh: () => _loadOrders(),
+                                     ),
+                                   ),
+                                 );
+diff --git a/mobile/doccione_mobile/lib/services/handlers/clients_sync_handler.dart b/mobile/doccione_mobile/lib/services/handlers/clients_sync_handler.dart
+index e2355ae..75b3a4b 100644
+--- a/mobile/doccione_mobile/lib/services/handlers/clients_sync_handler.dart
++++ b/mobile/doccione_mobile/lib/services/handlers/clients_sync_handler.dart
+@@ -1,3 +1,4 @@
++import 'package:sqflite/sqflite.dart';
+ import '../../database/clients_repository.dart';
+ import 'sync_entity_handler.dart';
+ 
+@@ -11,8 +12,8 @@ class ClientsSyncHandler implements SyncEntityHandler {
+   String get entityType => 'clients';
+ 
+   @override
+-  Future<void> process(List<Map<String, dynamic>> items) async {
++  Future<void> process(List<Map<String, dynamic>> items, {Transaction? txn}) async {
+     if (items.isEmpty) return;
+-    await _repository.upsertClients(items);
++    await _repository.upsertClients(items, txn: txn);
+   }
+ }
+diff --git a/mobile/doccione_mobile/lib/services/handlers/jobs_sync_handler.dart b/mobile/doccione_mobile/lib/services/handlers/jobs_sync_handler.dart
+index 284cf40..ad48a39 100644
+--- a/mobile/doccione_mobile/lib/services/handlers/jobs_sync_handler.dart
++++ b/mobile/doccione_mobile/lib/services/handlers/jobs_sync_handler.dart
+@@ -1,3 +1,4 @@
++import 'package:sqflite/sqflite.dart';
+ import '../../database/jobs_repository.dart';
+ import 'sync_entity_handler.dart';
+ 
+@@ -11,8 +12,8 @@ class JobsSyncHandler implements SyncEntityHandler {
+   String get entityType => 'jobs';
+ 
+   @override
+-  Future<void> process(List<Map<String, dynamic>> items) async {
++  Future<void> process(List<Map<String, dynamic>> items, {Transaction? txn}) async {
+     if (items.isEmpty) return;
+-    await _repository.upsertJobs(items);
++    await _repository.upsertJobs(items, txn: txn);
+   }
+ }
+diff --git a/mobile/doccione_mobile/lib/services/handlers/orders_sync_handler.dart b/mobile/doccione_mobile/lib/services/handlers/orders_sync_handler.dart
+index 1cd6f54..29e29b4 100644
+--- a/mobile/doccione_mobile/lib/services/handlers/orders_sync_handler.dart
++++ b/mobile/doccione_mobile/lib/services/handlers/orders_sync_handler.dart
+@@ -1,3 +1,4 @@
++import 'package:sqflite/sqflite.dart';
+ import '../../database/orders_repository.dart';
+ import 'sync_entity_handler.dart';
+ 
+@@ -11,8 +12,8 @@ class OrdersSyncHandler implements SyncEntityHandler {
+   String get entityType => 'orders';
+ 
+   @override
+-  Future<void> process(List<Map<String, dynamic>> items) async {
++  Future<void> process(List<Map<String, dynamic>> items, {Transaction? txn}) async {
+     if (items.isEmpty) return;
+-    await _repository.upsertOrders(items);
++    await _repository.upsertOrders(items, txn: txn);
+   }
+ }
+diff --git a/mobile/doccione_mobile/lib/services/handlers/sync_entity_handler.dart b/mobile/doccione_mobile/lib/services/handlers/sync_entity_handler.dart
+index 2fe1b48..fdf1c87 100644
+--- a/mobile/doccione_mobile/lib/services/handlers/sync_entity_handler.dart
++++ b/mobile/doccione_mobile/lib/services/handlers/sync_entity_handler.dart
+@@ -1,9 +1,12 @@
++import 'package:sqflite/sqflite.dart';
++
+ /// Abstract handler for synchronizing a specific entity type
+ abstract class SyncEntityHandler {
+-  /// Process a list of entity items from sync response
+-  /// This method should upsert the items into the database
+-  Future<void> process(List<Map<String, dynamic>> items);
+-  
++  /// Process a list of entity items from sync response.
++  /// When [txn] is provided, all DB operations must use it directly
++  /// to stay within the caller's transaction.
++  Future<void> process(List<Map<String, dynamic>> items, {Transaction? txn});
++
+   /// Get the name of the entity type this handler manages
+   String get entityType;
+ }
+diff --git a/mobile/doccione_mobile/lib/services/sync_api_client.dart b/mobile/doccione_mobile/lib/services/sync_api_client.dart
+index 8a2b92c..4cf2acc 100644
+--- a/mobile/doccione_mobile/lib/services/sync_api_client.dart
++++ b/mobile/doccione_mobile/lib/services/sync_api_client.dart
+@@ -193,7 +193,7 @@ class SyncApiClient {
+     };
+ 
+     if (authToken != null) {
+-      headers['Authorization'] = 'Bearer \$authToken';
++      headers['Authorization'] = 'Bearer $authToken';
+     }
+ 
+     return headers;
+diff --git a/mobile/doccione_mobile/lib/services/sync_service.dart b/mobile/doccione_mobile/lib/services/sync_service.dart
+index 88fff01..9cd1154 100644
+--- a/mobile/doccione_mobile/lib/services/sync_service.dart
++++ b/mobile/doccione_mobile/lib/services/sync_service.dart
+@@ -104,22 +104,17 @@ class SyncService {
+     );
+     httpStopwatch.stop();
+ 
+-    // Parse response
++    // Parse response ÔÇö backend contract:
++    // { snapshot_until, complete, next_cursor, entities: { X: { items, has_more } } }
+     final parseStopwatch = Stopwatch()..start();
+-    final snapshotId = response['snapshot_id'] as String;
++    final snapshotId = response['snapshot_until'] as String;
+     final nextCursor = response['next_cursor'] as String?;
+     final complete = response['complete'] as bool;
+-    final data = response['data'] as Map<String, dynamic>;
+-
+-    final jobs = (data['jobs'] as List<dynamic>?)
+-            ?.cast<Map<String, dynamic>>() ??
+-        [];
+-    final orders = (data['orders'] as List<dynamic>?)
+-            ?.cast<Map<String, dynamic>>() ??
+-        [];
+-    final clients = (data['clients'] as List<dynamic>?)
+-            ?.cast<Map<String, dynamic>>() ??
+-        [];
++    final entities = response['entities'] as Map<String, dynamic>;
++
++    final jobs = _extractEntityItems(entities, 'jobs');
++    final orders = _extractEntityItems(entities, 'orders');
++    final clients = _extractEntityItems(entities, 'clients');
+     parseStopwatch.stop();
+ 
+     // Database transaction
+@@ -127,29 +122,24 @@ class SyncService {
+     final db = await _dbHelper.database;
+ 
+     await db.transaction((txn) async {
+-      // Create temporary database helper for transaction
+-      final txnDbHelper = _TransactionDatabaseHelper(txn);
+-
+-      // Process each entity type within transaction
++      // Process each entity type within transaction, using the txn handle
+       if (_handlers.containsKey('jobs') && jobs.isNotEmpty) {
+-        await _handlers['jobs']!.process(jobs);
++        await _handlers['jobs']!.process(jobs, txn: txn);
+       }
+ 
+       if (_handlers.containsKey('orders') && orders.isNotEmpty) {
+-        await _handlers['orders']!.process(orders);
++        await _handlers['orders']!.process(orders, txn: txn);
+       }
+ 
+       if (_handlers.containsKey('clients') && clients.isNotEmpty) {
+-        await _handlers['clients']!.process(clients);
++        await _handlers['clients']!.process(clients, txn: txn);
+       }
+ 
+-      // Update sync state within transaction
++      // Update sync state within the same transaction
+       if (complete) {
+-        // Sync completed - clear cursor and update snapshot
+-        await _syncStateRepo.completeSync(snapshotId);
++        await _syncStateRepo.completeSync(snapshotId, txn: txn);
+       } else if (nextCursor != null) {
+-        // More pages to sync - save cursor
+-        await _syncStateRepo.setCurrentNextCursor(nextCursor);
++        await _syncStateRepo.setCurrentNextCursor(nextCursor, txn: txn);
+       }
+     });
+     dbStopwatch.stop();
+@@ -242,13 +232,24 @@ class SyncService {
+       );
+     }
+   }
+-}
+-
+-/// Helper class to wrap a transaction for DatabaseHelper interface
+-class _TransactionDatabaseHelper {
+-  final Transaction _transaction;
+ 
+-  _TransactionDatabaseHelper(this._transaction);
++  /// Extract items from entities[type].items and coerce int IDs to String.
++  List<Map<String, dynamic>> _extractEntityItems(
++      Map<String, dynamic> entities, String type) {
++    final entity = entities[type] as Map<String, dynamic>?;
++    if (entity == null) return [];
++    final items = entity['items'] as List<dynamic>? ?? [];
++    return items.map((item) => _coerceIdTypes(item as Map<String, dynamic>)).toList();
++  }
+ 
+-  Transaction get transaction => _transaction;
++  /// Convert int ID fields to String for model compatibility.
++  Map<String, dynamic> _coerceIdTypes(Map<String, dynamic> item) {
++    final map = Map<String, dynamic>.from(item);
++    for (final key in ['id', 'order_id', 'client_id', 'job_id']) {
++      if (map[key] is int) {
++        map[key] = map[key].toString();
++      }
++    }
++    return map;
++  }
+ }
+diff --git a/mobile/doccione_mobile/lib/widgets/dashboard_metrics_card.dart b/mobile/doccione_mobile/lib/widgets/dashboard_metrics_card.dart
+index d66981b..028b175 100644
+--- a/mobile/doccione_mobile/lib/widgets/dashboard_metrics_card.dart
++++ b/mobile/doccione_mobile/lib/widgets/dashboard_metrics_card.dart
+@@ -5,10 +5,12 @@ import '../screens/orders_list_screen.dart';
+ /// Widget that displays dashboard metrics in a card
+ class DashboardMetricsCard extends StatelessWidget {
+   final DashboardMetrics metrics;
++  final String? sessionToken;
+ 
+   const DashboardMetricsCard({
+     super.key,
+     required this.metrics,
++    this.sessionToken,
+   });
+ 
+   @override
+@@ -113,6 +115,7 @@ class DashboardMetricsCard extends StatelessWidget {
+                 MaterialPageRoute(
+                   builder: (context) => OrdersListScreen(
+                     initialStatus: filterStatus,
++                    sessionToken: sessionToken,
+                   ),
+                 ),
+               );
+diff --git a/mobile/doccione_mobile/lib/widgets/job_detail_card.dart b/mobile/doccione_mobile/lib/widgets/job_detail_card.dart
+index 9bd8208..c0eb513 100644
+--- a/mobile/doccione_mobile/lib/widgets/job_detail_card.dart
++++ b/mobile/doccione_mobile/lib/widgets/job_detail_card.dart
+@@ -1,20 +1,33 @@
+ import 'package:flutter/material.dart';
+ import 'package:doccione_mobile/models/job.dart';
++import 'package:doccione_mobile/widgets/quick_action_sheet.dart';
++import 'package:doccione_mobile/services/quick_edit_api_client.dart';
+ 
+ /// Widget to display job details in a card format
+ class JobDetailCard extends StatelessWidget {
+   final Job job;
+   final int index;
++  final QuickEditApiClient? apiClient;
++  final int? orderId;
++  final VoidCallback? onRefresh;
++  final void Function(String? status, int? quantity, String? size)? onJobEdited;
+ 
+   const JobDetailCard({
+     super.key,
+     required this.job,
+     required this.index,
++    this.apiClient,
++    this.orderId,
++    this.onRefresh,
++    this.onJobEdited,
+   });
+ 
+   @override
+   Widget build(BuildContext context) {
+-    return Card(
++    final hasApi = apiClient != null && orderId != null;
++    final jobUid = int.tryParse(job.id);
++
++    Widget card = Card(
+       margin: const EdgeInsets.only(bottom: 12),
+       child: Padding(
+         padding: const EdgeInsets.all(16),
+@@ -23,7 +36,6 @@ class JobDetailCard extends StatelessWidget {
+           children: [
+             Row(
+               children: [
+-                // Job number/index
+                 Container(
+                   width: 32,
+                   height: 32,
+@@ -42,45 +54,32 @@ class JobDetailCard extends StatelessWidget {
+                   ),
+                 ),
+                 const SizedBox(width: 12),
+-                // Title
+                 Expanded(
+                   child: Text(
+                     job.title ?? 'Sin t├¡tulo',
+-                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
+-                          fontWeight: FontWeight.bold,
+-                        ),
++                    style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
+                   ),
+                 ),
+-                // Status badge
+                 _buildStatusBadge(context),
++                if (hasApi && jobUid != null)
++                  PopupMenuButton<String>(
++                    icon: const Icon(Icons.more_vert, size: 20),
++                    tooltip: 'Editar trabajo',
++                    onSelected: (action) => _handleJobAction(context, action, jobUid),
++                    itemBuilder: (context) => [
++                      const PopupMenuItem(value: 'stage', child: Text('Cambiar etapa')),
++                      const PopupMenuItem(value: 'quantity_size', child: Text('Cantidad y tama├▒o')),
++                    ],
++                  ),
+               ],
+             ),
+             const SizedBox(height: 12),
+-            // Material
+             if (job.material != null && job.material!.isNotEmpty)
+-              _buildInfoRow(
+-                context,
+-                Icons.category_outlined,
+-                'Material',
+-                job.material!,
+-              ),
+-            // Size
++              _buildInfoRow(context, Icons.category_outlined, 'Material', job.material!),
+             if (job.size != null && job.size!.isNotEmpty)
+-              _buildInfoRow(
+-                context,
+-                Icons.straighten,
+-                'Tama├▒o',
+-                job.size!,
+-              ),
+-            // Quantity
++              _buildInfoRow(context, Icons.straighten, 'Tama├▒o', job.size!),
+             if (job.quantity != null)
+-              _buildInfoRow(
+-                context,
+-                Icons.format_list_numbered,
+-                'Cantidad',
+-                '${job.quantity}',
+-              ),
+-            // Notes
++              _buildInfoRow(context, Icons.format_list_numbered, 'Cantidad', '${job.quantity}'),
+             if (job.notes != null && job.notes!.isNotEmpty)
+               Padding(
+                 padding: const EdgeInsets.only(top: 8),
+@@ -93,18 +92,12 @@ class JobDetailCard extends StatelessWidget {
+                   child: Row(
+                     crossAxisAlignment: CrossAxisAlignment.start,
+                     children: [
+-                      Icon(
+-                        Icons.note_outlined,
+-                        size: 16,
+-                        color: Colors.grey[600],
+-                      ),
++                      Icon(Icons.note_outlined, size: 16, color: Colors.grey[600]),
+                       const SizedBox(width: 8),
+                       Expanded(
+                         child: Text(
+                           job.notes!,
+-                          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+-                                color: Colors.grey[700],
+-                              ),
++                          style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.grey[700]),
+                         ),
+                       ),
+                     ],
+@@ -115,14 +108,106 @@ class JobDetailCard extends StatelessWidget {
+         ),
+       ),
+     );
++
++    if (hasApi) {
++      return GestureDetector(
++        onLongPress: () => _showJobQuickActions(context),
++        child: card,
++      );
++    }
++    return card;
++  }
++
++  void _showJobQuickActions(BuildContext context) {
++    final jobUid = int.tryParse(job.id);
++    if (jobUid == null || apiClient == null || orderId == null) return;
++    showModalBottomSheet(
++      context: context,
++      builder: (ctx) => SafeArea(
++        child: Column(
++          mainAxisSize: MainAxisSize.min,
++          children: [
++            Padding(
++              padding: const EdgeInsets.all(16),
++              child: Text(
++                'Editar "${job.title ?? 'Trabajo'}"',
++                style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
++              ),
++            ),
++            ListTile(
++              leading: const Icon(Icons.play_circle_outline),
++              title: const Text('Cambiar etapa'),
++              onTap: () {
++                Navigator.pop(ctx);
++                QuickActionSheet.show(
++                  context,
++                  action: QuickAction.jobStage,
++                  api: apiClient!,
++                  orderId: orderId!,
++                  jobId: jobUid,
++                  currentStage: job.status ?? 'Recibido',
++                  onSuccess: () => _applyJobEdit(context, jobUid, stage: null),
++                );
++              },
++            ),
++            ListTile(
++              leading: const Icon(Icons.numbers),
++              title: const Text('Cantidad y tama├▒o'),
++              onTap: () {
++                Navigator.pop(ctx);
++                QuickActionSheet.show(
++                  context,
++                  action: QuickAction.jobQuantitySize,
++                  api: apiClient!,
++                  orderId: orderId!,
++                  jobId: jobUid,
++                  currentQuantity: job.quantity ?? 1,
++                  currentSize: job.size ?? '',
++                  onSuccess: () => _applyJobEdit(context, jobUid),
++                );
++              },
++            ),
++            const SizedBox(height: 8),
++          ],
++        ),
++      ),
++    );
+   }
+ 
+-  Widget _buildInfoRow(
+-    BuildContext context,
+-    IconData icon,
+-    String label,
+-    String value,
+-  ) {
++  void _handleJobAction(BuildContext context, String action, int jobUid) {
++    switch (action) {
++      case 'stage':
++        QuickActionSheet.show(
++          context,
++          action: QuickAction.jobStage,
++          api: apiClient!,
++          orderId: orderId!,
++          jobId: jobUid,
++          currentStage: job.status ?? 'Recibido',
++          onSuccess: () => _applyJobEdit(context, jobUid, stage: null),
++        );
++        break;
++      case 'quantity_size':
++        QuickActionSheet.show(
++          context,
++          action: QuickAction.jobQuantitySize,
++          api: apiClient!,
++          orderId: orderId!,
++          jobId: jobUid,
++          currentQuantity: job.quantity ?? 1,
++          currentSize: job.size ?? '',
++          onSuccess: () => _applyJobEdit(context, jobUid),
++        );
++        break;
++    }
++  }
++
++  void _applyJobEdit(BuildContext context, int jobUid, {String? stage}) {
++    onJobEdited?.call(null, null, null);
++    onRefresh?.call();
++  }
++
++  Widget _buildInfoRow(BuildContext context, IconData icon, String label, String value) {
+     return Padding(
+       padding: const EdgeInsets.only(top: 8),
+       child: Row(
+@@ -131,16 +216,10 @@ class JobDetailCard extends StatelessWidget {
+           const SizedBox(width: 8),
+           Text(
+             '$label: ',
+-            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+-                  color: Colors.grey[600],
+-                  fontWeight: FontWeight.w500,
+-                ),
++            style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.grey[600], fontWeight: FontWeight.w500),
+           ),
+           Expanded(
+-            child: Text(
+-              value,
+-              style: Theme.of(context).textTheme.bodyMedium,
+-            ),
++            child: Text(value, style: Theme.of(context).textTheme.bodyMedium),
+           ),
+         ],
+       ),
+@@ -149,11 +228,10 @@ class JobDetailCard extends StatelessWidget {
+ 
+   Widget _buildStatusBadge(BuildContext context) {
+     final status = job.status ?? 'unknown';
+-    
+     Color backgroundColor;
+     Color textColor;
+     String label;
+-    
++
+     switch (status.toLowerCase()) {
+       case 'pending':
+         backgroundColor = Colors.blue.shade50;
+@@ -181,7 +259,7 @@ class JobDetailCard extends StatelessWidget {
+         textColor = Colors.grey.shade700;
+         label = status;
+     }
+-    
++
+     return Container(
+       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+       decoration: BoxDecoration(
+@@ -190,11 +268,7 @@ class JobDetailCard extends StatelessWidget {
+       ),
+       child: Text(
+         label,
+-        style: TextStyle(
+-          color: textColor,
+-          fontSize: 11,
+-          fontWeight: FontWeight.w600,
+-        ),
++        style: TextStyle(color: textColor, fontSize: 11, fontWeight: FontWeight.w600),
+       ),
+     );
+   }
+diff --git a/mobile/doccione_mobile/lib/widgets/order_card.dart b/mobile/doccione_mobile/lib/widgets/order_card.dart
+index 598b1f5..9869fb7 100644
+--- a/mobile/doccione_mobile/lib/widgets/order_card.dart
++++ b/mobile/doccione_mobile/lib/widgets/order_card.dart
+@@ -29,7 +29,7 @@ class OrderCard extends StatelessWidget {
+                 children: [
+                   // Order number
+                   Text(
+-                    '#${order.orderNumber ?? order.id.substring(0, 8)}',
++                    '#${order.orderNumber ?? (order.id.length > 8 ? order.id.substring(0, 8) : order.id)}',
+                     style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                           fontWeight: FontWeight.bold,
+                         ),
+diff --git a/mobile/doccione_mobile/lib/widgets/sync_status_card.dart b/mobile/doccione_mobile/lib/widgets/sync_status_card.dart
+index f554fa9..a7ed91b 100644
+--- a/mobile/doccione_mobile/lib/widgets/sync_status_card.dart
++++ b/mobile/doccione_mobile/lib/widgets/sync_status_card.dart
+@@ -109,28 +109,35 @@ class _SyncStatusCardState extends State<SyncStatusCard> {
+ 
+       if (mounted) {
+         setState(() {
+-          _isSyncing = false;
+           _lastResult = result;
+           
+           if (result.isSuccess) {
+             _syncStatus = 'Sincronizaci├│n completada';
+-            _showSuccess(result);
+-            // Call the callback if provided
+-            widget.onSyncCompleted?.call();
+           } else {
+             _syncStatus = 'Error en sincronizaci├│n';
+-            _showError(result.error ?? 'Error desconocido');
+           }
+         });
++
++        if (result.isSuccess) {
++          _showSuccess(result);
++          widget.onSyncCompleted?.call();
++        } else {
++          _showError(result.error ?? 'Error desconocido');
++        }
+       }
+     } catch (e) {
+       if (mounted) {
+         setState(() {
+-          _isSyncing = false;
+           _syncStatus = 'Error: ${e.toString()}';
+         });
+         _showError(e.toString());
+       }
++    } finally {
++      if (mounted) {
++        setState(() {
++          _isSyncing = false;
++        });
++      }
+     }
+   }
+ 
+diff --git a/mobile/doccione_mobile/linux/flutter/generated_plugin_registrant.cc b/mobile/doccione_mobile/linux/flutter/generated_plugin_registrant.cc
+index e71a16d..d0e7f79 100644
+--- a/mobile/doccione_mobile/linux/flutter/generated_plugin_registrant.cc
++++ b/mobile/doccione_mobile/linux/flutter/generated_plugin_registrant.cc
+@@ -6,6 +6,10 @@
+ 
+ #include "generated_plugin_registrant.h"
+ 
++#include <flutter_secure_storage_linux/flutter_secure_storage_linux_plugin.h>
+ 
+ void fl_register_plugins(FlPluginRegistry* registry) {
++  g_autoptr(FlPluginRegistrar) flutter_secure_storage_linux_registrar =
++      fl_plugin_registry_get_registrar_for_plugin(registry, "FlutterSecureStorageLinuxPlugin");
++  flutter_secure_storage_linux_plugin_register_with_registrar(flutter_secure_storage_linux_registrar);
+ }
+diff --git a/mobile/doccione_mobile/linux/flutter/generated_plugins.cmake b/mobile/doccione_mobile/linux/flutter/generated_plugins.cmake
+index 2e1de87..ce58916 100644
+--- a/mobile/doccione_mobile/linux/flutter/generated_plugins.cmake
++++ b/mobile/doccione_mobile/linux/flutter/generated_plugins.cmake
+@@ -3,9 +3,11 @@
+ #
+ 
+ list(APPEND FLUTTER_PLUGIN_LIST
++  flutter_secure_storage_linux
+ )
+ 
+ list(APPEND FLUTTER_FFI_PLUGIN_LIST
++  jni
+ )
+ 
+ set(PLUGIN_BUNDLED_LIBRARIES)
+diff --git a/mobile/doccione_mobile/macos/Flutter/GeneratedPluginRegistrant.swift b/mobile/doccione_mobile/macos/Flutter/GeneratedPluginRegistrant.swift
+index 29262c1..0e161cb 100644
+--- a/mobile/doccione_mobile/macos/Flutter/GeneratedPluginRegistrant.swift
++++ b/mobile/doccione_mobile/macos/Flutter/GeneratedPluginRegistrant.swift
+@@ -8,9 +8,13 @@ import Foundation
+ import firebase_core
+ import firebase_messaging
+ import flutter_local_notifications
++import flutter_secure_storage_macos
++import sqflite_darwin
+ 
+ func RegisterGeneratedPlugins(registry: FlutterPluginRegistry) {
+   FLTFirebaseCorePlugin.register(with: registry.registrar(forPlugin: "FLTFirebaseCorePlugin"))
+   FLTFirebaseMessagingPlugin.register(with: registry.registrar(forPlugin: "FLTFirebaseMessagingPlugin"))
+   FlutterLocalNotificationsPlugin.register(with: registry.registrar(forPlugin: "FlutterLocalNotificationsPlugin"))
++  FlutterSecureStoragePlugin.register(with: registry.registrar(forPlugin: "FlutterSecureStoragePlugin"))
++  SqflitePlugin.register(with: registry.registrar(forPlugin: "SqflitePlugin"))
+ }
+diff --git a/mobile/doccione_mobile/pubspec.lock b/mobile/doccione_mobile/pubspec.lock
+index 4efc0da..15ece5f 100644
+--- a/mobile/doccione_mobile/pubspec.lock
++++ b/mobile/doccione_mobile/pubspec.lock
+@@ -49,6 +49,14 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "1.1.2"
++  code_assets:
++    dependency: transitive
++    description:
++      name: code_assets
++      sha256: bf394f466ba9205f1812a0433b392d6af280f155f56651eda7c18cc32ed493b8
++      url: "https://pub.dev"
++    source: hosted
++    version: "1.2.1"
+   collection:
+     dependency: transitive
+     description:
+@@ -57,6 +65,14 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "1.19.1"
++  crypto:
++    dependency: transitive
++    description:
++      name: crypto
++      sha256: c8ea0233063ba03258fbcf2ca4d6dadfefe14f02fab57702265467a19f27fadf
++      url: "https://pub.dev"
++    source: hosted
++    version: "3.0.7"
+   dbus:
+     dependency: transitive
+     description:
+@@ -81,6 +97,14 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "2.2.0"
++  file:
++    dependency: transitive
++    description:
++      name: file
++      sha256: a3b4f84adafef897088c160faf7dfffb7696046cb13ae90b508c2cbc95d3b8d4
++      url: "https://pub.dev"
++    source: hosted
++    version: "7.0.1"
+   firebase_core:
+     dependency: "direct main"
+     description:
+@@ -166,6 +190,54 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "7.2.0"
++  flutter_secure_storage:
++    dependency: "direct main"
++    description:
++      name: flutter_secure_storage
++      sha256: "9cad52d75ebc511adfae3d447d5d13da15a55a92c9410e50f67335b6d21d16ea"
++      url: "https://pub.dev"
++    source: hosted
++    version: "9.2.4"
++  flutter_secure_storage_linux:
++    dependency: transitive
++    description:
++      name: flutter_secure_storage_linux
++      sha256: be76c1d24a97d0b98f8b54bce6b481a380a6590df992d0098f868ad54dc8f688
++      url: "https://pub.dev"
++    source: hosted
++    version: "1.2.3"
++  flutter_secure_storage_macos:
++    dependency: transitive
++    description:
++      name: flutter_secure_storage_macos
++      sha256: "6c0a2795a2d1de26ae202a0d78527d163f4acbb11cde4c75c670f3a0fc064247"
++      url: "https://pub.dev"
++    source: hosted
++    version: "3.1.3"
++  flutter_secure_storage_platform_interface:
++    dependency: transitive
++    description:
++      name: flutter_secure_storage_platform_interface
++      sha256: cf91ad32ce5adef6fba4d736a542baca9daf3beac4db2d04be350b87f69ac4a8
++      url: "https://pub.dev"
++    source: hosted
++    version: "1.1.2"
++  flutter_secure_storage_web:
++    dependency: transitive
++    description:
++      name: flutter_secure_storage_web
++      sha256: f4ebff989b4f07b2656fb16b47852c0aab9fed9b4ec1c70103368337bc1886a9
++      url: "https://pub.dev"
++    source: hosted
++    version: "1.2.1"
++  flutter_secure_storage_windows:
++    dependency: transitive
++    description:
++      name: flutter_secure_storage_windows
++      sha256: b20b07cb5ed4ed74fc567b78a72936203f587eba460af1df11281c9326cd3709
++      url: "https://pub.dev"
++    source: hosted
++    version: "3.1.2"
+   flutter_test:
+     dependency: "direct dev"
+     description: flutter
+@@ -176,6 +248,22 @@ packages:
+     description: flutter
+     source: sdk
+     version: "0.0.0"
++  glob:
++    dependency: transitive
++    description:
++      name: glob
++      sha256: c3f1ee72c96f8f78935e18aa8cecced9ab132419e8625dc187e1c2408efc20de
++      url: "https://pub.dev"
++    source: hosted
++    version: "2.1.3"
++  hooks:
++    dependency: transitive
++    description:
++      name: hooks
++      sha256: "9a62a50b50b769a737bc0a8ff381f333529df3ab746b2f6b02e83760231455ba"
++      url: "https://pub.dev"
++    source: hosted
++    version: "2.0.2"
+   http:
+     dependency: "direct main"
+     description:
+@@ -192,6 +280,22 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "4.1.2"
++  jni:
++    dependency: transitive
++    description:
++      name: jni
++      sha256: c2230682d5bc2362c1c9e8d3c7f406d9cbba23ab3f2e203a025dd47e0fb2e68f
++      url: "https://pub.dev"
++    source: hosted
++    version: "1.0.0"
++  jni_flutter:
++    dependency: transitive
++    description:
++      name: jni_flutter
++      sha256: "8b59e590786050b1cd866677dddaf76b1ade5e7bc751abe04b86e84d379d3ba6"
++      url: "https://pub.dev"
++    source: hosted
++    version: "1.0.1"
+   js:
+     dependency: transitive
+     description:
+@@ -232,6 +336,14 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "3.0.0"
++  logging:
++    dependency: transitive
++    description:
++      name: logging
++      sha256: c8245ada5f1717ed44271ed1c26b8ce85ca3228fd2ffdb75468ab01979309d61
++      url: "https://pub.dev"
++    source: hosted
++    version: "1.3.0"
+   matcher:
+     dependency: transitive
+     description:
+@@ -256,14 +368,86 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "1.18.0"
+-  path:
++  native_toolchain_c:
++    dependency: transitive
++    description:
++      name: native_toolchain_c
++      sha256: f9c168717100ae6d9fee9ffb0be379bf1f8b26b0f6bcbd4fdddcd931993a6a72
++      url: "https://pub.dev"
++    source: hosted
++    version: "0.19.2"
++  objective_c:
++    dependency: transitive
++    description:
++      name: objective_c
++      sha256: "6cb691c686fa2838c6deb34980d426145c2a5d537491cb83d463c33cdbc726ed"
++      url: "https://pub.dev"
++    source: hosted
++    version: "9.4.1"
++  package_config:
+     dependency: transitive
++    description:
++      name: package_config
++      sha256: f096c55ebb7deb7e384101542bfba8c52696c1b56fca2eb62827989ef2353bbc
++      url: "https://pub.dev"
++    source: hosted
++    version: "2.2.0"
++  path:
++    dependency: "direct main"
+     description:
+       name: path
+       sha256: "75cca69d1490965be98c73ceaea117e8a04dd21217b37b292c9ddbec0d955bc5"
+       url: "https://pub.dev"
+     source: hosted
+     version: "1.9.1"
++  path_provider:
++    dependency: "direct main"
++    description:
++      name: path_provider
++      sha256: a7f4874f987173da295a61c181b8ee71dab59b332a486b391babf26a1b884825
++      url: "https://pub.dev"
++    source: hosted
++    version: "2.1.6"
++  path_provider_android:
++    dependency: transitive
++    description:
++      name: path_provider_android
++      sha256: "69cbd515a62b94d32a7944f086b2f82b4ac40a1d45bebfc00813a430ab2dabcd"
++      url: "https://pub.dev"
++    source: hosted
++    version: "2.3.1"
++  path_provider_foundation:
++    dependency: transitive
++    description:
++      name: path_provider_foundation
++      sha256: "2a376b7d6392d80cd3705782d2caa734ca4727776db0b6ec36ef3f1855197699"
++      url: "https://pub.dev"
++    source: hosted
++    version: "2.6.0"
++  path_provider_linux:
++    dependency: transitive
++    description:
++      name: path_provider_linux
++      sha256: "58c2005f147315b11e9b4a7bc889cd5203e250cba8e3f012dae259b4972b5c16"
++      url: "https://pub.dev"
++    source: hosted
++    version: "2.2.2"
++  path_provider_platform_interface:
++    dependency: transitive
++    description:
++      name: path_provider_platform_interface
++      sha256: "484838772624c3a4b94f1e44a3e19897fee738f2d5c4ce448443b0417f7c9dda"
++      url: "https://pub.dev"
++    source: hosted
++    version: "2.1.3"
++  path_provider_windows:
++    dependency: transitive
++    description:
++      name: path_provider_windows
++      sha256: bd6f00dbd873bfb70d0761682da2b3a2c2fccc2b9e84c495821639601d81afe7
++      url: "https://pub.dev"
++    source: hosted
++    version: "2.3.0"
+   petitparser:
+     dependency: transitive
+     description:
+@@ -272,6 +456,14 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "7.0.2"
++  platform:
++    dependency: transitive
++    description:
++      name: platform
++      sha256: "5d6b1b0036a5f331ebc77c850ebc8506cbc1e9416c27e59b439f917a902a4984"
++      url: "https://pub.dev"
++    source: hosted
++    version: "3.1.6"
+   plugin_platform_interface:
+     dependency: transitive
+     description:
+@@ -280,6 +472,22 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "2.1.8"
++  pub_semver:
++    dependency: transitive
++    description:
++      name: pub_semver
++      sha256: "5bfcf68ca79ef689f8990d1160781b4bad40a3bd5e5218ad4076ddb7f4081585"
++      url: "https://pub.dev"
++    source: hosted
++    version: "2.2.0"
++  record_use:
++    dependency: transitive
++    description:
++      name: record_use
++      sha256: "2551bd8eecfe95d14ae75f6021ad0248be5c27f138c2ec12fcb52b500b3ba1ed"
++      url: "https://pub.dev"
++    source: hosted
++    version: "0.6.0"
+   sky_engine:
+     dependency: transitive
+     description: flutter
+@@ -293,6 +501,62 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "1.10.2"
++  sqflite:
++    dependency: "direct main"
++    description:
++      name: sqflite
++      sha256: "58a799e6ac17dd32fbab93813d39ed835a75ccc0f8f85b8955fe318c6712b082"
++      url: "https://pub.dev"
++    source: hosted
++    version: "2.4.3"
++  sqflite_android:
++    dependency: transitive
++    description:
++      name: sqflite_android
++      sha256: d0548f9d7422a2dae99ec6f8b0a3074463b132d216fa5ba0d230eeefc901983b
++      url: "https://pub.dev"
++    source: hosted
++    version: "2.4.3"
++  sqflite_common:
++    dependency: transitive
++    description:
++      name: sqflite_common
++      sha256: "5bf6a55c166e73bf651ba7ec3ed486e577620e3dc8f3a9c6a258a8031b624590"
++      url: "https://pub.dev"
++    source: hosted
++    version: "2.5.11"
++  sqflite_common_ffi:
++    dependency: "direct dev"
++    description:
++      name: sqflite_common_ffi
++      sha256: "5ccd38136edb9beb3213f6927775d52db70dfdadcdb28dad1f625ca9f2b9824f"
++      url: "https://pub.dev"
++    source: hosted
++    version: "2.4.2"
++  sqflite_darwin:
++    dependency: transitive
++    description:
++      name: sqflite_darwin
++      sha256: c86ca18b8f666bbf903924687fe21cc16fc385d086005067e26619ca530bef9f
++      url: "https://pub.dev"
++    source: hosted
++    version: "2.4.3+1"
++  sqflite_platform_interface:
++    dependency: transitive
++    description:
++      name: sqflite_platform_interface
++      sha256: f84939f84350d92d04416f8bc4dc52d3896aec7716cc9e80cf0146342139dc50
++      url: "https://pub.dev"
++    source: hosted
++    version: "2.4.1"
++  sqlite3:
++    dependency: transitive
++    description:
++      name: sqlite3
++      sha256: c73fd75df1332d76a6257f4823ae4df9c791f522b97e4a60cbcad214de1becf4
++      url: "https://pub.dev"
++    source: hosted
++    version: "3.5.0"
+   stack_trace:
+     dependency: transitive
+     description:
+@@ -317,6 +581,14 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "1.4.1"
++  synchronized:
++    dependency: transitive
++    description:
++      name: synchronized
++      sha256: "93b153dcb6a26dcddee6ca087dd634b53e38c10b5aa163e8e49501a776456153"
++      url: "https://pub.dev"
++    source: hosted
++    version: "3.4.1"
+   term_glyph:
+     dependency: transitive
+     description:
+@@ -373,6 +645,14 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "1.1.1"
++  win32:
++    dependency: transitive
++    description:
++      name: win32
++      sha256: d7cb55e04cd34096cd3a79b3330245f54cb96a370a1c27adb3c84b917de8b08e
++      url: "https://pub.dev"
++    source: hosted
++    version: "5.15.0"
+   xdg_directories:
+     dependency: transitive
+     description:
+@@ -389,6 +669,14 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "6.6.1"
++  yaml:
++    dependency: transitive
++    description:
++      name: yaml
++      sha256: b9da305ac7c39faa3f030eccd175340f968459dae4af175130b3fc47e40d76ce
++      url: "https://pub.dev"
++    source: hosted
++    version: "3.1.3"
+ sdks:
+-  dart: ">=3.10.0-0 <4.0.0"
+-  flutter: ">=3.22.0"
++  dart: ">=3.12.0 <4.0.0"
++  flutter: ">=3.44.0"
+diff --git a/mobile/doccione_mobile/test/services/sync_service_test.dart b/mobile/doccione_mobile/test/services/sync_service_test.dart
+index 6a7ee51..a91f915 100644
+--- a/mobile/doccione_mobile/test/services/sync_service_test.dart
++++ b/mobile/doccione_mobile/test/services/sync_service_test.dart
+@@ -1,5 +1,8 @@
+ import 'dart:convert';
++import 'dart:io';
++import 'package:flutter/services.dart';
+ import 'package:flutter_test/flutter_test.dart';
++import 'package:sqflite/sqflite.dart';
+ import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+ import 'package:http/http.dart' as http;
+ import 'package:http/testing.dart';
+@@ -14,6 +17,41 @@ import 'package:doccione_mobile/services/handlers/jobs_sync_handler.dart';
+ import 'package:doccione_mobile/services/handlers/orders_sync_handler.dart';
+ import 'package:doccione_mobile/services/handlers/clients_sync_handler.dart';
+ 
++/// Helper: build a response matching the real backend contract.
++/// Backend format: { snapshot_until, complete, next_cursor, entities: { X: { items, has_more } } }
++Map<String, dynamic> _backendResponse({
++  required String snapshotUntil,
++  required bool complete,
++  String? nextCursor,
++  List<Map<String, dynamic>>? jobs,
++  List<Map<String, dynamic>>? orders,
++  List<Map<String, dynamic>>? clients,
++  bool jobsHasMore = false,
++  bool ordersHasMore = false,
++  bool clientsHasMore = false,
++}) {
++  return {
++    'server_time': '2026-07-21T10:00:00',
++    'snapshot_until': snapshotUntil,
++    'complete': complete,
++    'next_cursor': nextCursor,
++    'entities': {
++      'jobs': {
++        'items': jobs ?? [],
++        'has_more': jobsHasMore,
++      },
++      'orders': {
++        'items': orders ?? [],
++        'has_more': ordersHasMore,
++      },
++      'clients': {
++        'items': clients ?? [],
++        'has_more': clientsHasMore,
++      },
++    },
++  };
++}
++
+ void main() {
+   late DatabaseHelper dbHelper;
+   late SyncStateRepository syncStateRepo;
+@@ -21,14 +59,28 @@ void main() {
+   late OrdersRepository ordersRepo;
+   late ClientsRepository clientsRepo;
+ 
+-  setUpAll(() {
++  setUpAll(() async {
++    TestWidgetsFlutterBinding.ensureInitialized();
++    
++    // Mock path_provider for tests
++    final testDir = Directory.systemTemp.createTempSync('sync_test_');
++    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
++        .setMockMethodCallHandler(
++      const MethodChannel('plugins.flutter.io/path_provider'),
++      (MethodCall methodCall) async {
++        if (methodCall.method == 'getApplicationDocumentsDirectory') {
++          return testDir.path;
++        }
++        return null;
++      },
++    );
++    
+     sqfliteFfiInit();
+     databaseFactory = databaseFactoryFfi;
+   });
+ 
+   setUp(() async {
+     dbHelper = DatabaseHelper();
+-    await dbHelper.deleteDatabase();
+     
+     syncStateRepo = SyncStateRepository(dbHelper);
+     jobsRepo = JobsRepository(dbHelper);
+@@ -37,35 +89,43 @@ void main() {
+   });
+ 
+   tearDown(() async {
+-    await dbHelper.deleteDatabase();
++    try {
++      await dbHelper.close();
++      await dbHelper.deleteDatabase();
++    } catch (_) {}
+   });
+ 
+-  group('SyncService', () {
+-    test('should start sync and process single page', () async {
++  tearDownAll(() {
++    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
++        .setMockMethodCallHandler(
++      const MethodChannel('plugins.flutter.io/path_provider'),
++      null,
++    );
++  });
++
++  group('SyncService ÔÇö backend contract (entities/items)', () {
++    test('single page: jobs, orders, clients with int IDs coerced to String', () async {
+       final mockClient = MockClient((request) async {
+         return http.Response(
+-          jsonEncode({
+-            'snapshot_id': 'snap-123',
+-            'next_cursor': null,
+-            'complete': true,
+-            'data': {
+-              'jobs': [
+-                {'id': 'job-1', 'title': 'Job 1', 'updated_at': '2026-01-01T00:00:00Z'}
+-              ],
+-              'orders': [
+-                {'id': 'order-1', 'job_id': 'job-1', 'updated_at': '2026-01-01T00:00:00Z'}
+-              ],
+-              'clients': [
+-                {'id': 'client-1', 'name': 'Client 1', 'updated_at': '2026-01-01T00:00:00Z'}
+-              ],
+-            },
+-          }),
++          jsonEncode(_backendResponse(
++            snapshotUntil: '2026-07-21T10:00:00',
++            complete: true,
++            jobs: [
++              {'id': 1, 'order_id': 10, 'title': 'Job 1', 'material': 'Acero', 'status': 'pending', 'sort_order': 0, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'}
++            ],
++            orders: [
++              {'id': 10, 'client_id': 1, 'client': 'John', 'whatsapp': '123', 'order_date': '2026-07-20', 'status': 'pending', 'material': 'Acero', 'quantity': 5, 'delivery_date': '2026-07-25', 'print_priority': 'high', 'is_archived': 0, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'}
++            ],
++            clients: [
++              {'id': 1, 'name': 'John', 'whatsapp': '123', 'client_type': 'regular', 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'}
++            ],
++          )),
+           200,
+         );
+       });
+ 
+       final apiClient = SyncApiClient(
+-        baseUrl: 'http://localhost:8000',
++        baseUrl: 'http://localhost:8766',
+         authToken: 'test-token',
+         httpClient: mockClient,
+       );
+@@ -87,76 +147,118 @@ void main() {
+       expect(result.jobsUpdated, 1);
+       expect(result.ordersUpdated, 1);
+       expect(result.clientsUpdated, 1);
+-      expect(result.httpDuration.inMilliseconds, greaterThan(0));
+-      expect(result.parseDuration.inMilliseconds, greaterThanOrEqualTo(0));
+-      expect(result.databaseDuration.inMilliseconds, greaterThan(0));
+-      expect(result.totalDuration.inMilliseconds, greaterThan(0));
+ 
+-      // Verify data was saved
++      // Verify data persisted
+       final jobs = await jobsRepo.getAllJobs();
+       expect(jobs.length, 1);
+-      expect(jobs.first.id, 'job-1');
++      expect(jobs.first.id, '1');
+ 
+       final orders = await ordersRepo.getAllOrders();
+       expect(orders.length, 1);
++      expect(orders.first.id, '10');
+ 
+       final clients = await clientsRepo.getAllClients();
+       expect(clients.length, 1);
++      expect(clients.first.id, '1');
+ 
+-      // Verify sync state
++      // Verify sync state uses snapshot_until value
+       final syncState = await syncStateRepo.getSyncState();
+-      expect(syncState.lastCompletedSnapshot, 'snap-123');
++      expect(syncState.lastCompletedSnapshot, '2026-07-21T10:00:00');
+       expect(syncState.currentNextCursor, null);
+ 
+       apiClient.close();
+     });
+ 
+-    test('should handle paginated sync with cursor', () async {
++    test('zero orders, multiple jobs, empty clients', () async {
++      final mockClient = MockClient((request) async {
++        return http.Response(
++          jsonEncode(_backendResponse(
++            snapshotUntil: '2026-07-21T11:00:00',
++            complete: true,
++            jobs: [
++              {'id': 1, 'title': 'Job A', 'status': 'pending', 'sort_order': 0, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'},
++              {'id': 2, 'title': 'Job B', 'status': 'done', 'sort_order': 1, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T10:00:00'},
++              {'id': 3, 'title': 'Job C', 'status': 'pending', 'sort_order': 2, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T11:00:00'},
++            ],
++            orders: [],
++            clients: [],
++          )),
++          200,
++        );
++      });
++
++      final apiClient = SyncApiClient(
++        baseUrl: 'http://localhost:8766',
++        authToken: 'test-token',
++        httpClient: mockClient,
++      );
++
++      final syncService = SyncService(
++        dbHelper: dbHelper,
++        syncStateRepo: syncStateRepo,
++        apiClient: apiClient,
++      );
++
++      syncService.registerHandler('jobs', JobsSyncHandler(jobsRepo));
++      syncService.registerHandler('orders', OrdersSyncHandler(ordersRepo));
++      syncService.registerHandler('clients', ClientsSyncHandler(clientsRepo));
++
++      final result = await syncService.startSync();
++
++      expect(result.isSuccess, true);
++      expect(result.completed, true);
++      expect(result.jobsUpdated, 3);
++      expect(result.ordersUpdated, 0);
++      expect(result.clientsUpdated, 0);
++
++      final jobs = await jobsRepo.getAllJobs();
++      expect(jobs.length, 3);
++
++      final orders = await ordersRepo.getAllOrders();
++      expect(orders.length, 0);
++
++      final clients = await clientsRepo.getAllClients();
++      expect(clients.length, 0);
++
++      apiClient.close();
++    });
++
++    test('paginated sync with cursor', () async {
+       int requestCount = 0;
+       
+       final mockClient = MockClient((request) async {
+         requestCount++;
+         
+         if (requestCount == 1) {
+-          // First page
+           return http.Response(
+-            jsonEncode({
+-              'snapshot_id': 'snap-123',
+-              'next_cursor': 'cursor-page2',
+-              'complete': false,
+-              'data': {
+-                'jobs': [
+-                  {'id': 'job-1', 'title': 'Job 1', 'updated_at': '2026-01-01T00:00:00Z'}
+-                ],
+-                'orders': [],
+-                'clients': [],
+-              },
+-            }),
++            jsonEncode(_backendResponse(
++              snapshotUntil: '2026-07-21T10:00:00',
++              complete: false,
++              nextCursor: 'cursor-page2',
++              jobs: [
++                {'id': 1, 'title': 'Job 1', 'status': 'pending', 'sort_order': 0, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'}
++              ],
++              jobsHasMore: true,
++            )),
+             200,
+           );
+         } else {
+-          // Second page
+           expect(request.url.queryParameters['cursor'], 'cursor-page2');
+           return http.Response(
+-            jsonEncode({
+-              'snapshot_id': 'snap-123',
+-              'next_cursor': null,
+-              'complete': true,
+-              'data': {
+-                'jobs': [
+-                  {'id': 'job-2', 'title': 'Job 2', 'updated_at': '2026-01-02T00:00:00Z'}
+-                ],
+-                'orders': [],
+-                'clients': [],
+-              },
+-            }),
++            jsonEncode(_backendResponse(
++              snapshotUntil: '2026-07-21T10:00:00',
++              complete: true,
++              jobs: [
++                {'id': 2, 'title': 'Job 2', 'status': 'done', 'sort_order': 1, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T10:00:00'}
++              ],
++            )),
+             200,
+           );
+         }
+       });
+ 
+       final apiClient = SyncApiClient(
+-        baseUrl: 'http://localhost:8000',
++        baseUrl: 'http://localhost:8766',
+         authToken: 'test-token',
+         httpClient: mockClient,
+       );
+@@ -178,7 +280,6 @@ void main() {
+       expect(result.jobsUpdated, 1);
+       expect(result.nextCursor, 'cursor-page2');
+ 
+-      // Verify cursor was saved
+       final hasIncomplete = await syncService.hasIncompleteSync();
+       expect(hasIncomplete, true);
+ 
+@@ -188,24 +289,63 @@ void main() {
+       expect(result.completed, true);
+       expect(result.jobsUpdated, 1);
+ 
+-      // Verify all jobs were saved
+       final jobs = await jobsRepo.getAllJobs();
+       expect(jobs.length, 2);
+ 
+-      // Verify sync completed
+       final syncState = await syncStateRepo.getSyncState();
+       expect(syncState.currentNextCursor, null);
+ 
+       apiClient.close();
+     });
+ 
+-    test('should handle sync errors and save error state', () async {
++    test('syncAll across 3 pages', () async {
++      int requestCount = 0;
++      
+       final mockClient = MockClient((request) async {
+-        return http.Response('Internal Server Error', 500);
++        requestCount++;
++        
++        if (requestCount == 1) {
++          return http.Response(
++            jsonEncode(_backendResponse(
++              snapshotUntil: '2026-07-21T10:00:00',
++              complete: false,
++              nextCursor: 'cursor-page2',
++              jobs: [
++                {'id': 1, 'title': 'Job 1', 'status': 'pending', 'sort_order': 0, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'}
++              ],
++              jobsHasMore: true,
++            )),
++            200,
++          );
++        } else if (requestCount == 2) {
++          return http.Response(
++            jsonEncode(_backendResponse(
++              snapshotUntil: '2026-07-21T10:00:00',
++              complete: false,
++              nextCursor: 'cursor-page3',
++              jobs: [
++                {'id': 2, 'title': 'Job 2', 'status': 'done', 'sort_order': 1, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T10:00:00'}
++              ],
++              jobsHasMore: true,
++            )),
++            200,
++          );
++        } else {
++          return http.Response(
++            jsonEncode(_backendResponse(
++              snapshotUntil: '2026-07-21T10:00:00',
++              complete: true,
++              jobs: [
++                {'id': 3, 'title': 'Job 3', 'status': 'pending', 'sort_order': 2, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T11:00:00'}
++              ],
++            )),
++            200,
++          );
++        }
+       });
+ 
+       final apiClient = SyncApiClient(
+-        baseUrl: 'http://localhost:8000',
++        baseUrl: 'http://localhost:8766',
+         authToken: 'test-token',
+         httpClient: mockClient,
+       );
+@@ -217,21 +357,32 @@ void main() {
+       );
+ 
+       syncService.registerHandler('jobs', JobsSyncHandler(jobsRepo));
++      syncService.registerHandler('orders', OrdersSyncHandler(ordersRepo));
++      syncService.registerHandler('clients', ClientsSyncHandler(clientsRepo));
+ 
+-      final result = await syncService.startSync();
++      int pageCount = 0;
++      final result = await syncService.syncAll(
++        onPageComplete: (pageResult) {
++          pageCount++;
++          expect(pageResult.isSuccess, true);
++        },
++      );
+ 
+-      expect(result.hasError, true);
+-      expect(result.error, isNotNull);
+-      expect(result.jobsUpdated, 0);
++      expect(result.isSuccess, true);
++      expect(result.completed, true);
++      expect(result.jobsUpdated, 3);
++      expect(pageCount, 3);
+ 
+-      // Verify error was saved
+-      final syncState = await syncStateRepo.getSyncState();
+-      expect(syncState.lastSyncError, isNotNull);
++      final jobs = await jobsRepo.getAllJobs();
++      expect(jobs.length, 3);
++
++      final hasIncomplete = await syncService.hasIncompleteSync();
++      expect(hasIncomplete, false);
+ 
+       apiClient.close();
+     });
+ 
+-    test('should perform complete sync with syncAll', () async {
++    test('has_more true triggers pagination, has_more false completes', () async {
+       int requestCount = 0;
+       
+       final mockClient = MockClient((request) async {
+@@ -239,57 +390,36 @@ void main() {
+         
+         if (requestCount == 1) {
+           return http.Response(
+-            jsonEncode({
+-              'snapshot_id': 'snap-123',
+-              'next_cursor': 'cursor-page2',
+-              'complete': false,
+-              'data': {
+-                'jobs': [
+-                  {'id': 'job-1', 'title': 'Job 1', 'updated_at': '2026-01-01T00:00:00Z'}
+-                ],
+-                'orders': [],
+-                'clients': [],
+-              },
+-            }),
+-            200,
+-          );
+-        } else if (requestCount == 2) {
+-          return http.Response(
+-            jsonEncode({
+-              'snapshot_id': 'snap-123',
+-              'next_cursor': 'cursor-page3',
+-              'complete': false,
+-              'data': {
+-                'jobs': [
+-                  {'id': 'job-2', 'title': 'Job 2', 'updated_at': '2026-01-02T00:00:00Z'}
+-                ],
+-                'orders': [],
+-                'clients': [],
+-              },
+-            }),
++            jsonEncode(_backendResponse(
++              snapshotUntil: '2026-07-21T10:00:00',
++              complete: false,
++              nextCursor: 'cursor-p2',
++              jobs: [
++                {'id': 1, 'title': 'Job 1', 'status': 'pending', 'sort_order': 0, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'}
++              ],
++              jobsHasMore: true,
++              orders: [],
++              clients: [],
++            )),
+             200,
+           );
+         } else {
+           return http.Response(
+-            jsonEncode({
+-              'snapshot_id': 'snap-123',
+-              'next_cursor': null,
+-              'complete': true,
+-              'data': {
+-                'jobs': [
+-                  {'id': 'job-3', 'title': 'Job 3', 'updated_at': '2026-01-03T00:00:00Z'}
+-                ],
+-                'orders': [],
+-                'clients': [],
+-              },
+-            }),
++            jsonEncode(_backendResponse(
++              snapshotUntil: '2026-07-21T10:00:00',
++              complete: true,
++              jobs: [
++                {'id': 2, 'title': 'Job 2', 'status': 'done', 'sort_order': 1, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T10:00:00'}
++              ],
++              jobsHasMore: false,
++            )),
+             200,
+           );
+         }
+       });
+ 
+       final apiClient = SyncApiClient(
+-        baseUrl: 'http://localhost:8000',
++        baseUrl: 'http://localhost:8766',
+         authToken: 'test-token',
+         httpClient: mockClient,
+       );
+@@ -301,46 +431,29 @@ void main() {
+       );
+ 
+       syncService.registerHandler('jobs', JobsSyncHandler(jobsRepo));
+-      syncService.registerHandler('orders', OrdersSyncHandler(ordersRepo));
+-      syncService.registerHandler('clients', ClientsSyncHandler(clientsRepo));
+ 
+-      int pageCount = 0;
+-      final result = await syncService.syncAll(
+-        onPageComplete: (pageResult) {
+-          pageCount++;
+-          expect(pageResult.isSuccess, true);
+-        },
+-      );
++      final result = await syncService.syncAll();
+ 
+       expect(result.isSuccess, true);
+       expect(result.completed, true);
+-      expect(result.jobsUpdated, 3); // Total from all pages
+-      expect(pageCount, 3); // 3 pages processed
++      expect(requestCount, 2);
+ 
+-      // Verify all jobs were saved
+       final jobs = await jobsRepo.getAllJobs();
+-      expect(jobs.length, 3);
+-
+-      // Verify sync completed
+-      final hasIncomplete = await syncService.hasIncompleteSync();
+-      expect(hasIncomplete, false);
++      expect(jobs.length, 2);
+ 
+       apiClient.close();
+     });
+ 
+-    test('should rollback transaction on database error', () async {
++    test('malformed response: missing snapshot_until throws and returns error', () async {
+       final mockClient = MockClient((request) async {
+         return http.Response(
+           jsonEncode({
+-            'snapshot_id': 'snap-123',
+-            'next_cursor': null,
+             'complete': true,
+-            'data': {
+-              'jobs': [
+-                {'id': 'job-1', 'title': 'Job 1', 'updated_at': '2026-01-01T00:00:00Z'}
+-              ],
+-              'orders': [],
+-              'clients': [],
++            'next_cursor': null,
++            'entities': {
++              'jobs': {'items': [], 'has_more': false},
++              'orders': {'items': [], 'has_more': false},
++              'clients': {'items': [], 'has_more': false},
+             },
+           }),
+           200,
+@@ -348,7 +461,111 @@ void main() {
+       });
+ 
+       final apiClient = SyncApiClient(
+-        baseUrl: 'http://localhost:8000',
++        baseUrl: 'http://localhost:8766',
++        authToken: 'test-token',
++        httpClient: mockClient,
++      );
++
++      final syncService = SyncService(
++        dbHelper: dbHelper,
++        syncStateRepo: syncStateRepo,
++        apiClient: apiClient,
++      );
++
++      syncService.registerHandler('jobs', JobsSyncHandler(jobsRepo));
++
++      final result = await syncService.startSync();
++
++      expect(result.hasError, true);
++      expect(result.error, isNotNull);
++
++      // Verify error was saved
++      final syncState = await syncStateRepo.getSyncState();
++      expect(syncState.lastSyncError, isNotNull);
++
++      apiClient.close();
++    });
++
++    test('malformed response: missing entities throws and returns error', () async {
++      final mockClient = MockClient((request) async {
++        return http.Response(
++          jsonEncode({
++            'snapshot_until': '2026-07-21T10:00:00',
++            'complete': true,
++            'next_cursor': null,
++          }),
++          200,
++        );
++      });
++
++      final apiClient = SyncApiClient(
++        baseUrl: 'http://localhost:8766',
++        authToken: 'test-token',
++        httpClient: mockClient,
++      );
++
++      final syncService = SyncService(
++        dbHelper: dbHelper,
++        syncStateRepo: syncStateRepo,
++        apiClient: apiClient,
++      );
++
++      syncService.registerHandler('jobs', JobsSyncHandler(jobsRepo));
++
++      final result = await syncService.startSync();
++
++      expect(result.hasError, true);
++
++      apiClient.close();
++    });
++
++    test('HTTP 500 returns error and saves state', () async {
++      final mockClient = MockClient((request) async {
++        return http.Response('Internal Server Error', 500);
++      });
++
++      final apiClient = SyncApiClient(
++        baseUrl: 'http://localhost:8766',
++        authToken: 'test-token',
++        httpClient: mockClient,
++      );
++
++      final syncService = SyncService(
++        dbHelper: dbHelper,
++        syncStateRepo: syncStateRepo,
++        apiClient: apiClient,
++      );
++
++      syncService.registerHandler('jobs', JobsSyncHandler(jobsRepo));
++
++      final result = await syncService.startSync();
++
++      expect(result.hasError, true);
++      expect(result.error, isNotNull);
++      expect(result.jobsUpdated, 0);
++
++      final syncState = await syncStateRepo.getSyncState();
++      expect(syncState.lastSyncError, isNotNull);
++
++      apiClient.close();
++    });
++
++    test('rollback on handler error ÔÇö no data persisted', () async {
++      final mockClient = MockClient((request) async {
++        return http.Response(
++          jsonEncode(_backendResponse(
++            snapshotUntil: '2026-07-21T10:00:00',
++            complete: true,
++            jobs: [
++              {'id': 1, 'title': 'Job 1', 'status': 'pending', 'sort_order': 0, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'}
++            ],
++          )),
++          200,
++        );
++      });
++
++      final apiClient = SyncApiClient(
++        baseUrl: 'http://localhost:8766',
+         authToken: 'test-token',
+         httpClient: mockClient,
+       );
+@@ -359,27 +576,25 @@ void main() {
+         apiClient: apiClient,
+       );
+ 
+-      // Register handler that throws error
+       syncService.registerHandler('jobs', _FailingJobsHandler());
+ 
+       final result = await syncService.startSync();
+ 
+       expect(result.hasError, true);
+ 
+-      // Verify no jobs were saved (transaction rolled back)
+       final jobs = await jobsRepo.getAllJobs();
+       expect(jobs.length, 0);
+ 
+       apiClient.close();
+     });
+ 
+-    test('should not continue sync when no incomplete sync exists', () async {
++    test('continueSync returns error when no incomplete sync exists', () async {
+       final mockClient = MockClient((request) async {
+         throw Exception('Should not be called');
+       });
+ 
+       final apiClient = SyncApiClient(
+-        baseUrl: 'http://localhost:8000',
++        baseUrl: 'http://localhost:8766',
+         authToken: 'test-token',
+         httpClient: mockClient,
+       );
+@@ -397,6 +612,143 @@ void main() {
+ 
+       apiClient.close();
+     });
++
++    test('int IDs coerced to String in all entity types', () async {
++      final mockClient = MockClient((request) async {
++        return http.Response(
++          jsonEncode(_backendResponse(
++            snapshotUntil: '2026-07-21T10:00:00',
++            complete: true,
++            jobs: [
++              {'id': 42, 'order_id': 99, 'title': 'Int ID Job', 'status': 'pending', 'sort_order': 0, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'}
++            ],
++            orders: [
++              {'id': 77, 'client_id': 33, 'client': 'Test', 'status': 'pending', 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'}
++            ],
++            clients: [
++              {'id': 55, 'name': 'Int Client', 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'}
++            ],
++          )),
++          200,
++        );
++      });
++
++      final apiClient = SyncApiClient(
++        baseUrl: 'http://localhost:8766',
++        authToken: 'test-token',
++        httpClient: mockClient,
++      );
++
++      final syncService = SyncService(
++        dbHelper: dbHelper,
++        syncStateRepo: syncStateRepo,
++        apiClient: apiClient,
++      );
++
++      syncService.registerHandler('jobs', JobsSyncHandler(jobsRepo));
++      syncService.registerHandler('orders', OrdersSyncHandler(ordersRepo));
++      syncService.registerHandler('clients', ClientsSyncHandler(clientsRepo));
++
++      final result = await syncService.startSync();
++
++      expect(result.isSuccess, true);
++
++      final jobs = await jobsRepo.getAllJobs();
++      expect(jobs.first.id, '42');
++
++      final orders = await ordersRepo.getAllOrders();
++      expect(orders.first.id, '77');
++
++      final clients = await clientsRepo.getAllClients();
++      expect(clients.first.id, '55');
++
++      apiClient.close();
++    });
++
++    test('entity type missing from response treated as empty list', () async {
++      final mockClient = MockClient((request) async {
++        return http.Response(
++          jsonEncode({
++            'server_time': '2026-07-21T10:00:00',
++            'snapshot_until': '2026-07-21T10:00:00',
++            'complete': true,
++            'next_cursor': null,
++            'entities': {
++              'jobs': {
++                'items': [
++                  {'id': 1, 'title': 'Job Only', 'status': 'pending', 'sort_order': 0, 'created_at': '2026-07-20T08:00:00', 'updated_at': '2026-07-20T09:00:00'}
++                ],
++                'has_more': false,
++              },
++              // orders and clients intentionally absent
++            },
++          }),
++          200,
++        );
++      });
++
++      final apiClient = SyncApiClient(
++        baseUrl: 'http://localhost:8766',
++        authToken: 'test-token',
++        httpClient: mockClient,
++      );
++
++      final syncService = SyncService(
++        dbHelper: dbHelper,
++        syncStateRepo: syncStateRepo,
++        apiClient: apiClient,
++      );
++
++      syncService.registerHandler('jobs', JobsSyncHandler(jobsRepo));
++      syncService.registerHandler('orders', OrdersSyncHandler(ordersRepo));
++      syncService.registerHandler('clients', ClientsSyncHandler(clientsRepo));
++
++      final result = await syncService.startSync();
++
++      expect(result.isSuccess, true);
++      expect(result.completed, true);
++      expect(result.jobsUpdated, 1);
++      expect(result.ordersUpdated, 0);
++      expect(result.clientsUpdated, 0);
++
++      final jobs = await jobsRepo.getAllJobs();
++      expect(jobs.length, 1);
++
++      apiClient.close();
++    });
++
++    test('snapshot_until value stored as lastCompletedSnapshot', () async {
++      final mockClient = MockClient((request) async {
++        return http.Response(
++          jsonEncode(_backendResponse(
++            snapshotUntil: '2026-07-21T15:30:00',
++            complete: true,
++          )),
++          200,
++        );
++      });
++
++      final apiClient = SyncApiClient(
++        baseUrl: 'http://localhost:8766',
++        authToken: 'test-token',
++        httpClient: mockClient,
++      );
++
++      final syncService = SyncService(
++        dbHelper: dbHelper,
++        syncStateRepo: syncStateRepo,
++        apiClient: apiClient,
++      );
++
++      syncService.registerHandler('jobs', JobsSyncHandler(jobsRepo));
++
++      await syncService.startSync();
++
++      final syncState = await syncStateRepo.getSyncState();
++      expect(syncState.lastCompletedSnapshot, '2026-07-21T15:30:00');
++
++      apiClient.close();
++    });
+   });
+ }
+ 
+@@ -406,10 +758,10 @@ class _FailingJobsHandler implements JobsSyncHandler {
+   String get entityType => 'jobs';
+ 
+   @override
+-  Future<void> process(List<Map<String, dynamic>> items) async {
++  Future<void> process(List<Map<String, dynamic>> items, {Transaction? txn}) async {
+     throw Exception('Simulated database error');
+   }
+-  
++
+   @override
+   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+ }
+diff --git a/mobile/doccione_mobile/windows/flutter/generated_plugin_registrant.cc b/mobile/doccione_mobile/windows/flutter/generated_plugin_registrant.cc
+index 1a82e7d..39cedd3 100644
+--- a/mobile/doccione_mobile/windows/flutter/generated_plugin_registrant.cc
++++ b/mobile/doccione_mobile/windows/flutter/generated_plugin_registrant.cc
+@@ -7,8 +7,11 @@
+ #include "generated_plugin_registrant.h"
+ 
+ #include <firebase_core/firebase_core_plugin_c_api.h>
++#include <flutter_secure_storage_windows/flutter_secure_storage_windows_plugin.h>
+ 
+ void RegisterPlugins(flutter::PluginRegistry* registry) {
+   FirebaseCorePluginCApiRegisterWithRegistrar(
+       registry->GetRegistrarForPlugin("FirebaseCorePluginCApi"));
++  FlutterSecureStorageWindowsPluginRegisterWithRegistrar(
++      registry->GetRegistrarForPlugin("FlutterSecureStorageWindowsPlugin"));
+ }
+diff --git a/mobile/doccione_mobile/windows/flutter/generated_plugins.cmake b/mobile/doccione_mobile/windows/flutter/generated_plugins.cmake
+index fa8a39b..b1ad9e1 100644
+--- a/mobile/doccione_mobile/windows/flutter/generated_plugins.cmake
++++ b/mobile/doccione_mobile/windows/flutter/generated_plugins.cmake
+@@ -4,9 +4,11 @@
+ 
+ list(APPEND FLUTTER_PLUGIN_LIST
+   firebase_core
++  flutter_secure_storage_windows
+ )
+ 
+ list(APPEND FLUTTER_FFI_PLUGIN_LIST
++  jni
+ )
+ 
+ set(PLUGIN_BUNDLED_LIBRARIES)
+diff --git a/tests/test_mobile_api.py b/tests/test_mobile_api.py
+index 1e29691..87a4664 100644
+--- a/tests/test_mobile_api.py
++++ b/tests/test_mobile_api.py
+@@ -89,9 +89,11 @@ def repo(temp_db):
+     
+     # Agregar columnas faltantes en orders
+     existing_order_columns = {row[1] for row in conn.execute("PRAGMA table_info(orders)")}
+-    for column in ("order_concept", "order_description"):
++    for column in ("order_concept", "order_description", "discount_percent",
++                    "budget_total", "paid_amount", "payment_status"):
+         if column not in existing_order_columns:
+-            conn.execute(f"ALTER TABLE orders ADD COLUMN {column} TEXT DEFAULT ''")
++            default = "0" if column in ("discount_percent", "budget_total", "paid_amount") else "'Pendiente'" if column == "payment_status" else "''"
++            conn.execute(f"ALTER TABLE orders ADD COLUMN {column} TEXT DEFAULT {default}")
+     
+     conn.execute(
+         """CREATE TABLE IF NOT EXISTS order_jobs (
+@@ -118,6 +120,17 @@ def repo(temp_db):
+             created_at TEXT NOT NULL
+         )"""
+     )
++    conn.execute(
++        """CREATE TABLE IF NOT EXISTS order_payments (
++            id INTEGER PRIMARY KEY,
++            order_id INTEGER NOT NULL,
++            amount REAL NOT NULL,
++            method TEXT DEFAULT '',
++            note TEXT DEFAULT '',
++            paid_at TEXT NOT NULL,
++            created_at TEXT NOT NULL
++        )"""
++    )
+     conn.commit()
+     
+     return repo
+@@ -1236,3 +1249,474 @@ class TestServerBindConfiguration:
+         handler.do_GET()
+ 
+         handler._send_error.assert_called_once_with(401, "Authorization header missing")
++
++
++# ÔöÇÔöÇ Tests para Quick-Edit Endpoints ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
++
++def _make_handler_with_body(repo, event_bus, session_token, path, body_dict):
++    """Helper: crea un handler con body JSON simulado."""
++    handler = create_handler(repo, event_bus)
++    handler.headers = {"Authorization": f"Bearer {session_token}"}
++    handler.path = path
++    body_data = json.dumps(body_dict).encode("utf-8")
++    handler.headers["Content-Length"] = str(len(body_data))
++    handler.rfile = BytesIO(body_data)
++    return handler
++
++
++# ÔöÇÔöÇ PATCH /orders/{id}/status ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
++
++class TestUpdateOrderStatus:
++    """Tests para PATCH /api/v1/mobile/orders/{id}/status."""
++
++    def test_update_status_success(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          f"/api/v1/mobile/orders/{sample_order}/status",
++                                          {"status": "En producci├│n"})
++        handler._update_order_status(sample_order, device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert data["success"] is True
++        assert data["order"]["status"] == "En producci├│n"
++
++    def test_update_status_not_found(self, repo, event_bus, sample_device):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          "/api/v1/mobile/orders/99999/status",
++                                          {"status": "Finalizado"})
++        handler._update_order_status(99999, device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert "error" in data
++        assert "not found" in data["error"].lower()
++
++    def test_update_status_invalid_value(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          f"/api/v1/mobile/orders/{sample_order}/status",
++                                          {"status": "ValorInvalido"})
++        handler._update_order_status(sample_order, device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert "error" in data
++        assert "Invalid status" in data["error"]
++
++    def test_update_status_missing_field(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          f"/api/v1/mobile/orders/{sample_order}/status",
++                                          {})
++        handler._update_order_status(sample_order, device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert "error" in data
++        assert "required" in data["error"]
++
++    def test_update_status_empty_body(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        handler = create_handler(repo, event_bus)
++        handler.headers = {"Authorization": f"Bearer {session_token}"}
++        handler.path = f"/api/v1/mobile/orders/{sample_order}/status"
++        handler.headers["Content-Length"] = "0"
++        handler.rfile = BytesIO(b"")
++        handler._update_order_status(sample_order, device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert "error" in data
++        assert "body is required" in data["error"]
++
++
++# ÔöÇÔöÇ PATCH /orders/{id}/priority ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
++
++class TestUpdateOrderPriority:
++    """Tests para PATCH /api/v1/mobile/orders/{id}/priority."""
++
++    def test_update_priority_success(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          f"/api/v1/mobile/orders/{sample_order}/priority",
++                                          {"print_priority": 3})
++        handler._update_order_priority(sample_order, device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert data["success"] is True
++        assert data["order"]["print_priority"] == 3
++
++    def test_update_priority_clamp_low(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          f"/api/v1/mobile/orders/{sample_order}/priority",
++                                          {"print_priority": -5})
++        handler._update_order_priority(sample_order, device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert "error" in data
++        assert "between 0 and 4" in data["error"]
++
++    def test_update_priority_clamp_high(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          f"/api/v1/mobile/orders/{sample_order}/priority",
++                                          {"print_priority": 10})
++        handler._update_order_priority(sample_order, device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert "error" in data
++        assert "between 0 and 4" in data["error"]
++
++    def test_update_priority_not_found(self, repo, event_bus, sample_device):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          "/api/v1/mobile/orders/99999/priority",
++                                          {"print_priority": 2})
++        handler._update_order_priority(99999, device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert "error" in data
++
++    def test_update_priority_missing_field(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          f"/api/v1/mobile/orders/{sample_order}/priority",
++                                          {})
++        handler._update_order_priority(sample_order, device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert "error" in data
++        assert "required" in data["error"]
++
++    def test_update_priority_not_integer(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          f"/api/v1/mobile/orders/{sample_order}/priority",
++                                          {"print_priority": "alta"})
++        handler._update_order_priority(sample_order, device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert "error" in data
++        assert "integer" in data["error"]
++
++
++# ÔöÇÔöÇ PATCH /orders/{oid}/jobs/{jid} ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
++
++class TestUpdateJobFields:
++    """Tests para PATCH /api/v1/mobile/orders/{oid}/jobs/{jid}."""
++
++    def test_update_quantity_success(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        conn = repo.conn
++        job = conn.execute("SELECT id FROM order_jobs WHERE order_id = ? LIMIT 1", (sample_order,)).fetchone()
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          f"/api/v1/mobile/orders/{sample_order}/jobs/{job['id']}",
++                                          {"quantity": 25})
++        handler._update_job_fields(sample_order, job["id"], device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert data["success"] is True
++        assert data["job"]["quantity"] == 25
++
++    def test_update_size_success(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        conn = repo.conn
++        job = conn.execute("SELECT id FROM order_jobs WHERE order_id = ? LIMIT 1", (sample_order,)).fetchone()
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          f"/api/v1/mobile/orders/{sample_order}/jobs/{job['id']}",
++                                          {"size": "20cm"})
++        handler._update_job_fields(sample_order, job["id"], device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert data["success"] is True
++        assert data["job"]["size"] == "20cm"
++
++    def test_update_both_fields(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        conn = repo.conn
++        job = conn.execute("SELECT id FROM order_jobs WHERE order_id = ? LIMIT 1", (sample_order,)).fetchone()
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          f"/api/v1/mobile/orders/{sample_order}/jobs/{job['id']}",
++                                          {"quantity": 50, "size": "15cm"})
++        handler._update_job_fields(sample_order, job["id"], device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert data["success"] is True
++        assert data["job"]["quantity"] == 50
++        assert data["job"]["size"] == "15cm"
++
++    def test_quantity_floor_at_one(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        conn = repo.conn
++        job = conn.execute("SELECT id FROM order_jobs WHERE order_id = ? LIMIT 1", (sample_order,)).fetchone()
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          f"/api/v1/mobile/orders/{sample_order}/jobs/{job['id']}",
++                                          {"quantity": -3})
++        handler._update_job_fields(sample_order, job["id"], device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert data["success"] is True
++        assert data["job"]["quantity"] == 1
++
++    def test_job_not_found(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          f"/api/v1/mobile/orders/{sample_order}/jobs/99999",
++                                          {"quantity": 5})
++        handler._update_job_fields(sample_order, 99999, device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert "error" in data
++        assert "not found" in data["error"].lower()
++
++    def test_missing_all_fields(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        conn = repo.conn
++        job = conn.execute("SELECT id FROM order_jobs WHERE order_id = ? LIMIT 1", (sample_order,)).fetchone()
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          f"/api/v1/mobile/orders/{sample_order}/jobs/{job['id']}",
++                                          {})
++        handler._update_job_fields(sample_order, job["id"], device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert "error" in data
++        assert "required" in data["error"]
++
++    def test_order_total_quantity_updates(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        conn = repo.conn
++        job = conn.execute("SELECT id FROM order_jobs WHERE order_id = ? LIMIT 1", (sample_order,)).fetchone()
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          f"/api/v1/mobile/orders/{sample_order}/jobs/{job['id']}",
++                                          {"quantity": 99})
++        handler._update_job_fields(sample_order, job["id"], device)
++
++        # sample_order has 3 jobs with qty 5 each (total 15). Changing one to 99 ÔåÆ 99+5+5 = 109
++        order_row = conn.execute("SELECT quantity FROM orders WHERE id = ?", (sample_order,)).fetchone()
++        assert order_row["quantity"] == 109
++
++
++# ÔöÇÔöÇ POST /orders/{id}/payments ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
++
++class TestRegisterPayment:
++    """Tests para POST /api/v1/mobile/orders/{id}/payments."""
++
++    def test_register_payment_success(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          f"/api/v1/mobile/orders/{sample_order}/payments",
++                                          {"amount": 2500, "method": "Efectivo"})
++        handler._register_payment(sample_order, device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert data["success"] is True
++        assert data["payment"]["amount"] == 2500.0
++        assert data["payment"]["method"] == "Efectivo"
++        assert "financials" in data
++
++    def test_register_payment_not_found(self, repo, event_bus, sample_device):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          "/api/v1/mobile/orders/99999/payments",
++                                          {"amount": 1000})
++        handler._register_payment(99999, device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert "error" in data
++
++    def test_register_payment_zero_amount(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          f"/api/v1/mobile/orders/{sample_order}/payments",
++                                          {"amount": 0})
++        handler._register_payment(sample_order, device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert "error" in data
++        assert "greater than zero" in data["error"]
++
++    def test_register_payment_negative_amount(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          f"/api/v1/mobile/orders/{sample_order}/payments",
++                                          {"amount": -100})
++        handler._register_payment(sample_order, device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert "error" in data
++
++    def test_register_payment_missing_amount(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          f"/api/v1/mobile/orders/{sample_order}/payments",
++                                          {"method": "Transferencia"})
++        handler._register_payment(sample_order, device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert "error" in data
++        assert "required" in data["error"]
++
++    def test_payment_creates_event(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          f"/api/v1/mobile/orders/{sample_order}/payments",
++                                          {"amount": 1500, "method": "MP"})
++        handler._register_payment(sample_order, device)
++
++        events = repo.conn.execute(
++            "SELECT * FROM order_events WHERE order_id = ? AND event_type = 'payment.received'",
++            (sample_order,),
++        ).fetchall()
++        assert len(events) >= 1
++
++
++# ÔöÇÔöÇ POST /orders/{id}/deliver ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
++
++class TestMarkDelivered:
++    """Tests para POST /api/v1/mobile/orders/{id}/deliver."""
++
++    def test_mark_delivered_success(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        repo.conn.execute(
++            "UPDATE order_jobs SET status = 'Finalizado' WHERE order_id = ?", (sample_order,)
++        )
++        repo.conn.commit()
++
++        handler = create_handler(repo, event_bus)
++        handler.headers = {"Authorization": f"Bearer {session_token}"}
++        handler.path = f"/api/v1/mobile/orders/{sample_order}/deliver"
++        handler._mark_delivered(sample_order, device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert data["success"] is True
++        assert data["order"]["status"] == "Entregado"
++
++    def test_mark_delivered_not_found(self, repo, event_bus, sample_device):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        handler = create_handler(repo, event_bus)
++        handler.headers = {"Authorization": f"Bearer {session_token}"}
++        handler.path = "/api/v1/mobile/orders/99999/deliver"
++        handler._mark_delivered(99999, device)
++
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert "error" in data
++        assert "not found" in data["error"].lower()
++
++    def test_mark_delivered_creates_event(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        handler = create_handler(repo, event_bus)
++        handler.headers = {"Authorization": f"Bearer {session_token}"}
++        handler.path = f"/api/v1/mobile/orders/{sample_order}/deliver"
++        handler._mark_delivered(sample_order, device)
++
++        events = repo.conn.execute(
++            "SELECT * FROM order_events WHERE order_id = ? AND event_type = 'order.delivered'",
++            (sample_order,),
++        ).fetchall()
++        assert len(events) >= 1
++
++    def test_mark_delivered_all_jobs_entregado_status(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        device = {"id": device_id, "device_name": "Test Device"}
++        handler = create_handler(repo, event_bus)
++        handler.headers = {"Authorization": f"Bearer {session_token}"}
++        handler.path = f"/api/v1/mobile/orders/{sample_order}/deliver"
++        handler._mark_delivered(sample_order, device)
++
++        jobs = repo.conn.execute(
++            "SELECT status FROM order_jobs WHERE order_id = ?", (sample_order,)
++        ).fetchall()
++        assert all(j["status"] == "Entregado" for j in jobs)
++
++
++# ÔöÇÔöÇ do_PATCH routing ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
++
++class TestDoPATCHRouting:
++    """Verifica que do_PATCH enruta correctamente."""
++
++    def test_patch_status_routes_correctly(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          f"/api/v1/mobile/orders/{sample_order}/status",
++                                          {"status": "Finalizado"})
++        handler.do_PATCH()
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert data["success"] is True
++
++    def test_patch_priority_routes_correctly(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          f"/api/v1/mobile/orders/{sample_order}/priority",
++                                          {"print_priority": 1})
++        handler.do_PATCH()
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert data["success"] is True
++
++    def test_patch_unknown_returns_404(self, repo, event_bus, sample_device):
++        device_id, session_token = sample_device
++        handler = create_handler(repo, event_bus)
++        handler.headers = {"Authorization": f"Bearer {session_token}"}
++        handler.path = "/api/v1/mobile/orders/1/unknown"
++        handler.do_PATCH()
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert "error" in data
++        assert "not found" in data["error"].lower()
++
++    def test_post_deliver_routes_correctly(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        handler = create_handler(repo, event_bus)
++        handler.headers = {"Authorization": f"Bearer {session_token}"}
++        handler.path = f"/api/v1/mobile/orders/{sample_order}/deliver"
++        handler.headers["Content-Length"] = "2"
++        handler.rfile = BytesIO(b"{}")
++        handler.do_POST()
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert data["success"] is True
++
++    def test_post_payment_routes_correctly(self, repo, event_bus, sample_device, sample_order):
++        device_id, session_token = sample_device
++        handler = _make_handler_with_body(repo, event_bus, session_token,
++                                          f"/api/v1/mobile/orders/{sample_order}/payments",
++                                          {"amount": 500})
++        handler.do_POST()
++        data = json.loads(handler.response.body.decode("utf-8"))
++        assert data["success"] is True
++
++
++# ÔöÇÔöÇ Auth check for do_PATCH ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
++
++class TestDoPATCHRequiresAuth:
++    """Verifica que do_PATCH requiere autenticaci├│n."""
++
++    def test_patch_requires_auth(self, repo, event_bus, sample_order):
++        handler = create_handler(repo, event_bus)
++        handler.headers = {}
++        handler.path = f"/api/v1/mobile/orders/{sample_order}/status"
++        handler._send_error = Mock()
++        handler.do_PATCH()
++        handler._send_error.assert_called_once_with(401, "Authorization header missing")
+
+diff --git a/mobile/doccione_mobile/lib/services/quick_edit_api_client.dart b/mobile/doccione_mobile/lib/services/quick_edit_api_client.dart
+new file mode 100644
+--- /dev/null
++++ b/mobile/doccione_mobile/lib/services/quick_edit_api_client.dart
+䁀ⴠⰰ‰ㄫㄬ㐷䀠ീ⬊浩潰瑲✠慤瑲愺祳据㬧਍椫灭牯⁴搧牡㩴潣癮牥❴഻⬊浩潰瑲✠慰正条㩥瑨灴栯瑴⹰慤瑲‧獡栠瑴㭰਍椫灭牯⁴猧湹彣灡彩汣敩瑮搮牡❴഻⬊਍⼫⼯删獥汵⁴景愠焠極正攭楤⁴偁⁉慣汬਍挫慬獳儠極正摅瑩敒畳瑬笠਍‫映湩污戠潯⁬畳捣獥㭳਍‫映湩污匠牴湩㽧攠牲牯敍獳条㭥਍‫映湩污䴠灡匼牴湩Ⱨ搠湹浡捩㼾搠瑡㭡਍ഫ⬊†潣獮⁴畑捩䕫楤剴獥汵⹴畳捣獥⡳桴獩搮瑡⥡㨠猠捵散獳㴠琠畲ⱥ攠牲牯敍獳条⁥‽畮汬഻⬊†潣獮⁴畑捩䕫楤剴獥汵⹴慦汩牵⡥桴獩攮牲牯敍獳条⥥㨠猠捵散獳㴠映污敳‬慤慴㴠渠汵㭬਍紫਍ഫ⬊⼯ 呈偔挠楬湥⁴潦⁲畱捩⵫摥瑩愠瑣潩獮映潲⁭潭楢敬਍挫慬獳儠極正摅瑩灁䍩楬湥⁴ൻ⬊†楦慮⁬瑓楲杮戠獡啥汲഻⬊†楦慮⁬瑓楲杮‿畡桴潔敫㭮਍‫映湩污䐠牵瑡潩⁮楴敭畯㭴਍‫映湩污栠瑴⹰汃敩瑮张瑨灴汃敩瑮഻⬊਍‫儠極正摅瑩灁䍩楬湥⡴ൻ⬊††敲畱物摥琠楨⹳慢敳牕ⱬ਍‫†琠楨⹳畡桴潔敫Ɱ਍‫†琠楨⹳楴敭畯⁴‽潣獮⁴畄慲楴湯猨捥湯獤›㔱Ⱙ਍‫†栠瑴⹰汃敩瑮‿瑨灴汃敩瑮ബ⬊†⥽㨠张瑨灴汃敩瑮㴠栠瑴䍰楬湥⁴㼿栠瑴⹰汃敩瑮⤨഻⬊਍‫⼠⼯倠呁䡃⼠灡⽩ㅶ洯扯汩⽥牯敤獲笯摩⽽瑳瑡獵਍‫䘠瑵牵㱥畑捩䕫楤剴獥汵㹴甠摰瑡佥摲牥瑓瑡獵椨瑮漠摲牥摉‬瑓楲杮猠慴畴⥳愠祳据笠਍‫†爠瑥牵⁮灟瑡档ന⬊†††⼧灡⽩ㅶ洯扯汩⽥牯敤獲␯牯敤䥲⽤瑳瑡獵Ⱗ਍‫††笠猧慴畴❳›瑳瑡獵ⱽ਍‫†⤠഻⬊†ൽ⬊਍‫⼠⼯倠呁䡃⼠灡⽩ㅶ洯扯汩⽥牯敤獲笯摩⽽牰潩楲祴਍‫䘠瑵牵㱥畑捩䕫楤剴獥汵㹴甠摰瑡佥摲牥牐潩楲祴椨瑮漠摲牥摉‬湩⁴牰潩楲祴 獡湹⁣ൻ⬊††敲畴湲张慰捴⡨਍‫††✠愯楰瘯⼱潭楢敬漯摲牥⽳漤摲牥摉瀯楲牯瑩❹ബ⬊†††❻牰湩彴牰潩楲祴㨧瀠楲牯瑩絹ബ⬊††㬩਍‫素਍ഫ⬊†⼯ 䅐䍔⁈愯楰瘯⼱潭楢敬漯摲牥⽳潻摩⽽潪獢笯楪絤਍‫䘠瑵牵㱥畑捩䕫楤剴獥汵㹴甠摰瑡䩥扯楆汥獤ന⬊††湩⁴牯敤䥲Ɽ਍‫†椠瑮樠扯摉‬ൻ⬊††湩㽴焠慵瑮瑩ⱹ਍‫†匠牴湩㽧猠穩ⱥ਍‫素 獡湹⁣ൻ⬊††楦慮⁬潢祤㴠㰠瑓楲杮‬祤慮業㹣絻഻⬊††晩⠠畱湡楴祴℠‽畮汬 潢祤❛畱湡楴祴崧㴠焠慵瑮瑩㭹਍‫†椠⁦猨穩⁥㴡渠汵⥬戠摯孹猧穩❥⁝‽楳敺഻⬊††敲畴湲张慰捴⡨਍‫††✠愯楰瘯⼱潭楢敬漯摲牥⽳漤摲牥摉樯扯⽳樤扯摉Ⱗ਍‫††戠摯ⱹ਍‫†⤠഻⬊†ൽ⬊਍‫⼠⼯倠协⁔愯楰瘯⼱潭楢敬漯摲牥⽳楻絤瀯祡敭瑮൳⬊†畆畴敲儼極正摅瑩敒畳瑬‾敲楧瑳牥慐浹湥⡴਍‫†椠瑮漠摲牥摉‬ൻ⬊††敲畱物摥搠畯汢⁥浡畯瑮ബ⬊††瑓楲杮洠瑥潨⁤‽✧ബ⬊††瑓楲杮渠瑯⁥‽✧ബ⬊†⥽愠祳据笠਍‫†爠瑥牵⁮灟獯⡴਍‫††✠愯楰瘯⼱潭楢敬漯摲牥⽳漤摲牥摉瀯祡敭瑮❳ബ⬊†††❻浡畯瑮㨧愠潭湵ⱴ✠敭桴摯㨧洠瑥潨Ɽ✠潮整㨧渠瑯絥ബ⬊††㬩਍‫素਍ഫ⬊†⼯ 佐呓⼠灡⽩ㅶ洯扯汩⽥牯敤獲笯摩⽽敤楬敶൲⬊†畆畴敲儼極正摅瑩敒畳瑬‾慭歲敄楬敶敲⡤湩⁴牯敤䥲⥤愠祳据笠਍‫†爠瑥牵⁮灟獯⡴਍‫††✠愯楰瘯⼱潭楢敬漯摲牥⽳漤摲牥摉搯汥癩牥Ⱗ਍‫††笠ⱽ਍‫†⤠഻⬊†ൽ⬊਍‫⼠⼯倠协⁔愯楰瘯⼱潭楢敬樯扯⽳楻絤猯慴敧⠠硥獩楴杮攠摮潰湩⥴਍‫䘠瑵牵㱥畑捩䕫楤剴獥汵㹴挠慨杮䩥扯瑓条⡥湩⁴潪䥢Ɽ匠牴湩⁧瑳条⥥愠祳据笠਍‫†爠瑥牵⁮灟獯⡴਍‫††✠愯楰瘯⼱潭楢敬樯扯⽳樤扯摉猯慴敧Ⱗ਍‫††笠猧慴敧㨧猠慴敧ⱽ਍‫†⤠഻⬊†ൽ⬊਍
+diff --git a/mobile/doccione_mobile/lib/widgets/quick_action_sheet.dart b/mobile/doccione_mobile/lib/widgets/quick_action_sheet.dart
+new file mode 100644
+--- /dev/null
++++ b/mobile/doccione_mobile/lib/widgets/quick_action_sheet.dart
+䁀ⴠⰰ‰ㄫ㜬㤰䀠ീ⬊浩潰瑲✠慰正条㩥汦瑵整⽲慭整楲污搮牡❴഻⬊浩潰瑲✠慰正条㩥汦瑵整⽲敳癲捩獥搮牡❴഻⬊浩潰瑲✠慰正条㩥潤捣潩敮浟扯汩⽥敳癲捩獥焯極正敟楤彴灡彩汣敩瑮搮牡❴഻⬊਍⼫⼯䄠瑣潩獮愠慶汩扡敬映潲⁭桴⁥畱捩⵫捡楴湯猠敨瑥മ⬊湥浵儠極正捁楴湯笠਍‫猠慴畴ⱳ਍‫瀠楲牯瑩ⱹ਍‫瀠祡敭瑮ബ⬊†敤楬敶祲ബ⬊†潪卢慴敧ബ⬊†潪兢慵瑮瑩卹穩ⱥ਍紫਍ഫ⬊⼯ 楓杮敬攠瑮祲瀭楯瑮映牯愠汬焠極正攭楤⁴桳敥獴മ⬊⼯ 桔⁥慣汬牥瀠捩獫琠敨嬠捡楴湯ⱝ琠楨⁳楷杤瑥爠湥敤獲琠敨爠杩瑨攠楤潴⹲਍挫慬獳儠極正捁楴湯桓敥⁴ൻ⬊†畑捩䅫瑣潩卮敨瑥弮⤨഻⬊਍
+diff --git a/mobile/doccione_mobile/test/services/quick_edit_api_client_test.dart b/mobile/doccione_mobile/test/services/quick_edit_api_client_test.dart
+new file mode 100644
+--- /dev/null
++++ b/mobile/doccione_mobile/test/services/quick_edit_api_client_test.dart
+䁀ⴠⰰ‰ㄫ㈬㌸䀠ീ⬊浩潰瑲✠慤瑲挺湯敶瑲㬧਍椫灭牯⁴瀧捡慫敧昺畬瑴牥瑟獥⽴汦瑵整彲整瑳搮牡❴഻⬊浩潰瑲✠慰正条㩥瑨灴栯瑴⹰慤瑲‧獡栠瑴㭰਍椫灭牯⁴瀧捡慫敧栺瑴⽰整瑳湩⹧慤瑲㬧਍椫灭牯⁴瀧捡慫敧携捯楣湯彥潭楢敬猯牥楶散⽳畱捩彫摥瑩慟楰损楬湥⹴慤瑲㬧਍ഫ⬊潶摩洠楡⡮ ൻ⬊†潣獮⁴慢敳牕⁬‽栧瑴㩰⼯潬慣桬獯㩴〸〰㬧਍‫挠湯瑳愠瑵周歯湥㴠✠整瑳琭歯湥ㄭ㌲㬧਍ഫ⬊†潍正汃敩瑮张潭正汃敩瑮䘨瑵牵㱥瑨灴刮獥潰獮㹥䘠湵瑣潩⡮瑨灴刮煥敵瑳 慨摮敬⥲笠਍‫†爠瑥牵⁮潍正汃敩瑮栨湡汤牥㬩਍‫素਍ഫ⬊†牧畯⡰儧極正摅瑩灁䍩楬湥❴‬⤨笠਍‫†朠潲灵✨灵慤整牏敤卲慴畴❳‬⤨笠਍‫††琠獥⡴猧潨汵⁤敳摮倠呁䡃眠瑩⁨潣牲捥⁴潢祤Ⱗ⠠ 獡湹⁣ൻ⬊††††楦慮⁬潭正汃敩瑮㴠张潭正汃敩瑮⠨敲畱獥⥴愠祳据笠਍‫††††攠灸捥⡴敲畱獥⹴敭桴摯‬倧呁䡃⤧഻⬊†††††硥数瑣爨煥敵瑳甮汲琮卯牴湩⡧Ⱙ✠戤獡啥汲愯楰瘯⼱潭楢敬漯摲牥⽳㈴猯慴畴❳㬩਍‫††††攠灸捥⡴敲畱獥⹴敨摡牥孳䄧瑵潨楲慺楴湯崧‬䈧慥敲⁲愤瑵周歯湥⤧഻⬊†††††楦慮⁬潢祤㴠樠潳䑮捥摯⡥敲畱獥⹴潢祤㬩਍‫††††攠灸捥⡴潢祤❛瑳瑡獵崧‬䘧湩污穩摡❯㬩਍‫††††爠瑥牵⁮瑨灴刮獥潰獮⡥獪湯湅潣敤笨猧捵散獳㨧琠畲ⱥ✠牯敤❲›❻摩㨧㐠ⰲ✠瑳瑡獵㨧✠楆慮楬慺潤紧⥽‬〲⤰഻⬊††††⥽഻⬊਍‫†††映湩污挠楬湥⁴‽畑捩䕫楤䅴楰汃敩瑮戨獡啥汲›慢敳牕ⱬ愠瑵周歯湥›畡桴潔敫Ɱ栠瑴䍰楬湥㩴洠捯䍫楬湥⥴഻⬊††††楦慮⁬敲畳瑬㴠愠慷瑩挠楬湥⹴灵慤整牏敤卲慴畴⡳㈴‬䘧湩污穩摡❯㬩਍ഫ⬊††††硥数瑣爨獥汵⹴畳捣獥ⱳ琠畲⥥഻⬊††††硥数瑣爨獥汵⹴慤慴嬡漧摲牥崧❛瑳瑡獵崧‬䘧湩污穩摡❯㬩਍‫†††挠楬湥⹴汣獯⡥㬩਍‫††素㬩਍ഫ⬊†††整瑳✨桳畯摬爠瑥牵⁮慦汩牵⁥湯㐠〰Ⱗ⠠ 獡湹⁣ൻ⬊††††楦慮⁬潭正汃敩瑮㴠张潭正汃敩瑮⠨敲畱獥⥴愠祳据笠਍‫††††爠瑥牵⁮瑨灴刮獥潰獮⡥獪湯湅潣敤笨攧牲牯㨧✠湉慶楬⁤瑳瑡獵紧Ⱙ㐠〰㬩਍‫†††素㬩਍ഫ⬊††††楦慮⁬汣敩瑮㴠儠極正摅瑩灁䍩楬湥⡴慢敳牕㩬戠獡啥汲‬畡桴潔敫㩮愠瑵周歯湥‬瑨灴汃敩瑮›潭正汃敩瑮㬩਍‫†††映湩污爠獥汵⁴‽睡楡⁴汣敩瑮甮摰瑡佥摲牥瑓瑡獵㐨ⰲ✠慂卤慴畴❳㬩਍ഫ⬊††††硥数瑣爨獥汵⹴畳捣獥ⱳ映污敳㬩਍‫†††攠灸捥⡴敲畳瑬攮牲牯敍獳条ⱥ✠湉慶楬⁤瑳瑡獵⤧഻⬊††††汣敩瑮挮潬敳⤨഻⬊†††⥽഻⬊਍‫††琠獥⡴猧潨汵⁤敲畴湲映楡畬敲漠⁮〴✴‬⤨愠祳据笠਍‫†††映湩污洠捯䍫楬湥⁴‽浟捯䍫楬湥⡴爨煥敵瑳 獡湹⁣ൻ⬊†††††敲畴湲栠瑴⹰敒灳湯敳樨潳䕮据摯⡥❻牥潲❲›伧摲牥㤠‹潮⁴潦湵❤⥽‬〴⤴഻⬊††††⥽഻⬊਍‫†††映湩污挠楬湥⁴‽畑捩䕫楤䅴楰汃敩瑮戨獡啥汲›慢敳牕ⱬ愠瑵周歯湥›畡桴潔敫Ɱ栠瑴䍰楬湥㩴洠捯䍫楬湥⥴഻⬊††††楦慮⁬敲畳瑬㴠愠慷瑩挠楬湥⹴灵慤整牏敤卲慴畴⡳㤹‬䘧湩污穩摡❯㬩਍ഫ⬊††††硥数瑣爨獥汵⹴畳捣獥ⱳ映污敳㬩਍‫†††攠灸捥⡴敲畳瑬攮牲牯敍獳条ⱥ挠湯慴湩⡳渧瑯映畯摮⤧㬩਍‫†††挠楬湥⹴汣獯⡥㬩਍‫††素㬩਍‫†素㬩਍ഫ⬊††牧畯⡰甧摰瑡佥摲牥牐潩楲祴Ⱗ⠠ ൻ⬊†††整瑳✨桳畯摬猠湥⁤䅐䍔⁈楷桴挠牯敲瑣戠摯❹‬⤨愠祳据笠਍‫†††映湩污洠捯䍫楬湥⁴‽浟捯䍫楬湥⡴爨煥敵瑳 獡湹⁣ൻ⬊†††††硥数瑣爨煥敵瑳洮瑥潨Ɽ✠䅐䍔❈㬩਍‫††††攠灸捥⡴敲畱獥⹴牵⹬潴瑓楲杮⤨‬␧慢敳牕⽬灡⽩ㅶ洯扯汩⽥牯敤獲ㄯ⼰牰潩楲祴⤧഻⬊†††††楦慮⁬潢祤㴠樠潳䑮捥摯⡥敲畱獥⹴潢祤㬩਍‫††††攠灸捥⡴潢祤❛牰湩彴牰潩楲祴崧‬⤳഻⬊†††††敲畴湲栠瑴⹰敒灳湯敳樨潳䕮据摯⡥❻畳捣獥❳›牴敵‬漧摲牥㨧笠椧❤›〱‬瀧楲瑮灟楲牯瑩❹›紳⥽‬〲⤰഻⬊††††⥽഻⬊਍‫†††映湩污挠楬湥⁴‽畑捩䕫楤䅴楰汃敩瑮戨獡啥汲›慢敳牕ⱬ愠瑵周歯湥›畡桴潔敫Ɱ栠瑴䍰楬湥㩴洠捯䍫楬湥⥴഻⬊††††楦慮⁬敲畳瑬㴠愠慷瑩挠楬湥⹴灵慤整牏敤偲楲牯瑩⡹〱‬⤳഻⬊਍‫†††攠灸捥⡴敲畳瑬献捵散獳‬牴敵㬩਍‫†††攠灸捥⡴敲畳瑬搮瑡Ⅱ❛牯敤❲孝瀧楲瑮灟楲牯瑩❹ⱝ㌠㬩਍‫†††挠楬湥⹴汣獯⡥㬩਍‫††素㬩਍ഫ⬊†††整瑳✨桳畯摬爠瑥牵⁮慦汩牵⁥湯漠瑵漭ⵦ慲杮❥‬⤨愠祳据笠਍‫†††映湩污洠捯䍫楬湥⁴‽浟捯䍫楬湥⡴爨煥敵瑳 獡湹⁣ൻ⬊†††††敲畴湲栠瑴⹰敒灳湯敳樨潳䕮据摯⡥❻牥潲❲›瀧楲瑮灟楲牯瑩⁹畭瑳戠⁥敢睴敥⁮‰湡⁤✴⥽‬〴⤰഻⬊††††⥽഻⬊਍‫†††映湩污挠楬湥⁴‽畑捩䕫楤䅴楰汃敩瑮戨獡啥汲›慢敳牕ⱬ愠瑵周歯湥›畡桴潔敫Ɱ栠瑴䍰楬湥㩴洠捯䍫楬湥⥴഻⬊††††楦慮⁬敲畳瑬㴠愠慷瑩挠楬湥⹴灵慤整牏敤偲楲牯瑩⡹〱‬〱㬩਍ഫ⬊††††硥数瑣爨獥汵⹴畳捣獥ⱳ映污敳㬩਍‫†††攠灸捥⡴敲畳瑬攮牲牯敍獳条ⱥ挠湯慴湩⡳戧瑥敷湥〠愠摮㐠⤧㬩਍‫†††挠楬湥⹴汣獯⡥㬩਍‫††素㬩਍‫†素㬩਍ഫ⬊††牧畯⡰甧摰瑡䩥扯楆汥獤Ⱗ⠠ ൻ⬊†††整瑳✨桳畯摬猠湥⁤䅐䍔⁈楷桴焠慵瑮瑩⁹湡⁤楳敺Ⱗ⠠ 獡湹⁣ൻ⬊††††楦慮⁬潭正汃敩瑮㴠张潭正汃敩瑮⠨敲畱獥⥴愠祳据笠਍‫††††攠灸捥⡴敲畱獥⹴敭桴摯‬倧呁䡃⤧഻⬊†††††硥数瑣爨煥敵瑳甮汲琮卯牴湩⡧Ⱙ✠戤獡啥汲愯楰瘯⼱潭楢敬漯摲牥⽳⼵潪獢㜯⤧഻⬊†††††楦慮⁬潢祤㴠樠潳䑮捥摯⡥敲畱獥⹴潢祤㬩਍‫††††攠灸捥⡴潢祤❛畱湡楴祴崧‬㔲㬩਍‫††††攠灸捥⡴潢祤❛楳敺崧‬ㄧ挵❭㬩਍‫††††爠瑥牵⁮瑨灴刮獥潰獮⡥獪湯湅潣敤笨猧捵散獳㨧琠畲ⱥ✠潪❢›❻摩㨧㜠‬焧慵瑮瑩❹›㔲‬猧穩❥›ㄧ挵❭絽Ⱙ㈠〰㬩਍‫†††素㬩਍ഫ⬊††††楦慮⁬汣敩瑮㴠儠極正摅瑩灁䍩楬湥⡴慢敳牕㩬戠獡啥汲‬畡桴潔敫㩮愠瑵周歯湥‬瑨灴汃敩瑮›潭正汃敩瑮㬩਍‫†††映湩污爠獥汵⁴‽睡楡⁴汣敩瑮甮摰瑡䩥扯楆汥獤㔨‬ⰷ焠慵瑮瑩㩹㈠ⰵ猠穩㩥✠㔱浣⤧഻⬊਍‫†††攠灸捥⡴敲畳瑬献捵散獳‬牴敵㬩਍‫†††攠灸捥⡴敲畳瑬搮瑡Ⅱ❛潪❢孝焧慵瑮瑩❹ⱝ㈠⤵഻⬊††††汣敩瑮挮潬敳⤨഻⬊†††⥽഻⬊਍‫††琠獥⡴猧潨汵⁤敳摮倠呁䡃眠瑩⁨湯祬焠慵瑮瑩❹‬⤨愠祳据笠਍‫†††映湩污洠捯䍫楬湥⁴‽浟捯䍫楬湥⡴爨煥敵瑳 獡湹⁣ൻ⬊†††††楦慮⁬潢祤㴠樠潳䑮捥摯⡥敲畱獥⹴潢祤㬩਍‫††††攠灸捥⡴潢祤挮湯慴湩䭳祥✨畱湡楴祴⤧‬牴敵㬩਍‫††††攠灸捥⡴潢祤挮湯慴湩䭳祥✨楳敺⤧‬慦獬⥥഻⬊†††††敲畴湲栠瑴⹰敒灳湯敳樨潳䕮据摯⡥❻畳捣獥❳›牴敵‬樧扯㨧笠椧❤›ⰷ✠畱湡楴祴㨧ㄠ細⥽‬〲⤰഻⬊††††⥽഻⬊਍‫†††映湩污挠楬湥⁴‽畑捩䕫楤䅴楰汃敩瑮戨獡啥汲›慢敳牕ⱬ愠瑵周歯湥›畡桴潔敫Ɱ栠瑴䍰楬湥㩴洠捯䍫楬湥⥴഻⬊††††楦慮⁬敲畳瑬㴠愠慷瑩挠楬湥⹴灵慤整潊䙢敩摬⡳ⰵ㜠‬畱湡楴祴›〱㬩਍ഫ⬊††††硥数瑣爨獥汵⹴畳捣獥ⱳ琠畲⥥഻⬊††††汣敩瑮挮潬敳⤨഻⬊†††⥽഻⬊਍‫††琠獥⡴猧潨汵⁤敲畴湲映楡畬敲眠敨⁮潪⁢潮⁴潦湵❤‬⤨愠祳据笠਍‫†††映湩污洠捯䍫楬湥⁴‽浟捯䍫楬湥⡴爨煥敵瑳 獡湹⁣ൻ⬊†††††敲畴湲栠瑴⹰敒灳湯敳樨潳䕮据摯⡥❻牥潲❲›䨧扯㤠㤹渠瑯映畯摮紧Ⱙ㐠㐰㬩਍‫†††素㬩਍ഫ⬊††††楦慮⁬汣敩瑮㴠儠極正摅瑩灁䍩楬湥⡴慢敳牕㩬戠獡啥汲‬畡桴潔敫㩮愠瑵周歯湥‬瑨灴汃敩瑮›潭正汃敩瑮㬩਍‫†††映湩污爠獥汵⁴‽睡楡⁴汣敩瑮甮摰瑡䩥扯楆汥獤㔨‬㤹ⰹ焠慵瑮瑩㩹㔠㬩਍ഫ⬊††††硥数瑣爨獥汵⹴畳捣獥ⱳ映污敳㬩਍‫†††挠楬湥⹴汣獯⡥㬩਍‫††素㬩਍‫†素㬩਍ഫ⬊††牧畯⡰爧来獩整偲祡敭瑮Ⱗ⠠ ൻ⬊†††整瑳✨桳畯摬猠湥⁤佐呓眠瑩⁨慰浹湥⁴慤慴Ⱗ⠠ 獡湹⁣ൻ⬊††††楦慮⁬潭正汃敩瑮㴠张潭正汃敩瑮⠨敲畱獥⥴愠祳据笠਍‫††††攠灸捥⡴敲畱獥⹴敭桴摯‬倧协❔㬩਍‫††††攠灸捥⡴敲畱獥⹴牵⹬潴瑓楲杮⤨‬␧慢敳牕⽬灡⽩ㅶ洯扯汩⽥牯敤獲㈯⼰慰浹湥獴⤧഻⬊†††††楦慮⁬潢祤㴠樠潳䑮捥摯⡥敲畱獥⹴潢祤㬩਍‫††††攠灸捥⡴潢祤❛浡畯瑮崧‬㔲〰〮㬩਍‫††††攠灸捥⡴潢祤❛敭桴摯崧‬䔧敦瑣癩❯㬩਍‫††††攠灸捥⡴潢祤❛潮整崧‬匧쉥憱⤧഻⬊†††††敲畴湲栠瑴⹰敒灳湯敳樨潳䕮据摯⡥ൻ⬊††††††猧捵散獳㨧琠畲ⱥ਍‫†††††✠慰浹湥❴›❻浡畯瑮㨧㈠〵⸰ⰰ✠敭桴摯㨧✠晅捥楴潶紧ബ⬊††††††昧湩湡楣污❳›❻畢杤瑥瑟瑯污㨧㔠〰ⰰ✠慰摩慟潭湵❴›㔲〰‬瀧祡敭瑮獟慴畴❳›匧쉥憱爠捥扩摩❡ⱽ਍‫††††素Ⱙ㈠〰㬩਍‫†††素㬩਍ഫ⬊††††楦慮⁬汣敩瑮㴠儠極正摅瑩灁䍩楬湥⡴慢敳牕㩬戠獡啥汲‬畡桴潔敫㩮愠瑵周歯湥‬瑨灴汃敩瑮›潭正汃敩瑮㬩਍‫†††映湩污爠獥汵⁴‽睡楡⁴汣敩瑮爮来獩整偲祡敭瑮㈨ⰰ愠潭湵㩴㈠〵ⰰ洠瑥潨㩤✠晅捥楴潶Ⱗ渠瑯㩥✠敓뇂❡㬩਍ഫ⬊††††硥数瑣爨獥汵⹴畳捣獥ⱳ琠畲⥥഻⬊††††硥数瑣爨獥汵⹴慤慴嬡昧湩湡楣污❳孝瀧祡敭瑮獟慴畴❳ⱝ✠敓뇂⁡敲楣楢慤⤧഻⬊††††汣敩瑮挮潬敳⤨഻⬊†††⥽഻⬊਍‫††琠獥⡴猧潨汵⁤敲畴湲映楡畬敲漠⁮湩慶楬⁤浡畯瑮Ⱗ⠠ 獡湹⁣ൻ⬊††††楦慮⁬潭正汃敩瑮㴠张潭正汃敩瑮⠨敲畱獥⥴愠祳据笠਍‫††††爠瑥牵⁮瑨灴刮獥潰獮⡥獪湯湅潣敤笨攧牲牯㨧✠浡畯瑮洠獵⁴敢朠敲瑡牥琠慨⁮敺潲紧Ⱙ㐠〰㬩਍‫†††素㬩਍ഫ⬊††††楦慮⁬汣敩瑮㴠儠極正摅瑩灁䍩楬湥⡴慢敳牕㩬戠獡啥汲‬畡桴潔敫㩮愠瑵周歯湥‬瑨灴汃敩瑮›潭正汃敩瑮㬩਍‫†††映湩污爠獥汵⁴‽睡楡⁴汣敩瑮爮来獩整偲祡敭瑮㈨ⰰ愠潭湵㩴〠㬩਍ഫ⬊††††硥数瑣爨獥汵⹴畳捣獥ⱳ映污敳㬩਍‫†††攠灸捥⡴敲畳瑬攮牲牯敍獳条ⱥ挠湯慴湩⡳朧敲瑡牥琠慨⁮敺潲⤧㬩਍‫†††挠楬湥⹴汣獯⡥㬩਍‫††素㬩਍‫†素㬩਍ഫ⬊††牧畯⡰洧牡䑫汥癩牥摥Ⱗ⠠ ൻ⬊†††整瑳✨桳畯摬猠湥⁤佐呓琠⁯敤楬敶⁲湥灤楯瑮Ⱗ⠠ 獡湹⁣ൻ⬊††††楦慮⁬潭正汃敩瑮㴠张潭正汃敩瑮⠨敲畱獥⥴愠祳据笠਍‫††††攠灸捥⡴敲畱獥⹴敭桴摯‬倧协❔㬩਍‫††††攠灸捥⡴敲畱獥⹴牵⹬潴瑓楲杮⤨‬␧慢敳牕⽬灡⽩ㅶ洯扯汩⽥牯敤獲㌯⼰敤楬敶❲㬩਍‫††††映湩污戠摯⁹‽獪湯敄潣敤爨煥敵瑳戮摯⥹഻⬊†††††硥数瑣戨摯ⱹ椠䕳灭祴㬩਍‫††††爠瑥牵⁮瑨灴刮獥潰獮⡥獪湯湅潣敤笨਍‫†††††✠畳捣獥❳›牴敵ബ⬊††††††漧摲牥㨧笠椧❤›〳‬猧慴畴❳›䔧瑮敲慧潤紧ബ⬊†††††⥽‬〲⤰഻⬊††††⥽഻⬊਍‫†††映湩污挠楬湥⁴‽畑捩䕫楤䅴楰汃敩瑮戨獡啥汲›慢敳牕ⱬ愠瑵周歯湥›畡桴潔敫Ɱ栠瑴䍰楬湥㩴洠捯䍫楬湥⥴഻⬊††††楦慮⁬敲畳瑬㴠愠慷瑩挠楬湥⹴慭歲敄楬敶敲⡤〳㬩਍ഫ⬊††††硥数瑣爨獥汵⹴畳捣獥ⱳ琠畲⥥഻⬊††††硥数瑣爨獥汵⹴慤慴嬡漧摲牥崧❛瑳瑡獵崧‬䔧瑮敲慧潤⤧഻⬊††††汣敩瑮挮潬敳⤨഻⬊†††⥽഻⬊਍‫††琠獥⡴猧潨汵⁤敲畴湲映楡畬敲眠敨⁮牯敤⁲潮⁴潦湵❤‬⤨愠祳据笠਍‫†††映湩污洠捯䍫楬湥⁴‽浟捯䍫楬湥⡴爨煥敵瑳 獡湹⁣ൻ⬊†††††敲畴湲栠瑴⹰敒灳湯敳樨潳䕮据摯⡥❻牥潲❲›伧摲牥㤠㤹渠瑯映畯摮紧Ⱙ㐠㐰㬩਍‫†††素㬩਍ഫ⬊††††楦慮⁬汣敩瑮㴠儠極正摅瑩灁䍩楬湥⡴慢敳牕㩬戠獡啥汲‬畡桴潔敫㩮愠瑵周歯湥‬瑨灴汃敩瑮›潭正汃敩瑮㬩਍‫†††映湩污爠獥汵⁴‽睡楡⁴汣敩瑮洮牡䑫汥癩牥摥㤨㤹㬩਍ഫ⬊††††硥数瑣爨獥汵⹴畳捣獥ⱳ映污敳㬩਍‫†††挠楬湥⹴汣獯⡥㬩਍‫††素㬩਍‫†素㬩਍ഫ⬊††牧畯⡰挧慨杮䩥扯瑓条❥‬⤨笠਍‫††琠獥⡴猧潨汵⁤敳摮倠协⁔潴猠慴敧攠摮潰湩❴‬⤨愠祳据笠਍‫†††映湩污洠捯䍫楬湥⁴‽浟捯䍫楬湥⡴爨煥敵瑳 獡湹⁣ൻ⬊†††††硥数瑣爨煥敵瑳洮瑥潨Ɽ✠佐呓⤧഻⬊†††††硥数瑣爨煥敵瑳甮汲琮卯牴湩⡧Ⱙ✠戤獡啥汲愯楰瘯⼱潭楢敬樯扯⽳㔱猯慴敧⤧഻⬊†††††楦慮⁬潢祤㴠樠潳䑮捥摯⡥敲畱獥⹴潢祤㬩਍‫††††攠灸捥⡴潢祤❛瑳条❥ⱝ✠浉牰獥쉩溾⤧഻⬊†††††敲畴湲栠瑴⹰敒灳湯敳樨潳䕮据摯⡥ൻ⬊††††††猧捵散獳㨧琠畲ⱥ਍‫†††††✠敭獳条❥›䔧慴慰愠瑣慵楬慺慤Ⱗ਍‫†††††✠潪❢›❻摩㨧ㄠⰵ✠瑳瑡獵㨧✠浉牰獥쉩溾紧ബ⬊†††††⥽‬〲⤰഻⬊††††⥽഻⬊਍‫†††映湩污挠楬湥⁴‽畑捩䕫楤䅴楰汃敩瑮戨獡啥汲›慢敳牕ⱬ愠瑵周歯湥›畡桴潔敫Ɱ栠瑴䍰楬湥㩴洠捯䍫楬湥⥴഻⬊††††楦慮⁬敲畳瑬㴠愠慷瑩挠楬湥⹴档湡敧潊卢慴敧ㄨⰵ✠浉牰獥쉩溾⤧഻⬊਍‫†††攠灸捥⡴敲畳瑬献捵散獳‬牴敵㬩਍‫†††攠灸捥⡴敲畳瑬搮瑡Ⅱ❛潪❢孝猧慴畴❳ⱝ✠浉牰獥쉩溾⤧഻⬊††††汣敩瑮挮潬敳⤨഻⬊†††⥽഻⬊††⥽഻⬊਍‫†朠潲灵✨牥潲⁲慨摮楬杮Ⱗ⠠ ൻ⬊†††整瑳✨桳畯摬栠湡汤⁥潣湮捥楴湯爠晥獵摥Ⱗ⠠ 獡湹⁣ൻ⬊††††楦慮⁬潭正汃敩瑮㴠张潭正汃敩瑮⠨敲畱獥⥴愠祳据笠਍‫††††琠牨睯栠瑴⹰汃敩瑮硅散瑰潩⡮䌧湯敮瑣潩⁮敲畦敳❤㬩਍‫†††素㬩਍ഫ⬊††††楦慮⁬汣敩瑮㴠儠極正摅瑩灁䍩楬湥⡴慢敳牕㩬戠獡啥汲‬畡桴潔敫㩮愠瑵周歯湥‬瑨灴汃敩瑮›潭正汃敩瑮㬩਍‫†††映湩污爠獥汵⁴‽睡楡⁴汣敩瑮甮摰瑡佥摲牥瑓瑡獵ㄨ‬䘧湩污穩摡❯㬩਍ഫ⬊††††硥数瑣爨獥汵⹴畳捣獥ⱳ映污敳㬩਍‫†††攠灸捥⡴敲畳瑬攮牲牯敍獳条ⱥ挠湯慴湩⡳䔧牲牯搠⁥敲❤⤩഻⬊††††汣敩瑮挮潬敳⤨഻⬊†††⥽഻⬊਍‫††琠獥⡴猧潨汵⁤慨摮敬琠浩潥瑵Ⱗ⠠ 獡湹⁣ൻ⬊††††楦慮⁬潭正汃敩瑮㴠张潭正汃敩瑮⠨敲畱獥⥴愠祳据笠਍‫††††愠慷瑩䘠瑵牵⹥敤慬敹⡤潣獮⁴畄慲楴湯猨捥湯獤›⤵㬩਍‫††††爠瑥牵⁮瑨灴刮獥潰獮⡥笧❽‬〲⤰഻⬊††††⥽഻⬊਍‫†††映湩污挠楬湥⁴‽畑捩䕫楤䅴楰汃敩瑮ന⬊†††††慢敳牕㩬戠獡啥汲ബ⬊†††††畡桴潔敫㩮愠瑵周歯湥ബ⬊†††††瑨灴汃敩瑮›潭正汃敩瑮ബ⬊†††††楴敭畯㩴挠湯瑳䐠牵瑡潩⡮業汬獩捥湯獤›〵Ⱙ਍‫†††⤠഻⬊††††楦慮⁬敲畳瑬㴠愠慷瑩挠楬湥⹴灵慤整牏敤卲慴畴⡳ⰱ✠楆慮楬慺潤⤧഻⬊਍‫†††攠灸捥⡴敲畳瑬献捵散獳‬慦獬⥥഻⬊††††硥数瑣爨獥汵⹴牥潲䵲獥慳敧‬潣瑮楡獮✨条瑯摡❯⤩഻⬊††††汣敩瑮挮潬敳⤨഻⬊†††⥽഻⬊਍‫††琠獥⡴猧潨汵⁤慨摮敬猠牥敶⁲牥潲❲‬⤨愠祳据笠਍‫†††映湩污洠捯䍫楬湥⁴‽浟捯䍫楬湥⡴爨煥敵瑳 獡湹⁣ൻ⬊†††††敲畴湲栠瑴⹰敒灳湯敳✨湉整湲污匠牥敶⁲牅潲❲‬〵⤰഻⬊††††⥽഻⬊਍‫†††映湩污挠楬湥⁴‽畑捩䕫楤䅴楰汃敩瑮戨獡啥汲›慢敳牕ⱬ愠瑵周歯湥›畡桴潔敫Ɱ栠瑴䍰楬湥㩴洠捯䍫楬湥⥴഻⬊††††楦慮⁬敲畳瑬㴠愠慷瑩挠楬湥⹴灵慤整牏敤卲慴畴⡳ⰱ✠楆慮楬慺潤⤧഻⬊਍‫†††攠灸捥⡴敲畳瑬献捵散獳‬慦獬⥥഻⬊††††硥数瑣爨獥汵⹴牥潲䵲獥慳敧‬潣瑮楡獮✨敳癲摩牯⤧㬩਍‫†††挠楬湥⹴汣獯⡥㬩਍‫††素㬩਍‫†素㬩਍‫素㬩਍紫਍

@@ -1,7 +1,16 @@
 import json
 import sqlite3
+import shutil
+import difflib
+import re
+import unicodedata
+import threading
+import logging
+import uuid
+import math
 from pathlib import Path
 from decimal import Decimal
+from dataclasses import asdict
 
 from costos.models.cost_component import CostComponent
 from costos.models.cost_condition import CostCondition
@@ -10,10 +19,21 @@ from costos.models.variable_cost_component import VariableCostComponent
 from costos.models.variable_cost_model import VariableCostModel, build_product_key
 from costos.services.cost_calculator import CostCalculator
 from costos.services.variable_cost_calculator import VariableCostCalculator
+from app.database.maintenance import DatabaseMaintenance, MigrationRunner
+from app.database.migrations import application_migrations
+from app.diagnostics import record_health
+from app.database.order_transaction import OrderConnection
+
+logger = logging.getLogger(__name__)
 
 
 DOCCIONE_PRICE_CATALOG_KEY = "precio_catalogo_doccione_2026_07_15"
 MANUAL_PRIORITY_VALUES = {"Sin prisa": 0, "Baja": 1, "Media": 2, "Alta": 3, "Urgente": 4}
+DELIVERED_ORDER_STATUSES = frozenset({"entregado", "terminado"})
+SELLER_NAME = "Francisco Franco Salguero"
+# Francisco ya percibe sueldo fijo; la comisión es un incentivo adicional y
+# no una distribución principal de la ganancia del pedido.
+SELLER_COMMISSION_PERCENT = 10.0
 
 
 def _manual_priority_value(value) -> int:
@@ -23,6 +43,19 @@ def _manual_priority_value(value) -> int:
         return min(4, max(0, int(value or 0)))
     except (TypeError, ValueError):
         return 0
+
+
+def _is_delivered_order_status(value) -> bool:
+    return str(value or "").strip().casefold() in DELIVERED_ORDER_STATUSES
+
+
+def _seller_commission_percent(assigned_to: object) -> float:
+    """Devuelve la participación pactada para el vendedor del pedido."""
+    return (
+        SELLER_COMMISSION_PERCENT
+        if str(assigned_to or "").strip().casefold() == SELLER_NAME.casefold()
+        else 0.0
+    )
 
 # Valores iniciales extraídos de la lista de precios entregada por Doccione.
 # Se instalan una sola vez y luego siguen siendo reglas totalmente editables.
@@ -38,72 +71,141 @@ DOCCIONE_PRICE_CATALOG: tuple[tuple[str, str, int, float, str, int, str], ...] =
     *( ("Vinilo Ploteado", f"{size}cm", 1, price, "unitario", 1, "") for size, price in ((29, 3500), (25, 3000), (20, 2600), (17, 2200), (15, 1800), (14, 1600), (12, 1300), (10, 1000), (8, 700), (7, 500), (5, 300)) ),
     *( ("Vinilo Premium", f"{size}cm", 1, price, "unitario", 1, "") for size, price in ((29, 6000), (25, 5000), (20, 3600), (18, 3000), (15, 2150), (12, 1500), (10, 1100), (8, 850), (7, 650), (5, 500)) ),
     ("Plancha A4 - Vinilo Blanco Full Color", "A4", 1, 6000, "fijo", 1, "Incluye impresión, armado y troquelado"),
-    ("Plancha A4 - Diseño Único", "A4", 1, 5000, "fijo", 1, "Plancha personalizada"),
+    # Cada plancha es una unidad facturable; el precio debe multiplicarse por
+    # la cantidad solicitada antes de aplicar cualquier descuento general.
+    ("Plancha A4 - Diseño Único", "A4", 1, 5000, "unitario", 1, "Plancha personalizada"),
     ("Plancha A4 - Vinilos Especiales", "A4", 1, 7000, "fijo", 1, "Plancha personalizada"),
 )
 
 
 class ImageDatabase:
-    def __init__(self, db_path: str | Path = "visionvault.db"):
-        # Diagnóstico desactivado - la información se guarda en diagnostic_db_path.log si es necesaria
-        # TEMP LOG: print effective DB path and metadata for diagnostics
-        # try:
-        #     from datetime import datetime
-        #
-        #     eff = Path(db_path).resolve()
-        #     exists = eff.exists()
-        #     size = eff.stat().st_size if exists else 0
-        #     mtime = datetime.fromtimestamp(eff.stat().st_mtime).isoformat(timespec="seconds") if exists else ""
-        # except Exception:
-        #     eff = Path(db_path)
-        #     exists = False
-        #     size = 0
-        #     mtime = ""
-        # print("=====================================")
-        # print("DATABASE PATH")
-        # print("=====================================")
-        # print("Ruta absoluta:")
-        # print(str(eff))
-        # print()
-        # print("Existe:")
-        # print(str(bool(exists)))
-        # print()
-        # print("Tamaño:")
-        # print(str(size))
-        # print()
-        # print("Última modificación:")
-        # print(str(mtime))
-        # print()
-        # print("=====================================")
-        #
-        # # Also write the same block to a deterministic log file for retrieval
-        # try:
-        #     log_path = Path(__file__).resolve().parents[2] / 'diagnostic_db_path.log'
-        #     with open(log_path, 'w', encoding='utf-8') as fh:
-        #         fh.write('=====================================\n')
-        #         fh.write('DATABASE PATH\n')
-        #         fh.write('=====================================\n')
-        #         fh.write('Ruta absoluta:\n')
-        #         fh.write(str(eff) + '\n\n')
-        #         fh.write('Existe:\n')
-        #         fh.write(str(bool(exists)) + '\n\n')
-        #         fh.write('Tamaño:\n')
-        #         fh.write(str(size) + '\n\n')
-        #         fh.write('Última modificación:\n')
-        #         fh.write(str(mtime) + '\n\n')
-        #         fh.write('=====================================\n')
-        # except Exception:
-        #     pass
+    def __init__(
+        self,
+        db_path: str | Path = "visionvault.db",
+        *,
+        defer_automatic_maintenance: bool = False,
+    ):
+        self.db_path = Path(db_path)
+        self._thread_connections = threading.local()
 
-        self.connection = sqlite3.connect(db_path)
-        self.connection.row_factory = sqlite3.Row
+        try:
+            from datetime import datetime
+
+            eff = Path(db_path).resolve()
+            exists = eff.exists()
+            size = eff.stat().st_size if exists else 0
+            mtime = datetime.fromtimestamp(eff.stat().st_mtime).isoformat(timespec="seconds") if exists else ""
+        except Exception:
+            eff = Path(db_path)
+            exists = False
+            size = 0
+            mtime = ""
+        logger.info(
+            "Base de datos configurada",
+            extra={"component": "database", "event": "configured"},
+        )
+        logger.debug("DB path=%s exists=%s size=%s mtime=%s", eff, exists, size, mtime)
+
+        self._thread_connections.conn = self._create_connection()
+        self._thread_connections.conn.row_factory = sqlite3.Row
+        self._thread_connections.conn.execute("PRAGMA journal_mode=WAL")
+        self._thread_connections.conn.execute("PRAGMA busy_timeout = 30000")
+        self.maintenance = DatabaseMaintenance(self.connection, self.db_path)
+        self.last_automatic_backup: str = ""
+        self.automatic_maintenance_pending = bool(
+            defer_automatic_maintenance and exists and size > 0
+        )
+        if exists and size > 0:
+            if not defer_automatic_maintenance:
+                self.run_automatic_maintenance()
+        self._search_cache: dict[tuple, list[dict]] = {}
+        self._count_cache: dict[tuple, int] = {}
+        self._fuzzy_vocabulary_cache: tuple[int, set[str]] | None = None
+        self._visual_search_cache: tuple[int, list[dict]] | None = None
+        self._images_by_paths_cache: dict[tuple[str, ...], list[dict]] = {}
+
+        if exists and size > 0:
+            job_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(order_jobs)")}
+            if job_columns and "distribution_policy" not in job_columns:
+                self.maintenance.create_backup("pre_order_distribution_policy")
+            if job_columns and not self.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='order_delivery_readiness'"
+            ).fetchone():
+                self.maintenance.create_backup("pre_verified_delivery")
+        self._initialize_schema()
+        self.applied_migrations = MigrationRunner(self.connection, self.maintenance).apply_all(
+            application_migrations(),
+            # Una base existente ya fue respaldada por el preflight diario;
+            # una base nueva no necesita copiarse antes de su primera versión.
+            backup_before=bool(exists and size > 0),
+        )
+        record_health(
+            self.connection,
+            "database",
+            "INFO",
+            "Base lista para operar",
+            {
+                "path": str(eff),
+                "automatic_backup": self.last_automatic_backup,
+                "maintenance_pending": self.automatic_maintenance_pending,
+                "applied_migrations": self.applied_migrations,
+            },
+        )
+
+    def run_automatic_maintenance(self) -> str:
+        """Verifica SQLite y crea el respaldo diario en el hilo que la invoque.
+
+        La conexión es local por hilo, por lo que la aplicación de escritorio
+        puede ejecutar este control después de mostrar su primera ventana sin
+        compartir un objeto ``sqlite3.Connection`` con Tk.
+        """
+        maintenance = DatabaseMaintenance(self.connection, self.db_path)
+        maintenance.assert_healthy()
+        automatic_backup = maintenance.ensure_daily_backup(keep=14)
+        self.last_automatic_backup = str(automatic_backup or "")
+        self.automatic_maintenance_pending = False
+        return self.last_automatic_backup
+
+    def _create_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30, factory=OrderConnection)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout = 30000")
+        return conn
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        if not hasattr(self._thread_connections, 'conn'):
+            self._thread_connections.conn = self._create_connection()
+        return self._thread_connections.conn
+
+    @property
+    def event_repo(self):
+        # Outbox rows must use the same per-thread transaction as the order.
+        from app.events.event_repository import EventRepository
+        repo = getattr(self._thread_connections, 'event_repo', None)
+        if repo is None or repo.conn is not self.connection:
+            repo = EventRepository(self.connection)
+            self._thread_connections.event_repo = repo
+        return repo
+
+    @event_repo.setter
+    def event_repo(self, repository):
+        self._thread_connections.event_repo = repository
+
+    def _initialize_schema(self) -> None:
+        # Ensure the schema exists on the first connection for this database.
+        self.connection.execute("PRAGMA database_list")
         self.connection.execute(
             """CREATE TABLE IF NOT EXISTS images (
                 path TEXT PRIMARY KEY, name TEXT NOT NULL, extension TEXT NOT NULL,
-                size INTEGER NOT NULL, modified REAL NOT NULL, caption TEXT DEFAULT ''
+                size INTEGER NOT NULL, modified REAL NOT NULL, caption TEXT DEFAULT '',
+                recognized_text TEXT DEFAULT ''
             )"""
         )
         columns = {row[1] for row in self.connection.execute("PRAGMA table_info(images)")}
+        if "recognized_text" not in columns:
+            self.connection.execute("ALTER TABLE images ADD COLUMN recognized_text TEXT DEFAULT ''")
         if "category" not in columns:
             self.connection.execute("ALTER TABLE images ADD COLUMN category TEXT DEFAULT ''")
         if "visual_score" not in columns:
@@ -149,6 +251,11 @@ class ImageDatabase:
         self.connection.execute("CREATE INDEX IF NOT EXISTS idx_image_tags_tag ON image_tags(tag_id)")
         self.connection.execute("CREATE INDEX IF NOT EXISTS idx_images_modified ON images(modified DESC)")
         self.connection.execute("CREATE INDEX IF NOT EXISTS idx_images_category ON images(category)")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_images_name_nocase ON images(name COLLATE NOCASE)")
+        self.connection.execute(
+            """CREATE INDEX IF NOT EXISTS idx_images_mobile_catalog
+               ON images(is_reusable, is_private, name COLLATE NOCASE)"""
+        )
         self.connection.execute(
             """CREATE TABLE IF NOT EXISTS visual_similarities (
                 query_path TEXT NOT NULL, candidate_path TEXT NOT NULL, score REAL NOT NULL,
@@ -158,6 +265,14 @@ class ImageDatabase:
             )"""
         )
         self.connection.execute("CREATE INDEX IF NOT EXISTS idx_visual_similarities_query ON visual_similarities(query_path, score DESC)")
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS visual_search_runs (
+                cache_key TEXT PRIMARY KEY, query_path TEXT NOT NULL,
+                query_modified REAL NOT NULL, candidate_fingerprint TEXT NOT NULL,
+                options_json TEXT NOT NULL, matches_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
         self.connection.execute(
             """CREATE TABLE IF NOT EXISTS ai_results (
                 image_path TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
@@ -241,6 +356,7 @@ class ImageDatabase:
             ("print_priority", "INTEGER DEFAULT 0"),
             ("order_concept", "TEXT DEFAULT ''"),
             ("order_description", "TEXT DEFAULT ''"),
+            ("complaint_notes", "TEXT DEFAULT ''"),
             # Presupuesto: se guardan valores simples y trazables. La regla de
             # precio, si se usa, solo propone un importe; nunca reemplaza uno
             # confirmado por el usuario.
@@ -250,17 +366,41 @@ class ImageDatabase:
             ("paid_amount", "REAL DEFAULT 0"),
             ("payment_status", "TEXT DEFAULT 'Pendiente'"),
             ("assigned_to", "TEXT DEFAULT ''"),
+            # Comisión comercial: solo se aplica cuando el pedido tiene un
+            # vendedor asignado. Se conserva el porcentaje pactado en el
+            # pedido para que los cambios futuros no alteren ventas históricas.
+            ("seller_commission_percent", "REAL DEFAULT 0"),
+            ("seller_commission_amount", "REAL DEFAULT 0"),
+            # Identidad del vendedor móvil que creó el pedido. Es distinta de
+            # ``assigned_to``: asignar producción no transfiere su propiedad.
+            ("creator_device_id", "INTEGER"),
+            # Un pedido de stickers puede formar parte de un pedido comercial
+            # más amplio (por ejemplo, anillado + stickers) sin mezclar los
+            # trabajos, las planchas ni sus respectivos flujos de producción.
+            ("parent_order_id", "INTEGER"),
             # Costos desglosados — sincronizados desde order_jobs
             ("cost_mp",    "REAL DEFAULT 0"),   # Materia Prima
             ("cost_mo",    "REAL DEFAULT 0"),   # Mano de Obra
             ("cost_cf",    "REAL DEFAULT 0"),   # Carga Fabril
             ("cost_total", "REAL DEFAULT 0"),   # M.P + M.O + C.F
             ("margin",     "REAL DEFAULT 0"),   # budget_total − cost_total
+            # Preserva la eliminación intencional de todos los trabajos.
+            ("order_jobs_deleted", "INTEGER DEFAULT 0"),
         ):
             if column not in order_columns:
                 self.connection.execute(f"ALTER TABLE orders ADD COLUMN {column} {definition}")
+        # La urgencia es operativa: deja de aplicar cuando el pedido ya fue
+        # entregado. También normaliza registros creados por versiones
+        # anteriores que conservaron su prioridad después del cierre.
+        self.connection.execute(
+            """UPDATE orders
+               SET print_priority = 0
+               WHERE COALESCE(print_priority, 0) != 0
+                 AND LOWER(TRIM(COALESCE(status, ''))) IN ('entregado', 'terminado')"""
+        )
         self.connection.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
         self.connection.execute("CREATE INDEX IF NOT EXISTS idx_orders_date ON orders(order_date DESC)")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_orders_parent ON orders(parent_order_id)")
         # Un pedido puede reunir varios trabajos. El resumen histórico del
         # pedido se conserva en `orders` para no romper planchas, cobros ni
         # pantallas existentes; estos ítems son el detalle operativo.
@@ -289,6 +429,15 @@ class ImageDatabase:
             ("cost_mo",    "REAL DEFAULT 0"),
             ("cost_cf",    "REAL DEFAULT 0"),
             ("cost_total", "REAL DEFAULT 0"),
+            # Fotocopias y terminaciones: snapshot de precios
+            ("base_price", "REAL DEFAULT 0"),
+            ("discount_amount", "REAL DEFAULT 0"),
+            ("surcharge_amount", "REAL DEFAULT 0"),
+            ("final_price", "REAL DEFAULT 0"),
+            ("is_urgent", "INTEGER DEFAULT 0"),
+            ("manual_price", "REAL DEFAULT NULL"),
+            ("price_calculation_json", "TEXT DEFAULT '{}'"),
+            ("unit_kind", "TEXT DEFAULT ''"),
         ):
             if column not in order_job_columns:
                 self.connection.execute(f"ALTER TABLE order_jobs ADD COLUMN {column} {definition}")
@@ -297,7 +446,7 @@ class ImageDatabase:
         self.connection.execute(
             """CREATE TABLE IF NOT EXISTS cost_rules (
                 id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
+                name TEXT NOT NULL UNIQUE,
                 condition TEXT DEFAULT '',
                 material TEXT DEFAULT '',
                 
@@ -330,14 +479,36 @@ class ImageDatabase:
         self.connection.execute(
             """CREATE TABLE IF NOT EXISTS order_designs (
                 order_id INTEGER NOT NULL, image_path TEXT NOT NULL, quantity INTEGER DEFAULT 1,
-                size_cm REAL DEFAULT 5.9, rotation INTEGER DEFAULT 0,
+                size_cm REAL DEFAULT 5.0, rotation INTEGER DEFAULT 0,
                 PRIMARY KEY(order_id, image_path),
                 FOREIGN KEY(order_id) REFERENCES orders(id)
             )"""
         )
         design_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(order_designs)")}
-        if "status" not in design_columns:
-            self.connection.execute("ALTER TABLE order_designs ADD COLUMN status TEXT DEFAULT 'Pendiente'")
+        for column, definition in (
+            ("status", "TEXT DEFAULT 'Pendiente'"),
+            ("source", "TEXT DEFAULT ''"),
+            ("creator_status", "TEXT DEFAULT 'Pendiente'"),
+            ("creator_queued_at", "TEXT DEFAULT ''"),
+        ):
+            if column not in design_columns:
+                self.connection.execute(f"ALTER TABLE order_designs ADD COLUMN {column} {definition}")
+        # Recupera pedidos móviles creados antes de que `source` fuese
+        # persistido. La leyenda y la carpeta son datos generados por Studio,
+        # no rutas informadas por el dispositivo.
+        self.connection.execute(
+            """UPDATE order_designs
+               SET source = 'mobile'
+               WHERE COALESCE(source, '') = ''
+                 AND (
+                     LOWER(image_path) LIKE '%mobile_uploads%'
+                     OR EXISTS (
+                         SELECT 1 FROM images
+                         WHERE images.path = order_designs.image_path
+                           AND LOWER(COALESCE(images.caption, '')) = 'imagen recibida desde doccione mobile'
+                     )
+                 )"""
+        )
         self.connection.execute(
             """CREATE TABLE IF NOT EXISTS order_drafts (
                 order_id INTEGER PRIMARY KEY, draft_json TEXT NOT NULL,
@@ -356,6 +527,38 @@ class ImageDatabase:
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_order_events_order ON order_events(order_id, id DESC)"
         )
+        # Las versiones anteriores solo guardaban la autoría móvil dentro del
+        # evento JSON. Se recupera una vez para no perder pedidos del vendedor.
+        legacy_mobile_events = self.connection.execute(
+            """SELECT order_id, data_json
+               FROM order_events
+               WHERE event_type IN (
+                   'order.created.mobile_catalog',
+                   'order.created.mobile_pos',
+                   'order.created.mobile_stickers'
+               )
+                 AND EXISTS (
+                     SELECT 1 FROM orders
+                     WHERE orders.id = order_events.order_id
+                       AND orders.creator_device_id IS NULL
+                 )
+               ORDER BY id"""
+        ).fetchall()
+        for event in legacy_mobile_events:
+            try:
+                creator_device_id = int(json.loads(event["data_json"] or "{}").get("device_id"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            self.connection.execute(
+                """UPDATE orders
+                   SET creator_device_id = ?
+                   WHERE id = ? AND creator_device_id IS NULL""",
+                (creator_device_id, event["order_id"]),
+            )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_creator_device "
+            "ON orders(creator_device_id, updated_at, id)"
+        )
         self.connection.execute(
             """CREATE TABLE IF NOT EXISTS order_payments (
                 id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL,
@@ -366,6 +569,18 @@ class ImageDatabase:
         )
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_order_payments_order ON order_payments(order_id, paid_at DESC)"
+        )
+        payment_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(order_payments)")}
+        for column, definition in (
+            ("cancelled_at", "TEXT DEFAULT ''"),
+            ("cancellation_reason", "TEXT DEFAULT ''"),
+            ("idempotency_key", "TEXT DEFAULT ''"),
+        ):
+            if column not in payment_columns:
+                self.connection.execute(f"ALTER TABLE order_payments ADD COLUMN {column} {definition}")
+        self.connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_order_payments_idempotency "
+            "ON order_payments(order_id, idempotency_key) WHERE idempotency_key <> ''"
         )
         self.connection.execute(
             """CREATE TABLE IF NOT EXISTS order_previews (
@@ -413,7 +628,7 @@ class ImageDatabase:
                 min_quantity INTEGER DEFAULT 1, price REAL NOT NULL,
                 extra_service TEXT DEFAULT '', discount_percent REAL DEFAULT 0,
                 active INTEGER DEFAULT 1, price_mode TEXT DEFAULT 'fijo',
-                pack_quantity INTEGER DEFAULT 1, catalog_key TEXT DEFAULT ''
+                pack_quantity INTEGER DEFAULT 1, catalog_key TEXT DEFAULT NULL
             )"""
         )
         price_rule_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(price_rules)")}
@@ -427,6 +642,7 @@ class ImageDatabase:
             ("source_updated_at", "TEXT DEFAULT ''"),
             ("last_synced_at", "TEXT DEFAULT ''"),
             ("manually_overridden", "INTEGER DEFAULT 0"),
+            ("image_path", "TEXT DEFAULT ''"),
         ):
             if column not in price_rule_columns:
                 self.connection.execute(f"ALTER TABLE price_rules ADD COLUMN {column} {definition}")
@@ -441,6 +657,31 @@ class ImageDatabase:
                 if "variable_cost_model_id" not in price_rule_columns_after:
                     self.connection.execute("ALTER TABLE price_rules ADD COLUMN variable_cost_model_id INTEGER DEFAULT NULL")
         self.connection.execute("CREATE INDEX IF NOT EXISTS idx_price_rules_catalog ON price_rules(catalog_key)")
+        
+        # Fotocopias y terminaciones: configuración de recargos y descuentos
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS fotocopia_config (
+                id INTEGER PRIMARY KEY,
+                urgent_surcharge_percent REAL DEFAULT 30.0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS fotocopia_quantity_discounts (
+                id INTEGER PRIMARY KEY,
+                product_type TEXT NOT NULL,
+                min_quantity INTEGER NOT NULL,
+                max_quantity INTEGER,
+                discount_percent REAL NOT NULL,
+                active INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fotocopia_discounts_type ON fotocopia_quantity_discounts(product_type, min_quantity)"
+        )
         self.connection.execute(
             """CREATE TABLE IF NOT EXISTS plancha_projects (
                 id INTEGER PRIMARY KEY, order_id INTEGER, name TEXT NOT NULL,
@@ -473,19 +714,72 @@ class ImageDatabase:
             ("client_preview_bg_type", "TEXT DEFAULT ''"),
             ("client_preview_bg_value", "TEXT DEFAULT ''"),
             ("client_preview_updated_at", "TEXT DEFAULT ''"),
+            # Paginación: agrupación de planchas múltiples
+            ("plancha_set_id", "TEXT DEFAULT ''"),
+            ("plancha_number", "INTEGER DEFAULT 1"),
+            ("total_planchas", "INTEGER DEFAULT 1"),
+            # Datos de la persona cuando la plancha se crea fuera de un pedido.
+            ("person_name", "TEXT DEFAULT ''"),
+            ("person_phone", "TEXT DEFAULT ''"),
+            ("workspace_format", "TEXT DEFAULT 'a4'"),
+            ("continuous_confirmed", "INTEGER DEFAULT 0"),
         ):
             if column not in plancha_columns:
                 self.connection.execute(f"ALTER TABLE plancha_projects ADD COLUMN {column} {definition}")
-        # Migración: asignar production_status basado en el estado actual
+        # Manifiesto productivo. Las planchas históricas quedan válidas aunque
+        # no tengan filas: nunca se infiere procedencia desde un JSON ambiguo.
         self.connection.execute(
-            """UPDATE plancha_projects SET production_status = CASE
-                WHEN COALESCE(final_png_path, '') = '' AND COALESCE(project_path, '') = '' THEN 'borrador'
-                WHEN COALESCE(final_png_path, '') = '' THEN 'guardada'
-                WHEN print_status = 'Impresa' THEN 'impresa'
-                ELSE 'lista'
-            END
-            WHERE production_status = 'borrador' OR production_status IS NULL"""
+            """CREATE TABLE IF NOT EXISTS plancha_item_assignments (
+                id INTEGER PRIMARY KEY,
+                plancha_id INTEGER NOT NULL,
+                item_id TEXT NOT NULL,
+                requested_unit_key TEXT NOT NULL,
+                order_id INTEGER NOT NULL,
+                order_job_id INTEGER NOT NULL,
+                order_design_line_id TEXT DEFAULT '',
+                image_path TEXT DEFAULT '',
+                copy_number INTEGER NOT NULL DEFAULT 1,
+                unit_kind TEXT NOT NULL DEFAULT 'item',
+                quantity REAL NOT NULL DEFAULT 1,
+                state TEXT NOT NULL DEFAULT 'prepared',
+                prepared_at TEXT NOT NULL,
+                printed_at TEXT DEFAULT '',
+                finished_at TEXT DEFAULT '',
+                released_at TEXT DEFAULT '',
+                updated_at TEXT NOT NULL,
+                UNIQUE(plancha_id, item_id),
+                FOREIGN KEY(plancha_id) REFERENCES plancha_projects(id),
+                FOREIGN KEY(order_id) REFERENCES orders(id),
+                FOREIGN KEY(order_job_id) REFERENCES order_jobs(id)
+            )"""
         )
+        self.connection.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_plancha_assignment_active_unit
+               ON plancha_item_assignments(requested_unit_key)
+               WHERE state <> 'released'"""
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_plancha_assignment_job ON plancha_item_assignments(order_job_id, state)"
+        )
+        assignment_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(plancha_item_assignments)")}
+        if "order_design_line_id" not in assignment_columns:
+            self.connection.execute("ALTER TABLE plancha_item_assignments ADD COLUMN order_design_line_id TEXT DEFAULT ''")
+        # Migración: asignar production_status basado en el estado actual.
+        # Evitar el escaneo completo cuando no existen filas pendientes.
+        _pending_planchas = self.connection.execute(
+            "SELECT 1 FROM plancha_projects "
+            "WHERE production_status = 'borrador' OR production_status IS NULL LIMIT 1"
+        ).fetchone()
+        if _pending_planchas:
+            self.connection.execute(
+                """UPDATE plancha_projects SET production_status = CASE
+                    WHEN COALESCE(final_png_path, '') = '' AND COALESCE(project_path, '') = '' THEN 'borrador'
+                    WHEN COALESCE(final_png_path, '') = '' THEN 'guardada'
+                    WHEN print_status = 'Impresa' THEN 'impresa'
+                    ELSE 'lista'
+                END
+                WHERE production_status = 'borrador' OR production_status IS NULL"""
+            )
         # Producciones continuas: solo conservan referencias a planchas A4
         # guardadas. No duplican ni modifican los PNG originales.
         self.connection.execute(
@@ -607,113 +901,718 @@ class ImageDatabase:
             "ON variable_cost_models(product_key) WHERE active = 1 AND product_key != ''"
         )
 
-        # --- Sistema de eventos y notificaciones push ---
-        self.connection.execute(
-            """CREATE TABLE IF NOT EXISTS app_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_uuid TEXT NOT NULL UNIQUE,
-                event_type TEXT NOT NULL,
-                priority TEXT NOT NULL DEFAULT 'normal',
-                title TEXT NOT NULL,
-                message TEXT NOT NULL,
-                entity_type TEXT,
-                entity_id INTEGER,
-                payload_json TEXT,
-                created_at TEXT NOT NULL,
-                processed INTEGER NOT NULL DEFAULT 0
-            )"""
-        )
-        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_app_events_type ON app_events(event_type, created_at DESC)")
-        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_app_events_processed ON app_events(processed, created_at DESC)")
-        self.connection.execute(
-            """CREATE TABLE IF NOT EXISTS notification_outbox (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_uuid TEXT NOT NULL,
-                channel TEXT NOT NULL DEFAULT 'push',
-                recipient_id TEXT,
-                status TEXT NOT NULL DEFAULT 'pending',
-                attempts INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT,
-                next_attempt_at TEXT,
-                sent_at TEXT,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(event_uuid) REFERENCES app_events(event_uuid)
-            )"""
-        )
-        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_outbox_status ON notification_outbox(status, next_attempt_at)")
-        self.connection.execute(
-            """CREATE TABLE IF NOT EXISTS mobile_devices (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                device_name TEXT,
-                platform TEXT NOT NULL,
-                push_token TEXT NOT NULL UNIQUE,
-                active INTEGER NOT NULL DEFAULT 1,
-                last_seen_at TEXT,
-                created_at TEXT NOT NULL
-            )"""
-        )
-        self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_mobile_devices_token ON mobile_devices(push_token)")
-        self.connection.execute(
-            """CREATE TABLE IF NOT EXISTS device_notification_prefs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                device_id INTEGER NOT NULL,
-                event_type TEXT NOT NULL,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                FOREIGN KEY(device_id) REFERENCES mobile_devices(id),
-                UNIQUE(device_id, event_type)
-            )"""
-        )
-        # Códigos de emparejamiento temporales (uso único, expiran en 5 min, almacenados como hash)
-        self.connection.execute(
-            """CREATE TABLE IF NOT EXISTS pairing_codes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                code_hash TEXT NOT NULL UNIQUE,
-                installation_id TEXT NOT NULL DEFAULT 'studio-principal',
-                used INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                expires_at TEXT NOT NULL
-            )"""
-        )
-        # Historial de etapas de producción para auditoría
-        self.connection.execute(
-            """CREATE TABLE IF NOT EXISTS production_stage_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                job_id INTEGER NOT NULL,
-                order_id INTEGER NOT NULL,
-                old_stage TEXT,
-                new_stage TEXT NOT NULL,
-                device_id INTEGER,
-                device_name TEXT,
-                operator_name TEXT,
-                source TEXT NOT NULL DEFAULT 'mobile',
-                notes TEXT DEFAULT '',
-                changed_at TEXT NOT NULL,
-                FOREIGN KEY(job_id) REFERENCES order_jobs(id),
-                FOREIGN KEY(order_id) REFERENCES orders(id),
-                FOREIGN KEY(device_id) REFERENCES mobile_devices(id)
-            )"""
-        )
-        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_production_history_job ON production_stage_history(job_id, changed_at DESC)")
-        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_production_history_order ON production_stage_history(order_id, changed_at DESC)")
-        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_production_history_device ON production_stage_history(device_id, changed_at DESC)")
-        # Idempotencia del outbox: evitar mensajes duplicados al mismo dispositivo
-        self.connection.execute(
-            """CREATE UNIQUE INDEX IF NOT EXISTS idx_notification_outbox_event_device
-               ON notification_outbox(event_uuid, recipient_id, channel)"""
-        )
-        
         # ── Migraciones de esquema (ejecutar antes de crear EventRepository) ──
         self._migrate_order_clients()
         self._migrate_order_jobs()
         self._migrate_mobile_devices()
         self._migrate_pairing_codes()
+        self._migrate_sync_indexes()
+        self._migrate_commercial_pricing()
+        self._migrate_productive_plancha_costs()
+        self._migrate_mobile_security()
+        self._migrate_mobile_order_idempotency()
         self.install_doccione_price_catalog()
+        self.install_commercial_price_catalog()
+        self._repair_legacy_unique_design_plancha_totals()
+        self.install_fotocopia_price_catalog()
         self.connection.commit()
+
+        # ── Crear tablas de WhatsApp ──
+        from app.whatsapp.repository import create_whatsapp_tables
+        create_whatsapp_tables(self.connection)
 
         # ── Crear EventRepository después de todas las migraciones ──
         from app.events.event_repository import EventRepository
         self.event_repo = EventRepository(self.connection)
+        self._restore_recognized_text_from_ai_results()
+        self._setup_sticker_search_index()
+
+    def _restore_recognized_text_from_ai_results(self) -> None:
+        """Recupera OCR de análisis anteriores al campo de búsqueda actual."""
+        rows = self.connection.execute(
+            """SELECT images.path, ai_results.result
+                 FROM images JOIN ai_results ON ai_results.image_path = images.path
+                WHERE ai_results.modified = images.modified
+                  AND COALESCE(images.recognized_text, '') = ''"""
+        )
+        recovered = []
+        seen_paths = set()
+        for path, raw_result in rows:
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            try:
+                text = " ".join(str(json.loads(raw_result).get("text") or "").split())
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if text:
+                recovered.append((text, path))
+        if recovered:
+            self.connection.executemany(
+                "UPDATE images SET recognized_text = ? WHERE path = ?", recovered
+            )
+
+    def _setup_sticker_search_index(self) -> None:
+        """Crea el índice de texto que usa la biblioteca.
+
+        FTS5 evita recorrer etiquetas y pedidos completos cada vez que se pulsa
+        una tecla. ``unicode61`` además hace que ``seleccion`` encuentre
+        ``Selección`` sin pedir al usuario que escriba los acentos exactos.
+        """
+        self._sticker_search_fts = False
+        try:
+            # Las bases creadas antes de incluir OCR tenían un índice FTS sin
+            # esta columna. Se puede recrear sin perder datos: es un índice
+            # derivado de ``images`` e ``image_tags``.
+            index_columns = {
+                row[1] for row in self.connection.execute("PRAGMA table_info(sticker_search)")
+            }
+            if index_columns and "recognized_text" not in index_columns:
+                self.connection.execute("DROP TABLE sticker_search")
+            self.connection.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS sticker_search USING fts5("
+                "image_path UNINDEXED, caption, tags, category, design_client, recognized_text, "
+                "tokenize='unicode61 remove_diacritics 2')"
+            )
+            indexed = self.connection.execute("SELECT COUNT(*) FROM sticker_search").fetchone()[0]
+            images = self.connection.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+            if indexed != images:
+                self.connection.execute("DELETE FROM sticker_search")
+                self.connection.execute(
+                    """INSERT INTO sticker_search(image_path, caption, tags, category, design_client, recognized_text)
+                       SELECT images.path, images.caption,
+                              COALESCE(GROUP_CONCAT(tags.name, ' '), ''),
+                              images.category, images.design_client, images.recognized_text
+                       FROM images
+                       LEFT JOIN image_tags ON image_tags.image_path = images.path
+                       LEFT JOIN tags ON tags.id = image_tags.tag_id
+                       GROUP BY images.path"""
+                )
+            self.connection.commit()
+            self._sticker_search_fts = True
+        except sqlite3.OperationalError:
+            # Algunas instalaciones antiguas de SQLite no incluyen FTS5. La
+            # búsqueda clásica sigue disponible en ese caso.
+            self._sticker_search_fts = False
+
+    def _refresh_sticker_search_entry(self, image_path: str) -> None:
+        """Sincroniza un diseño puntual; las ediciones no obligan a reindexar."""
+        if not getattr(self, "_sticker_search_fts", False):
+            return
+        row = self.connection.execute(
+            """SELECT images.path, images.caption, images.category, images.design_client, images.recognized_text,
+                      COALESCE(GROUP_CONCAT(tags.name, ' '), '') AS tags
+               FROM images LEFT JOIN image_tags ON image_tags.image_path = images.path
+               LEFT JOIN tags ON tags.id = image_tags.tag_id
+               WHERE images.path = ? GROUP BY images.path""",
+            (image_path,),
+        ).fetchone()
+        self.connection.execute("DELETE FROM sticker_search WHERE image_path = ?", (image_path,))
+        if row:
+            self.connection.execute(
+                "INSERT INTO sticker_search(image_path, caption, tags, category, design_client, recognized_text) VALUES(?, ?, ?, ?, ?, ?)",
+                (row["path"], row["caption"], row["tags"], row["category"], row["design_client"], row["recognized_text"]),
+            )
+
+    @staticmethod
+    def _fts_query(query: str) -> str:
+        # Una palabra por prefijo: rápido al escribir y sin permitir que el
+        # texto de usuario altere la sintaxis de FTS.
+        tokens = re.findall(r"[\wÀ-ÿ]+", query)
+        return " AND ".join(f"{token}*" for token in tokens)
+
+    def _migrate_commercial_pricing(self) -> None:
+        """Añade el catálogo comercial sin alterar los pedidos ni reglas existentes."""
+        from datetime import datetime
+
+        # Una copia recuperable sólo se crea al migrar una base existente.
+        has_catalog = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='products'"
+        ).fetchone()
+        if not has_catalog and self.db_path.exists() and self.db_path.stat().st_size:
+            backup = self.db_path.with_suffix(self.db_path.suffix + ".before_commercial_pricing.bak")
+            if not backup.exists():
+                self.connection.commit()
+                shutil.copy2(self.db_path, backup)
+
+        self.connection.execute("""CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+        product_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(products)")}
+        for column, definition in (
+            ("description", "TEXT DEFAULT ''"),
+            ("category", "TEXT DEFAULT ''"),
+            ("image_path", "TEXT DEFAULT ''"),
+            ("base_price", "REAL DEFAULT NULL"),
+        ):
+            if column not in product_columns:
+                self.connection.execute(f"ALTER TABLE products ADD COLUMN {column} {definition}")
+        self.connection.execute("""CREATE TABLE IF NOT EXISTS product_variants (
+            id INTEGER PRIMARY KEY, product_id INTEGER NOT NULL, code TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL, line TEXT DEFAULT '', material TEXT DEFAULT '', size TEXT DEFAULT '',
+            modality TEXT DEFAULT '', active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            FOREIGN KEY(product_id) REFERENCES products(id))""")
+        self.connection.execute("""CREATE TABLE IF NOT EXISTS price_lists (
+            id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_variants_product ON product_variants(product_id)")
+        price_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(price_rules)")}
+        for column, definition in (
+            ("product_id", "INTEGER"), ("variant_id", "INTEGER"), ("price_list_id", "INTEGER"),
+            ("max_quantity", "INTEGER"), ("priority", "INTEGER NOT NULL DEFAULT 0"),
+            ("rule_name", "TEXT DEFAULT ''"), ("preparation_limit", "INTEGER"),
+        ):
+            if column not in price_columns:
+                self.connection.execute(f"ALTER TABLE price_rules ADD COLUMN {column} {definition}")
+        job_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(order_jobs)")}
+        for column, definition in (
+            ("product_id", "INTEGER"), ("variant_id", "INTEGER"), ("price_list_id", "INTEGER"),
+            ("price_rule_id", "INTEGER"), ("unit_price_snapshot", "REAL"),
+            ("fixed_price_snapshot", "REAL"), ("product_name_snapshot", "TEXT DEFAULT ''"),
+            ("variant_name_snapshot", "TEXT DEFAULT ''"), ("price_list_name_snapshot", "TEXT DEFAULT ''"),
+            ("price_rule_name_snapshot", "TEXT DEFAULT ''"), ("calculation_type", "TEXT DEFAULT ''"),
+            ("material_snapshot", "TEXT DEFAULT ''"), ("size_snapshot", "TEXT DEFAULT ''"),
+            ("manual_override", "INTEGER NOT NULL DEFAULT 0"), ("manual_override_reason", "TEXT DEFAULT ''"),
+            ("calculated_at", "TEXT DEFAULT ''"),
+        ):
+            if column not in job_columns:
+                self.connection.execute(f"ALTER TABLE order_jobs ADD COLUMN {column} {definition}")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_price_rules_match ON price_rules(product_id, variant_id, price_list_id, active)")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_order_jobs_price_rule ON order_jobs(price_rule_id)")
+
+    def _migrate_productive_plancha_costs(self) -> None:
+        """Agrega datos productivos A4 sin recalcular ni alterar pedidos históricos."""
+        from datetime import datetime
+
+        has_schema = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'order_job_production_estimates'"
+        ).fetchone()
+        if not has_schema and self.db_path.exists() and self.db_path.stat().st_size:
+            backup = self.db_path.with_suffix(self.db_path.suffix + ".before_productive_plancha_costs.bak")
+            if not backup.exists():
+                self.connection.commit()
+                shutil.copy2(self.db_path, backup)
+
+        order_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(orders)")}
+        for column, definition in (
+            ("commercial_cost", "REAL DEFAULT 0"),
+            ("commercial_cost_kind", "TEXT DEFAULT ''"),
+            ("final_cost", "REAL DEFAULT 0"),
+            ("final_margin", "REAL DEFAULT 0"),
+        ):
+            if column not in order_columns:
+                self.connection.execute(f"ALTER TABLE orders ADD COLUMN {column} {definition}")
+
+        job_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(order_jobs)")}
+        for column, definition in (
+            ("base_price_snapshot", "REAL DEFAULT 0"),
+            ("suggested_price_snapshot", "REAL DEFAULT 0"),
+            ("applied_price_snapshot", "REAL DEFAULT 0"),
+            ("productive_cost", "REAL DEFAULT 0"),
+            ("commercial_cost_allocated", "REAL DEFAULT 0"),
+            ("final_cost", "REAL DEFAULT 0"),
+            ("productive_margin", "REAL DEFAULT 0"),
+            ("final_margin", "REAL DEFAULT 0"),
+            ("productive_classification", "TEXT DEFAULT ''"),
+            ("production_mode", "TEXT DEFAULT ''"),
+            ("price_source", "TEXT DEFAULT 'legacy'"),
+            ("manual_price_snapshot", "REAL"),
+        ):
+            if column not in job_columns:
+                self.connection.execute(f"ALTER TABLE order_jobs ADD COLUMN {column} {definition}")
+
+        design_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(order_designs)")}
+        for column, definition in (
+            ("order_job_id", "INTEGER"),
+            ("estimated_design_minutes", "REAL DEFAULT 0"),
+        ):
+            if column not in design_columns:
+                self.connection.execute(f"ALTER TABLE order_designs ADD COLUMN {column} {definition}")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_order_designs_job ON order_designs(order_job_id)")
+        self._migrate_order_designs_nominal_size()
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS order_design_job_links (
+                id INTEGER PRIMARY KEY,
+                order_id INTEGER NOT NULL,
+                order_job_id INTEGER NOT NULL,
+                image_path TEXT NOT NULL,
+                quantity INTEGER NOT NULL DEFAULT 1,
+                size_cm REAL NOT NULL DEFAULT 5.0,
+                rotation INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(order_job_id,image_path,size_cm,rotation),
+                FOREIGN KEY(order_id) REFERENCES orders(id),
+                FOREIGN KEY(order_job_id) REFERENCES order_jobs(id)
+            )"""
+        )
+        # Tabla aditiva v2: conserva intacta la relación histórica, pero permite
+        # dos líneas del mismo trabajo con idéntico archivo y configuración.
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS order_design_demand_lines (
+                id INTEGER PRIMARY KEY, design_line_id TEXT NOT NULL UNIQUE,
+                order_id INTEGER NOT NULL, order_job_id INTEGER NOT NULL,
+                image_path TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1,
+                size_cm REAL NOT NULL DEFAULT 5.0, rotation INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                FOREIGN KEY(order_id) REFERENCES orders(id),
+                FOREIGN KEY(order_job_id) REFERENCES order_jobs(id)
+            )"""
+        )
+        demand_count = self.connection.execute("SELECT COUNT(*) FROM order_design_demand_lines").fetchone()[0]
+        if not demand_count:
+            legacy_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(order_design_job_links)")}
+            for legacy in self.connection.execute("SELECT * FROM order_design_job_links").fetchall():
+                data = dict(legacy)
+                line_id = str(data.get("design_line_id") or f"legacy-design-line-{data['id']}")
+                self.connection.execute(
+                    """INSERT OR IGNORE INTO order_design_demand_lines(
+                           design_line_id,order_id,order_job_id,image_path,quantity,size_cm,rotation,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (line_id, data["order_id"], data["order_job_id"], data["image_path"], data["quantity"],
+                     data["size_cm"], data["rotation"], data["created_at"], data["updated_at"]),
+                )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_order_design_demand_order ON order_design_demand_lines(order_id,order_job_id)"
+        )
+        demand_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(order_design_demand_lines)")}
+        for column, definition in (
+            ("unit_kind", "TEXT DEFAULT ''"),
+            ("packing_mode", "TEXT DEFAULT ''"),
+            ("workspace_format", "TEXT DEFAULT 'a4'"),
+        ):
+            if column not in demand_columns:
+                self.connection.execute(f"ALTER TABLE order_design_demand_lines ADD COLUMN {column} {definition}")
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS production_batches (
+                id INTEGER PRIMARY KEY, batch_key TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'prepared',
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                cancelled_at TEXT DEFAULT ''
+            )"""
+        )
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS production_batch_planchas (
+                batch_id INTEGER NOT NULL, plancha_id INTEGER NOT NULL UNIQUE,
+                group_key TEXT NOT NULL, plancha_number INTEGER NOT NULL,
+                PRIMARY KEY(batch_id,plancha_id),
+                FOREIGN KEY(batch_id) REFERENCES production_batches(id),
+                FOREIGN KEY(plancha_id) REFERENCES plancha_projects(id)
+            )"""
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_order_design_job_links_order ON order_design_job_links(order_id,order_job_id)"
+        )
+        self.connection.execute("""CREATE TABLE IF NOT EXISTS order_job_production_estimates (
+            order_job_id INTEGER PRIMARY KEY, unique_designs INTEGER NOT NULL DEFAULT 1,
+            production_mode TEXT NOT NULL DEFAULT 'individual', design_minutes REAL DEFAULT 0,
+            design_minutes_json TEXT DEFAULT '[]',
+            print_minutes REAL DEFAULT 0, cut_minutes REAL DEFAULT 0,
+            productive_surcharge REAL DEFAULT 0, additional_services REAL DEFAULT 0,
+            authorized_discount REAL DEFAULT 0, additional_materials REAL DEFAULT 0,
+            waste_cost REAL DEFAULT 0, valid_productive_exception INTEGER DEFAULT 0,
+            calculated_at TEXT DEFAULT '', FOREIGN KEY(order_job_id) REFERENCES order_jobs(id))""")
+        self.connection.execute("""CREATE TABLE IF NOT EXISTS order_job_internal_incidents (
+            id INTEGER PRIMARY KEY, order_job_id INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT '',
+            description TEXT DEFAULT '', extra_minutes REAL DEFAULT 0, cost REAL DEFAULT 0,
+            created_at TEXT NOT NULL, FOREIGN KEY(order_job_id) REFERENCES order_jobs(id))""")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_order_job_incidents_job ON order_job_internal_incidents(order_job_id, id DESC)")
+        estimate_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(order_job_production_estimates)")}
+        if "design_minutes_json" not in estimate_columns:
+            self.connection.execute("ALTER TABLE order_job_production_estimates ADD COLUMN design_minutes_json TEXT DEFAULT '[]'")
+
+        defaults = {
+            "productive_plancha_a4.base_price": "5000",
+            "productive_plancha_a4.standard_design_minutes": "10",
+            "productive_plancha_a4.standard_print_minutes": "10",
+            "productive_plancha_a4.standard_cut_minutes": "10",
+            "productive_plancha_a4.additional_design_block_minutes": "10",
+            "productive_plancha_a4.additional_design_block_rate": "1000",
+            "productive_plancha_a4.standard_target_cost": "2000",
+            "productive_plancha_a4.standard_raw_material_cost": "635",
+            "productive_plancha_a4.standard_overhead_cost": "465",
+            "productive_plancha_a4.labor_hour_rate": "1800",
+            "productive_plancha_a4.commercial_cost_first_purchase": "500",
+            "productive_plancha_a4.commercial_cost_recurrent": "300",
+            "productive_plancha_a4.batch_efficiency_enabled": "0",
+            "productive_plancha_a4.batch_print_setup_minutes": "10",
+            "productive_plancha_a4.batch_print_incremental_minutes": "1",
+            "productive_plancha_a4.batch_cut_setup_minutes": "10",
+            "productive_plancha_a4.batch_cut_incremental_minutes": "1",
+        }
+        now = datetime.now().isoformat(timespec="seconds")
+        for key, value in defaults.items():
+            self.connection.execute(
+                "INSERT INTO app_settings(setting_key, setting_value, updated_at) VALUES(?, ?, ?) ON CONFLICT(setting_key) DO NOTHING",
+                (key, value, now),
+            )
+
+    def _repair_legacy_unique_design_plancha_totals(self) -> None:
+        """Repara trabajos pendientes guardados cuando Diseño Único era fijo.
+
+        Sólo alcanza registros cuyo total coincide exactamente con el cálculo
+        fijo anterior (una sola plancha con su descuento). Así no modifica
+        precios manuales ni pedidos que ya se cotizaron correctamente.
+        """
+        rule = self.connection.execute(
+            """SELECT price FROM price_rules
+                 WHERE active = 1 AND material = 'Plancha A4 - Diseño Único'
+                   AND size = 'A4' ORDER BY id DESC LIMIT 1"""
+        ).fetchone()
+        if not rule:
+            return
+        unit_price = float(rule["price"] or 0)
+        if unit_price <= 0:
+            return
+        rows = self.connection.execute(
+            """SELECT j.id, j.order_id, j.quantity, j.subtotal,
+                      COALESCE(j.discount_percent, 0) AS discount_percent
+                 FROM order_jobs j
+                 JOIN orders o ON o.id = j.order_id
+                 WHERE j.quantity > 1
+                   AND TRIM(j.material) = 'Plancha A4 - Diseño Único'
+                   AND LOWER(TRIM(COALESCE(o.status, ''))) NOT IN ('entregado', 'terminado')"""
+        ).fetchall()
+        for row in rows:
+            discount_factor = 1 - max(0.0, min(100.0, float(row["discount_percent"] or 0))) / 100
+            old_total = round(unit_price * discount_factor, 2)
+            if abs(float(row["subtotal"] or 0) - old_total) > 0.01:
+                continue
+            corrected_total = round(unit_price * int(row["quantity"]) * discount_factor, 2)
+            delta = corrected_total - float(row["subtotal"] or 0)
+            self.connection.execute("UPDATE order_jobs SET subtotal = ? WHERE id = ?", (corrected_total, row["id"]))
+            self.connection.execute(
+                """UPDATE orders SET price = COALESCE(price, 0) + ?,
+                       budget_total = COALESCE(budget_total, 0) + ? WHERE id = ?""",
+                (delta, delta, row["order_id"]),
+            )
+
+    def install_commercial_price_catalog(self) -> int:
+        """Carga reglas oficiales con claves estables, sin sobrescribir ediciones manuales."""
+        from datetime import datetime
+        now = datetime.now().isoformat(timespec="seconds")
+        products = (("sticker_troquelado", "Stickers Individuales Vinilo Blanco Sublimable HD"), ("sticker_plotteado", "Sticker o vinilo plotteado"),
+                    ("sticker_vinilo_especial", "Stickers Individuales Vinilo Especial"),
+                    ("impresiones_fotograficas", "Impresiones fotogr\u00e1ficas"),
+                    ("plancha_a4", "Plancha personalizada A4"), ("tarjeta_personalizada", "Tarjeta personalizada"),
+                    ("sticker_doming", "Sticker doming"), ("servicio_diseno", "Servicio de diseño"),
+                    ("servicio_impresion", "Servicio de impresión"), ("servicio_corte", "Servicio de corte"))
+        for code, name in products:
+            self.connection.execute("INSERT INTO products(code, name, created_at, updated_at) VALUES(?, ?, ?, ?) ON CONFLICT(code) DO NOTHING", (code, name, now, now))
+        self.connection.execute(
+            "UPDATE products SET name = ?, updated_at = ? WHERE code = ? AND name = ?",
+            ("Stickers Individuales Vinilo Blanco Sublimable HD", now, "sticker_troquelado", "Sticker troquelado"),
+        )
+        self.connection.execute(
+            "UPDATE products SET name = ?, updated_at = ? WHERE code = ?",
+            ("Impresiones A4", now, "impresiones_fotograficas"),
+        )
+        self.connection.execute(
+            """UPDATE products
+                  SET base_price = CASE WHEN COALESCE(base_price, 0) IN (0, 1500) THEN 1400 ELSE base_price END,
+                      description = CASE WHEN TRIM(COALESCE(description, '')) = '' THEN ? ELSE description END,
+                      updated_at = ?
+                WHERE code = ?""",
+            (
+                "Impresiones A4 con precio unitario decreciente seg\u00fan la cantidad.",
+                now,
+                "impresiones_fotograficas",
+            ),
+        )
+        # La ficha se incorporó inicialmente al catálogo comercial con otro
+        # código. La opción histórica del formulario es ``plastificado_a4``;
+        # conservamos ese código para que los pedidos existentes y el selector
+        # apunten a una única ficha.
+        self.connection.execute(
+            "UPDATE products SET active = 0, updated_at = ? WHERE code = ?",
+            (now, "poster_plastificado_a4"),
+        )
+        self.connection.execute(
+            "UPDATE price_rules SET active = 0 WHERE catalog_key LIKE 'commercial_poster_plastificado_a4_%'",
+        )
+        lists = (("general", "Precios generales"), ("pedidos", "Precios de pedidos"),
+                 ("programa_emprendedor_doccione", "Programa Emprendedor Doccione"))
+        for code, name in lists:
+            self.connection.execute("INSERT INTO price_lists(code, name, created_at, updated_at) VALUES(?, ?, ?, ?) ON CONFLICT(code) DO NOTHING", (code, name, now, now))
+        # Las bases creadas antes del catálogo comercial usaban "General" para
+        # la misma lista predeterminada. Unificamos el rótulo sin alterar su ID
+        # ni las reglas que ya la referencian.
+        self.connection.execute(
+            "UPDATE price_lists SET name = ?, updated_at = ? WHERE code = ? AND name = ?",
+            ("Precios generales", now, "general", "General"),
+        )
+        # Las reglas heredadas no tenían lista vinculada y la interfaz las
+        # presenta como "Precios generales". Las asociamos a esa misma lista
+        # para evitar que aparezca como una segunda categoría visual.
+        self.connection.execute(
+            "UPDATE price_rules SET price_list_id = (SELECT id FROM price_lists WHERE code = ?) "
+            "WHERE price_list_id IS NULL",
+            ("general",),
+        )
+        product_ids = {r["code"]: r["id"] for r in self.connection.execute("SELECT id, code FROM products")}
+        list_ids = {r["code"]: r["id"] for r in self.connection.execute("SELECT id, code FROM price_lists")}
+        self.connection.execute(
+            "UPDATE price_rules SET product_id = ? WHERE material = ?",
+            (product_ids["sticker_troquelado"], "Vinilo Full Color HD"),
+        )
+        self.connection.execute(
+            "UPDATE price_rules SET product_id = ? WHERE material IN (?, ?)",
+            (product_ids["sticker_vinilo_especial"], "Vinilo Premium", "Vinilo Full Color Perlado Premium"),
+        )
+        self.connection.execute(
+            "UPDATE price_rules SET product_id = ? WHERE material LIKE ?",
+            (product_ids["impresiones_fotograficas"], "Papel fotogr%fico A4"),
+        )
+        self.connection.execute(
+            "UPDATE products SET active = 0, updated_at = ? WHERE code IN (?, ?, ?)",
+            (now, "impresion_fotografica_1_unidad", "folletos_fotograficos_4_unidades", "tarjetas_presentacion_fotograficas_10_unidades"),
+        )
+        self.connection.execute(
+            """UPDATE price_rules SET active = 0
+                 WHERE catalog_key LIKE 'doccione_2026_07_15_%'
+                   AND material IN ('Vinilo Full Color HD', 'Vinilo Ploteado',
+                                    'Vinilo Premium', 'Resina 3D Premium')"""
+        )
+        rules = []
+        def add(key, product, material, size, minimum, maximum, price, mode="unitario", pack=1, price_list="general", preparation=None):
+            rules.append((key, product_ids[product], material, size, minimum, maximum, price, mode, pack, list_ids[price_list], preparation))
+        for size, price in ((5,400),(7,500),(8,700),(10,900),(12,1200),(15,1800),(18,2500),(20,3000),(25,4200),(29,5000)):
+            add(f"sticker_full_color_standard_{size}cm", "sticker_troquelado", "Vinilo Full Color HD", f"{size}cm", 1, None, price)
+        for size, price in ((5,500),(7,650),(8,850),(10,1100),(12,1500),(15,2150),(18,3000),(20,3600),(25,5000),(29,6000)):
+            add(f"sticker_premium_{size}cm", "sticker_vinilo_especial", "Vinilo Premium", f"{size}cm", 1, None, price)
+        for size, price in ((5,300),(7,500),(8,700),(10,1000),(12,1300),(14,1600),(15,1800),(17,2200),(20,2600),(25,3000),(29,3500)):
+            add(f"sticker_plotteado_{size}cm", "sticker_plotteado", "Vinilo Ploteado", f"{size}cm", 1, None, price)
+        for minimum, maximum, price in ((1,9,400),(10,19,350),(20,99,300),(100,199,280),(200,499,260),(500,999,240),(1000,None,220)):
+            add(f"sticker_full_color_5cm_{minimum}", "sticker_troquelado", "Vinilo Full Color HD", "5cm", minimum, maximum, price)
+        for minimum, maximum, price, limit in ((100,499,260,10),(500,999,220,50),(1000,None,200,100)):
+            add(f"emprendedor_full_color_5cm_{minimum}", "sticker_troquelado", "Vinilo Full Color HD", "5cm", minimum, maximum, price, price_list="programa_emprendedor_doccione", preparation=limit)
+        for minimum, maximum, price in ((1,23,250),(24,79,200),(80,None,150)):
+            add(f"tarjeta_personalizada_{minimum}", "tarjeta_personalizada", "Tarjeta personalizada", "", minimum, maximum, price)
+        # Impresiones A4: escala comercial automática por cantidad.
+        for minimum, maximum, price in ((1,4,1400),(5,9,1350),(10,24,1300),(25,49,1250),(50,None,1200)):
+            add(
+                f"impresion_fotografica_a4_{minimum}",
+                "impresiones_fotograficas",
+                "Impresi\u00f3n A4",
+                "A4",
+                minimum,
+                maximum,
+                price,
+            )
+        # Cada unidad es una plancha independiente: el importe debe crecer
+        # cuando se solicitan varias planchas del mismo diseño.
+        add("plancha_a4_diseno_unico", "plancha_a4", "Vinilo estándar", "A4", 1, None, 5000, "unitario")
+        add("plancha_a4_combinada_estandar", "plancha_a4", "Vinilo blanco full color", "A4", 1, None, 6000, "fijo")
+        add("plancha_a4_combinada_especial", "plancha_a4", "Vinilo especial", "A4", 1, None, 7000, "fijo")
+        # Servicio separado de la impresión: una unidad equivale al diseño
+        # simple necesario para una plancha A4. Sigue siendo editable desde
+        # Comercial > Precios como cualquier otra regla.
+        add("diseno_simple_a4", "servicio_diseno", "Diseño simple", "A4", 1, None, 300, "unitario")
+        add("impresion_a4", "servicio_impresion", "Impresión", "A4", 1, None, 300, "unitario")
+        add("corte_a4", "servicio_corte", "Corte", "A4", 1, None, 300, "unitario")
+        for size, price in ((5,1500),(7,2500),(10,3500),(12,4500),(14,5500),(15,7000),(18,8000),(20,10000),(25,13000),(29,17000)):
+            add(f"doming_{size}cm_individual", "sticker_doming", "Resina 3D Premium", f"{size}cm", 1, None, price)
+        for quantity, total in ((5,7000),(10,13000),(20,24000)):
+            add(f"doming_5cm_pack_{quantity}", "sticker_doming", "Resina 3D Premium", "5cm", quantity, quantity, total, "pack", quantity)
+        for key, product_id, material, size, minimum, maximum, price, mode, pack, list_id, limit in rules:
+            catalog_key = f"commercial_{key}"
+            if self.connection.execute("SELECT 1 FROM price_rules WHERE catalog_key = ?", (catalog_key,)).fetchone():
+                continue
+            self.connection.execute("""INSERT INTO price_rules(product_id, material, size, min_quantity, max_quantity, price,
+                price_mode, pack_quantity, price_list_id, preparation_limit, priority, rule_name, catalog_key, active)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 100, ?, ?, 1)""",
+                (product_id, material, size, minimum, maximum, price, mode, pack, list_id, limit, key.replace("_", " ").title(), catalog_key))
+        # Actualiza las escalas de Impresiones A4 que ya existían antes de este
+        # cambio de lista, conservando sus claves estables.
+        for catalog_key, minimum, maximum, price in (
+            ("commercial_impresion_fotografica_a4_1", 1, 4, 1400),
+            ("commercial_impresion_fotografica_a4_5", 5, 9, 1350),
+            ("commercial_impresion_fotografica_a4_10", 10, 24, 1300),
+            ("commercial_impresion_fotografica_a4_25", 25, 49, 1250),
+            ("commercial_impresion_fotografica_a4_50", 50, None, 1200),
+        ):
+            self.connection.execute(
+                """UPDATE price_rules SET min_quantity = ?, max_quantity = ?,
+                       price = ?, price_mode = 'unitario', active = 1
+                     WHERE catalog_key = ?""",
+                (minimum, maximum, price, catalog_key),
+            )
+        # Corrige instalaciones ya inicializadas sin pisar una regla editada:
+        # sólo migra el valor original entregado por el catálogo.
+        self.connection.execute(
+            """UPDATE price_rules SET price_mode = 'unitario'
+                 WHERE catalog_key = 'commercial_plancha_a4_diseno_unico'
+                   AND price = 5000 AND price_mode = 'fijo'"""
+        )
+        # La regla histórica que usa el formulario de pedidos se instalaba
+        # como precio fijo. Se conserva el importe configurado por el usuario
+        # (por ejemplo, $4.000), pero cada plancha debe cobrarse por unidad.
+        self.connection.execute(
+            """UPDATE price_rules SET price_mode = 'unitario'
+                 WHERE catalog_key LIKE 'doccione_2026_07_15_%'
+                   AND material = 'Plancha A4 - Diseño Único'
+                   AND size = 'A4' AND price_mode = 'fijo'"""
+        )
+        return len(rules)
+
+    def install_fotocopia_price_catalog(self) -> int:
+        """Carga reglas de precios iniciales para Fotocopias y terminaciones."""
+        from datetime import datetime
+        now = datetime.now().isoformat(timespec="seconds")
+        
+        # Insertar configuración inicial de recargo urgente (30%)
+        self.connection.execute(
+            """INSERT INTO fotocopia_config(id, urgent_surcharge_percent, created_at, updated_at) 
+               VALUES(1, 30.0, ?, ?) 
+               ON CONFLICT(id) DO UPDATE SET urgent_surcharge_percent = 30.0, updated_at = ?""",
+            (now, now, now)
+        )
+        
+        # Insertar productos de fotocopias y terminaciones
+        products = (
+            ("fotocopia_bn_simple", "Fotocopia B/N Simple"),
+            ("fotocopia_bn_doble", "Fotocopia B/N Doble Faz"),
+            ("fotocopia_color_simple", "Fotocopia Color Simple"),
+            ("fotocopia_color_doble", "Fotocopia Color Doble Faz"),
+            ("anillado_chico", "Anillado Chico"),
+            ("anillado_mediano", "Anillado Mediano"),
+            ("anillado_grande", "Anillado Grande"),
+            ("plastificado_a4", "Plastificado A4"),
+            ("hoja_fotografica_plastificada", "Hoja Fotográfica Plastificada"),
+            ("impresion_fotografica_1_unidad", "Impresion Fotografica (1 Unidad)"),
+            ("folletos_fotograficos_4_unidades", "Folletos Fotográficos (4 unidades)"),
+            ("tarjetas_presentacion_fotograficas_10_unidades", "Tarjetas Presentacion Fotograficas (10 Unidades)"),
+        )
+        
+        # Eliminar producto antiguo si existe
+        self.connection.execute("DELETE FROM products WHERE code = 'impresion_fotografica_a4'")
+        for code, name in products:
+            self.connection.execute(
+                "INSERT INTO products(code, name, created_at, updated_at) VALUES(?, ?, ?, ?) ON CONFLICT(code) DO NOTHING",
+                (code, name, now, now)
+            )
+        self.connection.execute(
+            """UPDATE products
+                  SET name = ?,
+                      base_price = CASE WHEN COALESCE(base_price, 0) = 0 THEN 2500 ELSE base_price END,
+                      description = CASE WHEN TRIM(COALESCE(description, '')) = '' THEN ? ELSE description END,
+                      updated_at = ?
+                WHERE code = ?""",
+            (
+                "P\u00f3ster plastificado A4",
+                "A4 (21 \u00d7 29,7 cm). Precios por cantidad sujetos a un mismo dise\u00f1o o dise\u00f1os enviados en alta calidad. Dise\u00f1os personalizados se cotizan por separado.",
+                now,
+                "plastificado_a4",
+            ),
+        )
+        
+        # Obtener IDs de productos
+        product_ids = {r["code"]: r["id"] for r in self.connection.execute("SELECT id, code FROM products")}
+        # Sustituye los tres productos históricos de impresión fotográfica por
+        # la única ficha comercial ``Impresiones fotográficas`` y sus escalas.
+        self.connection.execute(
+            """UPDATE price_rules SET active = 0
+                 WHERE catalog_key IN (
+                    'impresion_fotografica_1_unidad',
+                    'folletos_fotograficos_4_unidades',
+                    'tarjetas_presentacion_fotograficas_10_unidades'
+                 )"""
+        )
+        
+        # Insertar reglas de precio iniciales
+        rules = []
+        def add(key, product, material, size, minimum, maximum, price, mode="unitario"):
+            rules.append((key, product_ids[product], material, size, minimum, maximum, price, mode))
+        
+        # Fotocopias
+        add("fotocopia_bn_simple", "fotocopia_bn_simple", "Papel A4", "", 1, None, 50)
+        add("fotocopia_bn_doble", "fotocopia_bn_doble", "Papel A4", "", 1, None, 80)
+        add("fotocopia_color_simple", "fotocopia_color_simple", "Papel A4", "", 1, None, 120)
+        add("fotocopia_color_doble", "fotocopia_color_doble", "Papel A4", "", 1, None, 180)
+        
+        # Anillados (precio por unidad, incluye tapas)
+        add("anillado_chico", "anillado_chico", "Espiral Chico", "", 1, None, 1200)
+        add("anillado_mediano", "anillado_mediano", "Espiral Mediano", "", 1, None, 1800)
+        add("anillado_grande", "anillado_grande", "Espiral Grande", "", 1, None, 2500)
+        add("hoja_fotografica_plastificada", "hoja_fotografica_plastificada", "Hoja Fotográfica", "A4", 1, None, 2500)
+        # Escala comercial de la hoja fotográfica plastificada. Se conserva
+        # separada del plastificado A4 básico para que ambos productos no
+        # compartan reglas ni precios.
+        for minimum, maximum, price in (
+            (1, 4, 2500), (5, 9, 2400), (10, 24, 2300),
+            (25, 49, 2200), (50, None, 2100),
+        ):
+            add(
+                f"hoja_fotografica_plastificada_{minimum}",
+                "hoja_fotografica_plastificada",
+                "Póster plastificado",
+                "A4 (21 × 29,7 cm)",
+                minimum,
+                maximum,
+                price,
+            )
+        
+        # Pósters plastificados A4. Desde 10 unidades se cotiza manualmente:
+        # sin regla para ese tramo, la aplicación no inventa un importe.
+        for minimum, maximum, price in (
+            (1, None, 1500),
+        ):
+            add(
+                f"plastificado_a4_{minimum}",
+                "plastificado_a4",
+                "Plastificado A4",
+                "A4 (21 \u00d7 29,7 cm)",
+                minimum,
+                maximum,
+                price,
+            )
+
+        # Migrar únicamente la regla histórica que conserva el precio original.
+        self.connection.execute(
+            """UPDATE price_rules SET active = 0
+                 WHERE catalog_key = 'plastificado_a4' AND price = 1500"""
+        )
+        # Migra las escalas que se instalaron en versiones anteriores, sin
+        # duplicar reglas en las bases que ya estaban en uso.
+        poster_tiers = (
+            ("plastificado_a4_1", 1, None, 1500),
+        )
+        self.connection.execute(
+            """UPDATE price_rules SET active = 0
+                 WHERE catalog_key LIKE 'plastificado_a4_%'
+                   AND catalog_key <> 'plastificado_a4_1'"""
+        )
+        for catalog_key, minimum, maximum, price in poster_tiers:
+            self.connection.execute(
+                """UPDATE price_rules
+                      SET product_id = ?, material = ?, size = ?, min_quantity = ?,
+                          max_quantity = ?, price = ?, price_mode = 'unitario',
+                          pack_quantity = 1, active = 1
+                    WHERE catalog_key = ?""",
+                (
+                    product_ids["plastificado_a4"], "Plastificado A4", "A4 (21 \u00d7 29,7 cm)",
+                    minimum, maximum, price, catalog_key,
+                ),
+            )
+        # El tramo 2–4 pertenecía a la escala anterior; queda retirado.
+        self.connection.execute(
+            "UPDATE price_rules SET active = 0 WHERE catalog_key = 'plastificado_a4_2'"
+        )
+        
+        # Insertar reglas en price_rules
+        for key, product_id, material, size, minimum, maximum, price, mode in rules:
+            catalog_key = key  # Use key directly as catalog_key (key already includes product type)
+            if self.connection.execute("SELECT 1 FROM price_rules WHERE catalog_key = ?", (catalog_key,)).fetchone():
+                continue
+            self.connection.execute(
+                """INSERT INTO price_rules(product_id, material, size, min_quantity, max_quantity, price,
+                   price_mode, pack_quantity, catalog_key, active)
+                   VALUES(?, ?, ?, ?, ?, ?, ?, 1, ?, 1)""",
+                (product_id, material, size, minimum, maximum, price, mode, catalog_key)
+            )
+        
+        return len(rules)
 
     @staticmethod
     def _clean_order_job(job: dict | None, position: int = 0) -> dict:
@@ -738,9 +1637,17 @@ class ImageDatabase:
             except (TypeError, ValueError):
                 return 0.0
 
+        def _optional_float(val) -> float | None:
+            if val is None or val == "":
+                return None
+            return _safe_float(val)
+
         title = str(job.get("title", "") or "").strip() or f"Producto {position + 1}"
         return {
             "id": job.get("id"), "title": title,
+            "distribution_policy": str(job.get("distribution_policy") or "legacy"),
+            "unit_kind": str(job.get("unit_kind", "") or "").strip().casefold()
+            if str(job.get("unit_kind", "") or "").strip().casefold() in {"item", "sheet"} else "",
             "material": str(job.get("material", "") or "").strip(),
             "size": str(job.get("size", "") or "").strip(),
             "quantity": quantity, "subtotal": round(subtotal, 2),
@@ -754,6 +1661,27 @@ class ImageDatabase:
             "cost_mo":    round(_safe_float(job.get("cost_mo", 0)),    2),
             "cost_cf":    round(_safe_float(job.get("cost_cf", 0)),    2),
             "cost_total": round(_safe_float(job.get("cost_total", 0)), 2),
+            # Los valores de catálogo son opcionales para mantener pedidos antiguos.
+            "product_id": job.get("product_id"), "variant_id": job.get("variant_id"),
+            "price_list_id": job.get("price_list_id"), "price_rule_id": job.get("price_rule_id"),
+            "unit_price_snapshot": _safe_float(job.get("unit_price_snapshot", 0)),
+            "fixed_price_snapshot": _safe_float(job.get("fixed_price_snapshot", 0)),
+            "manual_override": int(bool(job.get("manual_override", False))),
+            "manual_override_reason": str(job.get("manual_override_reason", "") or "").strip(),
+            # Snapshots: un presupuesto/pedido confirmado no depende de reglas futuras.
+            "base_price_snapshot": _safe_float(job.get("base_price_snapshot", job.get("base_price", 0))),
+            "suggested_price_snapshot": _safe_float(job.get("suggested_price_snapshot", job.get("suggested_price", job.get("subtotal", 0)))),
+            "applied_price_snapshot": _optional_float(job.get("applied_price_snapshot", job.get("applied_price"))),
+            "manual_price_snapshot": _optional_float(job.get("manual_price_snapshot", job.get("manual_price"))),
+            "price_source": str(job.get("price_source", "suggested") or "suggested"),
+            "productive_cost": _safe_float(job.get("productive_cost", 0)),
+            "commercial_cost_allocated": _safe_float(job.get("commercial_cost_allocated", 0)),
+            "final_cost": _safe_float(job.get("final_cost", 0)),
+            "productive_margin": _safe_float(job.get("productive_margin", 0)),
+            "final_margin": _safe_float(job.get("final_margin", 0)),
+            "productive_classification": str(job.get("productive_classification", "") or ""),
+            "production_mode": str(job.get("production_mode", "") or ""),
+            "production_estimate": dict(job.get("production_estimate") or {}),
         }
 
     def _write_order_jobs(self, order_id: int, jobs: list[dict], now: str) -> list[dict]:
@@ -761,23 +1689,165 @@ class ImageDatabase:
         clean_jobs = [self._clean_order_job(job, position) for position, job in enumerate(jobs)]
         if not clean_jobs:
             clean_jobs = [self._clean_order_job({}, 0)]
-        self.connection.execute("DELETE FROM order_jobs WHERE order_id = ?", (order_id,))
+        supplied_ids = {int(job["id"]) for job in clean_jobs if job.get("id") is not None}
         for job in clean_jobs:
-            self.connection.execute(
-                """INSERT INTO order_jobs(order_id, title, material, size, quantity, subtotal,
+            if job.get("id") is None:
+                continue
+            produced = float(self.connection.execute(
+                """SELECT COALESCE(SUM(quantity),0) FROM plancha_item_assignments
+                   WHERE order_job_id=? AND state<>'released'""",
+                (int(job["id"]),),
+            ).fetchone()[0] or 0)
+            if float(job["quantity"]) < produced:
+                raise ValueError(
+                    f"No se puede reducir el trabajo #{job['id']} a {job['quantity']}: "
+                    f"ya hay {produced:g} unidad(es) reservadas, impresas o terminadas. "
+                    "Conservá la cantidad histórica y registrá el ajuste como una línea nueva."
+                )
+        existing_ids = {int(row[0]) for row in self.connection.execute(
+            "SELECT id FROM order_jobs WHERE order_id=?", (order_id,)
+        )}
+        if len(supplied_ids) != sum(job.get("id") is not None for job in clean_jobs) or not supplied_ids <= existing_ids:
+            raise ValueError("Los trabajos deben ser únicos y pertenecer al pedido.")
+        for job in clean_jobs:
+            original = jobs[job["sort_order"]] if job["sort_order"] < len(jobs) else {}
+            if job.get("id") is not None and "distribution_policy" not in original:
+                policy = self.connection.execute("SELECT distribution_policy FROM order_jobs WHERE id=?", (job["id"],)).fetchone()
+                if policy:
+                    job["distribution_policy"] = policy[0]
+            if job["distribution_policy"] not in {"legacy", "complete", "partial"}:
+                raise ValueError("La política de distribución no es válida.")
+        for obsolete_id in existing_ids - supplied_ids:
+            history = self.connection.execute(
+                "SELECT 1 FROM plancha_item_assignments WHERE order_job_id=? LIMIT 1",
+                (obsolete_id,),
+            ).fetchone()
+            if history:
+                raise ValueError(f"No se puede quitar el trabajo #{obsolete_id}: conserva historial productivo.")
+            self.connection.execute("DELETE FROM order_jobs WHERE id=?", (obsolete_id,))
+        for job in clean_jobs:
+            if job.get("id") is not None:
+                previous = dict(self.connection.execute("SELECT * FROM order_jobs WHERE id=?", (job["id"],)).fetchone())
+                commercial_keys = ("product_id", "variant_id", "subtotal", "cost_total", "price_rule_id")
+                if any(previous.get(key) != job.get(key) for key in commercial_keys):
+                    self.connection.execute(
+                        "INSERT INTO order_events(order_id,event_type,message,data_json,created_at) VALUES(?,?,?,?,?)",
+                        (order_id, "Trabajo comercial", f"Cambio comercial del trabajo #{job['id']}", json.dumps({
+                            "order_job_id": job["id"], "origin": "order_editor",
+                            "before": {key: previous.get(key) for key in commercial_keys},
+                            "after": {key: job.get(key) for key in commercial_keys},
+                        }, ensure_ascii=False), now),
+                    )
+                self.connection.execute("UPDATE order_jobs SET distribution_policy=? WHERE id=?", (job["distribution_policy"], job["id"]))
+                self.connection.execute(
+                    """UPDATE order_jobs SET title=?,material=?,size=?,quantity=?,unit_kind=?,subtotal=?,discount_percent=?,
+                       extra_services=?,status=?,notes=?,sort_order=?,cost_mp=?,cost_mo=?,cost_cf=?,cost_total=?,
+                       product_id=?,variant_id=?,price_list_id=?,price_rule_id=?,unit_price_snapshot=?,fixed_price_snapshot=?,
+                       manual_override=?,manual_override_reason=?,base_price_snapshot=?,suggested_price_snapshot=?,
+                       applied_price_snapshot=?,manual_price_snapshot=?,price_source=?,productive_cost=?,
+                       commercial_cost_allocated=?,final_cost=?,productive_margin=?,final_margin=?,
+                       productive_classification=?,production_mode=?,updated_at=? WHERE id=? AND order_id=?""",
+                    (job["title"], job["material"], job["size"], job["quantity"], job["unit_kind"], job["subtotal"],
+                     job["discount_percent"], job["extra_services"], job["status"], job["notes"],
+                     job["sort_order"], job["cost_mp"], job["cost_mo"], job["cost_cf"], job["cost_total"],
+                     job["product_id"], job["variant_id"], job["price_list_id"], job["price_rule_id"],
+                     job["unit_price_snapshot"], job["fixed_price_snapshot"], job["manual_override"],
+                     job["manual_override_reason"], job["base_price_snapshot"], job["suggested_price_snapshot"],
+                     job["applied_price_snapshot"], job["manual_price_snapshot"], job["price_source"],
+                     job["productive_cost"], job["commercial_cost_allocated"], job["final_cost"],
+                     job["productive_margin"], job["final_margin"], job["productive_classification"],
+                     job["production_mode"], now, int(job["id"]), order_id),
+                )
+                continue
+            cursor = self.connection.execute(
+                """INSERT INTO order_jobs(order_id, title, material, size, quantity, unit_kind, subtotal,
                    discount_percent, extra_services, status, notes, sort_order,
                    cost_mp, cost_mo, cost_cf, cost_total,
-                   created_at, updated_at)
-                   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   product_id, variant_id, price_list_id, price_rule_id, unit_price_snapshot,
+                   fixed_price_snapshot, manual_override, manual_override_reason,
+                   base_price_snapshot, suggested_price_snapshot, applied_price_snapshot, manual_price_snapshot, price_source,
+                   productive_cost, commercial_cost_allocated, final_cost, productive_margin, final_margin,
+                   productive_classification, production_mode, created_at, updated_at)
+                   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     order_id, job["title"], job["material"], job["size"], job["quantity"],
-                    job["subtotal"], job["discount_percent"], job["extra_services"],
+                    job["unit_kind"], job["subtotal"], job["discount_percent"], job["extra_services"],
                     job["status"], job["notes"], job["sort_order"],
                     job["cost_mp"], job["cost_mo"], job["cost_cf"], job["cost_total"],
-                    now, now,
+                    job["product_id"], job["variant_id"], job["price_list_id"], job["price_rule_id"],
+                    job["unit_price_snapshot"], job["fixed_price_snapshot"], job["manual_override"],
+                    job["manual_override_reason"], job["base_price_snapshot"], job["suggested_price_snapshot"],
+                    job["applied_price_snapshot"], job["manual_price_snapshot"], job["price_source"],
+                    job["productive_cost"], job["commercial_cost_allocated"], job["final_cost"],
+                    job["productive_margin"], job["final_margin"], job["productive_classification"], job["production_mode"], now, now,
                 ),
             )
+            job["id"] = int(cursor.lastrowid)
+            self.connection.execute("UPDATE order_jobs SET distribution_policy=? WHERE id=?", (job["distribution_policy"], job["id"]))
+            try:
+                jobs[job["sort_order"]]["id"] = job["id"]
+            except (IndexError, TypeError):
+                pass
+            estimate = job["production_estimate"]
+            if estimate:
+                self.connection.execute(
+                    """INSERT INTO order_job_production_estimates(order_job_id, unique_designs, production_mode,
+                       design_minutes, design_minutes_json, print_minutes, cut_minutes, productive_surcharge, additional_services,
+                       authorized_discount, additional_materials, waste_cost, valid_productive_exception, calculated_at)
+                       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(order_job_id) DO UPDATE SET unique_designs=excluded.unique_designs,
+                       production_mode=excluded.production_mode, design_minutes=excluded.design_minutes, design_minutes_json=excluded.design_minutes_json,
+                       print_minutes=excluded.print_minutes, cut_minutes=excluded.cut_minutes,
+                       productive_surcharge=excluded.productive_surcharge, additional_services=excluded.additional_services,
+                       authorized_discount=excluded.authorized_discount, calculated_at=excluded.calculated_at""",
+                    (job["id"],
+                     int(estimate.get("unique_designs", 1) or 1), str(estimate.get("production_mode", "individual") or "individual"),
+                     float(estimate.get("design_minutes", 0) or 0), json.dumps(estimate.get("design_minutes_list") or []), float(estimate.get("print_minutes", 0) or 0),
+                     float(estimate.get("cut_minutes", 0) or 0), float(estimate.get("productive_surcharge", 0) or 0),
+                     float(estimate.get("additional_services", 0) or 0), float(estimate.get("authorized_discount", 0) or 0),
+                     float(estimate.get("additional_materials", 0) or 0), float(estimate.get("waste_cost", 0) or 0),
+                     int(bool(estimate.get("valid_productive_exception", False))), now),
+                )
         return clean_jobs
+
+    @staticmethod
+    def allocate_commercial_cost(total: float, jobs: list[dict]) -> list[float]:
+        """Distribuye centavos exactamente: aplicado, sugerido y luego uniforme."""
+        total_cents = int(round(max(0.0, float(total or 0)) * 100))
+        if not jobs:
+            return []
+        def amounts(key):
+            return [max(0.0, float(job.get(key) or 0)) for job in jobs]
+        weights = amounts("applied_price_snapshot")
+        if not any(weights):
+            weights = amounts("suggested_price_snapshot")
+        if not any(weights):
+            weights = [1.0] * len(jobs)
+        weight_total = sum(weights)
+        allocations = [int(total_cents * weight / weight_total) for weight in weights]
+        allocations[-1] += total_cents - sum(allocations)
+        return [value / 100 for value in allocations]
+
+    def _refresh_order_commercial_cost(self, order_id: int) -> None:
+        """Guarda un único costo comercial de pedido y su desglose analítico."""
+        order = self.connection.execute("SELECT client_id FROM orders WHERE id = ?", (order_id,)).fetchone()
+        if not order:
+            return
+        prior = self.connection.execute(
+            "SELECT COUNT(*) FROM orders WHERE client_id = ? AND id <> ?", (order["client_id"], order_id)
+        ).fetchone()[0]
+        settings = self.productive_plancha_a4_settings()
+        kind = "recurrent" if prior else "first_purchase"
+        total = float(settings.get("commercial_cost_recurrent" if prior else "commercial_cost_first_purchase", 300 if prior else 500))
+        jobs = self.order_jobs(order_id)
+        allocations = self.allocate_commercial_cost(total, jobs)
+        for job, allocated in zip(jobs, allocations):
+            self.connection.execute("UPDATE order_jobs SET commercial_cost_allocated = ? WHERE id = ?", (allocated, job["id"]))
+        productive_total = self.connection.execute("SELECT COALESCE(SUM(cost_total), 0) FROM order_jobs WHERE order_id = ?", (order_id,)).fetchone()[0]
+        self.connection.execute(
+            "UPDATE orders SET commercial_cost = ?, commercial_cost_kind = ?, final_cost = ?, final_margin = budget_total - ? WHERE id = ?",
+            (total, kind, float(productive_total or 0) + total, float(productive_total or 0) + total, order_id),
+        )
 
     def _sync_order_from_jobs(self, order_id: int, now: str) -> None:
         """Actualiza el resumen compatible del pedido desde sus trabajos."""
@@ -786,14 +1856,18 @@ class ImageDatabase:
         )]
         if not rows:
             return
+        order = self.order(order_id) or {}
         subtotal     = round(sum(float(job.get("subtotal") or 0) for job in rows), 2)
-        total        = round(sum(float(job.get("subtotal") or 0) * (1 - float(job.get("discount_percent") or 0) / 100) for job in rows), 2)
+        # Los descuentos individuales por trabajo ya no se usan; el descuento se aplica al pedido
+        total        = subtotal
         total_quantity = sum(max(1, int(job.get("quantity") or 1)) for job in rows)
         # Costos desglosados — suma de todos los trabajos
         cost_mp    = round(sum(float(job.get("cost_mp")    or 0) for job in rows), 2)
         cost_mo    = round(sum(float(job.get("cost_mo")    or 0) for job in rows), 2)
         cost_cf    = round(sum(float(job.get("cost_cf")    or 0) for job in rows), 2)
-        cost_total = round(cost_mp + cost_mo + cost_cf, 2)
+        commission_pct = _seller_commission_percent(order.get("assigned_to"))
+        commission = round(max(0.0, total - cost_mp - cost_mo - cost_cf) * commission_pct / 100, 2)
+        cost_total = round(cost_mp + cost_mo + cost_cf + commission, 2)
         margin     = round(total - cost_total, 2)
         one_job    = len(rows) == 1
         material   = rows[0].get("material", "") if one_job else f"{len(rows)} trabajos"
@@ -802,11 +1876,11 @@ class ImageDatabase:
         self.connection.execute(
             """UPDATE orders SET material = ?, size = ?, quantity = ?, price = ?,
                discount_percent = 0, extra_services = ?, budget_total = ?,
-               cost_mp = ?, cost_mo = ?, cost_cf = ?, cost_total = ?, margin = ?,
+               cost_mp = ?, cost_mo = ?, cost_cf = ?, seller_commission_percent = ?, seller_commission_amount = ?, cost_total = ?, margin = ?,
                updated_at = ?
                WHERE id = ?""",
             (material, size, total_quantity, subtotal, services, total,
-             cost_mp, cost_mo, cost_cf, cost_total, margin,
+             cost_mp, cost_mo, cost_cf, commission_pct, commission, cost_total, margin,
              now, order_id),
         )
 
@@ -818,7 +1892,8 @@ class ImageDatabase:
         rows = self.connection.execute(
             """SELECT orders.* FROM orders
                LEFT JOIN order_jobs ON order_jobs.order_id = orders.id
-               WHERE order_jobs.id IS NULL"""
+               WHERE order_jobs.id IS NULL
+                 AND COALESCE(orders.order_jobs_deleted, 0) = 0"""
         ).fetchall()
         for row in rows:
             order = dict(row)
@@ -859,6 +1934,8 @@ class ImageDatabase:
             priority = _manual_priority_value(values.get("print_priority", 0))
         except (TypeError, ValueError):
             priority = 0
+        if _is_delivered_order_status(values.get("status")):
+            priority = 0
         
         # Si se proporciona order_date con fecha y hora completa, usarla; si no, usar created_at
         if order_date and len(order_date) > 10:
@@ -874,14 +1951,15 @@ class ImageDatabase:
         with self.connection:
             cursor = self.connection.execute(
                 """INSERT INTO orders(client, whatsapp, client_id, order_date, status, material, size,
-                   quantity, price, discount_percent, extra_services, budget_total, assigned_to,
+                   quantity, price, discount_percent, extra_services, budget_total, assigned_to, seller_commission_percent,
                    observations, pending_reason, delivery_date, print_priority, order_concept,
                    order_description, created_at, updated_at, last_autosave_at)
-                   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     client, whatsapp, client_id, final_order_date, values.get("status", "Nuevo"),
                     first["material"], first["size"], first["quantity"], first["subtotal"],
                     first["discount_percent"], first["extra_services"], 0, values.get("assigned_to", ""),
+                    _seller_commission_percent(values.get("assigned_to")),
                     values.get("observations", "").strip(), values.get("pending_reason", "").strip(),
                     values.get("delivery_date", "").strip(), priority,
                     str(values.get("order_concept", "") or "").strip(),
@@ -892,9 +1970,10 @@ class ImageDatabase:
             order_id = int(cursor.lastrowid)
             self._write_order_jobs(order_id, jobs, now)
             self._sync_order_from_jobs(order_id, now)
+            self._refresh_order_commercial_cost(order_id)
         self.add_order_event(order_id, "Pedido", f"Pedido creado con {len(jobs)} trabajo(s).")
         try:
-            total = sum(float(j.get("subtotal", 0) or 0) * (1 - float(j.get("discount_percent", 0) or 0) / 100) for j in jobs)
+            total = sum(float(j.get("subtotal", 0) or 0) for j in jobs)  # Los descuentos individuales ya no se usan
             self.event_repo.publish_event(
                 event_type="order.created",
                 priority="high",
@@ -907,6 +1986,33 @@ class ImageDatabase:
         except Exception:
             pass
         return order_id
+
+    def create_order_with_details(self, client: str, whatsapp: str = "", order_date: str = "",
+                                  *, jobs: list[dict], designs: list[dict] | None = None, **values) -> int:
+        """Crea cabecera, trabajos y demanda usando el mismo guardado que la edición.
+
+        ``order_job_index`` vincula cada diseño con el trabajo del formulario antes
+        de que SQLite le asigne un id. Ante un error se elimina el alta incompleta.
+        """
+        order_id = self.create_order(client, whatsapp=whatsapp, order_date=order_date, jobs=jobs, **values)
+        try:
+            persisted_jobs = self.order_jobs(order_id)
+            draft_designs = [dict(item) for item in (designs or [])]
+            for design in draft_designs:
+                index = design.pop("order_job_index", None)
+                if index is not None:
+                    try:
+                        design["order_job_id"] = persisted_jobs[int(index)]["id"]
+                    except (IndexError, TypeError, ValueError):
+                        raise ValueError("El diseño referencia un trabajo que ya no existe.")
+            snapshot = dict(self.order(order_id) or {})
+            snapshot.update(values)
+            snapshot.update({"client": client, "whatsapp": whatsapp, "order_date": order_date})
+            self.save_order_snapshot(order_id, snapshot, draft_designs, persisted_jobs)
+            return order_id
+        except Exception:
+            self.delete_order(order_id)
+            raise
 
     def _migrate_order_clients(self) -> None:
         """Vincula pedidos antiguos sin modificar sus datos visibles."""
@@ -922,15 +2028,24 @@ class ImageDatabase:
 
     def _migrate_mobile_devices(self) -> None:
         """Agrega columnas de session token a mobile_devices si no existen."""
+        # La tabla mobile_devices la crea EventRepository.create_tables() después
+        # de esta migración. Si aún no existe, no hay nada que migrar.
+        table_exists = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='mobile_devices'"
+        ).fetchone()
+        if not table_exists:
+            return
         # Verificar columnas existentes
         existing_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(mobile_devices)")}
         
         # Agregar columnas faltantes de forma idempotente
         # SQLite no permite agregar columnas UNIQUE con ALTER TABLE, así que agregamos sin UNIQUE
         for column, definition in (
+            ("user_id", "INTEGER"),
             ("session_token_hash", "TEXT"),
             ("session_expires_at", "TEXT"),
             ("session_last_used_at", "TEXT"),
+            ("app_version", "TEXT DEFAULT ''"),
         ):
             if column not in existing_columns:
                 self.connection.execute(f"ALTER TABLE mobile_devices ADD COLUMN {column} {definition}")
@@ -938,9 +2053,20 @@ class ImageDatabase:
         # Crear índice único para session_token_hash DESPUÉS de agregar la columna
         # Esto garantiza unicidad y evita el error "no such column"
         self.connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_mobile_devices_session ON mobile_devices(session_token_hash)")
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mobile_devices_user "
+            "ON mobile_devices(user_id, active)"
+        )
 
     def _migrate_pairing_codes(self) -> None:
         """Migra pairing_codes de código en texto plano a hash SHA-256."""
+        # La tabla pairing_codes la crea EventRepository.create_tables() después
+        # de esta migración. Si aún no existe, no hay nada que migrar.
+        table_exists = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pairing_codes'"
+        ).fetchone()
+        if not table_exists:
+            return
         # Verificar si la columna code_hash existe
         existing_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(pairing_codes)")}
         
@@ -974,6 +2100,106 @@ class ImageDatabase:
             self.connection.execute("DROP TABLE pairing_codes")
             self.connection.execute("ALTER TABLE pairing_codes_new RENAME TO pairing_codes")
 
+    def _migrate_mobile_order_idempotency(self) -> None:
+        """Evita que un reintento del móvil duplique un pedido ya recibido."""
+        columns = {row[1] for row in self.connection.execute("PRAGMA table_info(orders)")}
+        if "mobile_request_id" not in columns:
+            self.connection.execute("ALTER TABLE orders ADD COLUMN mobile_request_id TEXT")
+        self.connection.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_mobile_request
+               ON orders(creator_device_id, mobile_request_id)
+               WHERE mobile_request_id IS NOT NULL"""
+        )
+
+    def _migrate_mobile_security(self) -> None:
+        """Crea tablas para seguridad de acceso externo (whitelist de IPs)."""
+        from datetime import datetime
+        from app.security.mobile_access import (
+            DEFAULTS_SEEDED_SETTING_KEY,
+            DEFAULT_MOBILE_NETWORKS,
+            WHITELIST_SETTING_KEY,
+        )
+
+        now = datetime.now().isoformat(timespec="seconds")
+
+        # Tabla para whitelist de IPs
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS mobile_ip_whitelist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip_address TEXT NOT NULL UNIQUE,
+                description TEXT DEFAULT '',
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_matched_at TEXT DEFAULT ''
+            )"""
+        )
+        whitelist_columns = {
+            row[1]
+            for row in self.connection.execute(
+                "PRAGMA table_info(mobile_ip_whitelist)"
+            )
+        }
+        if "last_matched_at" not in whitelist_columns:
+            self.connection.execute(
+                "ALTER TABLE mobile_ip_whitelist "
+                "ADD COLUMN last_matched_at TEXT DEFAULT ''"
+            )
+
+        # Configuración para habilitar/deshabilitar whitelist
+        self.connection.execute(
+            """INSERT OR IGNORE INTO app_settings(
+                   setting_key, setting_value, updated_at
+               ) VALUES(?, 'false', ?)""",
+            (WHITELIST_SETTING_KEY, now),
+        )
+
+        # Agregar IPs locales una sola vez. Quedan inactivas hasta que la
+        # persona confirme qué redes corresponden a su instalación.
+        defaults_seeded = self.connection.execute(
+            "SELECT setting_value FROM app_settings WHERE setting_key = ?",
+            (DEFAULTS_SEEDED_SETTING_KEY,),
+        ).fetchone()
+        if not defaults_seeded:
+            for ip, desc in DEFAULT_MOBILE_NETWORKS:
+                self.connection.execute(
+                    """INSERT OR IGNORE INTO mobile_ip_whitelist(ip_address, description, active, created_at, updated_at)
+                       VALUES (?, ?, 0, ?, ?)""",
+                    (ip, desc, now, now),
+                )
+            self.connection.execute(
+                """INSERT INTO app_settings(setting_key, setting_value, updated_at)
+                   VALUES(?, 'true', ?)""",
+                (DEFAULTS_SEEDED_SETTING_KEY, now),
+            )
+
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS mobile_security_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                ip_address TEXT DEFAULT '',
+                endpoint TEXT DEFAULT '',
+                details TEXT DEFAULT '',
+                created_at TEXT NOT NULL
+            )"""
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mobile_security_audit_created "
+            "ON mobile_security_audit(created_at DESC)"
+        )
+
+    def _migrate_sync_indexes(self) -> None:
+        """Agrega índices compuestos (updated_at, id) para sincronización incremental."""
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_updated_id ON orders(updated_at, id)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_order_jobs_updated_id ON order_jobs(updated_at, id)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_clients_updated_id ON clients(updated_at, id)"
+        )
+
     def _ensure_client(self, name: str, whatsapp: str, now: str | None = None) -> int:
         from datetime import datetime
 
@@ -1002,7 +2228,86 @@ class ImageDatabase:
         )
         self.connection.commit()
 
-    def orders(self, status: str | None = None, query: str = "", pending_only: bool = False) -> list[dict]:
+    def update_client(self, client_id: int, name: str, whatsapp: str, client_type: str) -> None:
+        """Actualiza una ficha y refleja sus datos en los pedidos vinculados."""
+        from datetime import datetime
+
+        name, whatsapp = (name or "").strip(), (whatsapp or "").strip()
+        client_type = (client_type or "Particular").strip() or "Particular"
+        if not name:
+            raise ValueError("El nombre del cliente es obligatorio.")
+        duplicate = self.connection.execute(
+            "SELECT id FROM clients WHERE name = ? COLLATE NOCASE AND whatsapp = ? AND id <> ?",
+            (name, whatsapp, client_id),
+        ).fetchone()
+        if duplicate:
+            raise ValueError("Ya existe otro cliente con el mismo nombre y WhatsApp.")
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE clients SET name = ?, whatsapp = ?, client_type = ?, updated_at = ? WHERE id = ?",
+                (name, whatsapp, client_type, now, client_id),
+            )
+            if not cursor.rowcount:
+                raise ValueError("La ficha del cliente ya no existe.")
+            self.connection.execute(
+                "UPDATE orders SET client = ?, whatsapp = ?, updated_at = ? WHERE client_id = ?",
+                (name, whatsapp, now, client_id),
+            )
+
+    def clients_with_order_summary(self, query: str = "") -> list[dict]:
+        """Devuelve las fichas de clientes junto con un resumen de sus pedidos."""
+        clauses: list[str] = []
+        params: list[str] = []
+        if query.strip():
+            term = f"%{query.strip().lower()}%"
+            clauses.append("(LOWER(c.name) LIKE ? OR LOWER(COALESCE(c.whatsapp, '')) LIKE ?)")
+            params.extend((term, term))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self.connection.execute(
+            """SELECT c.*, COUNT(o.id) AS order_count,
+                       COALESCE(SUM(COALESCE(o.budget_total, o.price, 0)), 0) AS total_billed,
+                       MAX(COALESCE(o.order_date, o.created_at)) AS last_order_at
+                 FROM clients AS c
+                 LEFT JOIN orders AS o ON o.client_id = c.id
+                 %s
+                 GROUP BY c.id
+                 ORDER BY c.name COLLATE NOCASE, c.id""" % where,
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def client_detail(self, client_id: int) -> dict | None:
+        row = self.connection.execute(
+            """SELECT c.*, COUNT(o.id) AS order_count,
+                       COALESCE(SUM(COALESCE(o.budget_total, o.price, 0)), 0) AS total_billed,
+                       MAX(COALESCE(o.order_date, o.created_at)) AS last_order_at
+                 FROM clients AS c
+                 LEFT JOIN orders AS o ON o.client_id = c.id
+                 WHERE c.id = ?
+                 GROUP BY c.id""",
+            (client_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def client_orders(self, client_id: int) -> list[dict]:
+        rows = self.connection.execute(
+            """SELECT id, order_date, created_at, status, material, quantity,
+                       COALESCE(budget_total, price, 0) AS total
+                 FROM orders WHERE client_id = ?
+                 ORDER BY COALESCE(order_date, created_at) DESC, id DESC""",
+            (client_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_client(self, client_id: int) -> int:
+        """Elimina una ficha, conservando los pedidos históricos sin vínculo a ella."""
+        with self.connection:
+            self.connection.execute("UPDATE orders SET client_id = NULL WHERE client_id = ?", (client_id,))
+            cursor = self.connection.execute("DELETE FROM clients WHERE id = ?", (client_id,))
+        return int(cursor.rowcount)
+
+    def orders(self, status: str | tuple[str, ...] | list[str] | None = None, query: str = "", pending_only: bool = False) -> list[dict]:
         """Devuelve la lista operativa sin tocar precios ni otros módulos."""
         sql = """
             SELECT orders.*, COALESCE(clients.name, orders.client) AS client_name,
@@ -1010,7 +2315,11 @@ class ImageDatabase:
                    COALESCE(metrics.design_count, 0) AS design_count,
                    COALESCE(metrics.assigned_quantity, 0) AS assigned_quantity,
                    COALESCE(metrics.confirmed_count, 0) AS confirmed_count,
-                   COALESCE(plancha_counts.total, 0) AS plancha_count
+                   COALESCE(plancha_counts.total, 0) AS plancha_count,
+                   COALESCE(job_financials.budget_total,
+                       orders.price * (1 - COALESCE(orders.discount_percent, 0) / 100.0)
+                   ) AS current_budget_total,
+                   COALESCE(payment_totals.paid_amount, 0) AS current_paid_amount
             FROM orders
             LEFT JOIN clients ON clients.id = orders.client_id
             LEFT JOIN (
@@ -1022,14 +2331,32 @@ class ImageDatabase:
             LEFT JOIN (
                 SELECT order_id, COUNT(*) AS total FROM plancha_projects GROUP BY order_id
             ) AS plancha_counts ON plancha_counts.order_id = orders.id
+            LEFT JOIN (
+                SELECT order_id,
+                       SUM(subtotal) AS budget_total
+                FROM order_jobs GROUP BY order_id
+            ) AS job_financials ON job_financials.order_id = orders.id
+            LEFT JOIN (
+                SELECT order_id, SUM(amount) AS paid_amount
+                FROM order_payments
+                WHERE COALESCE(cancelled_at, '') = ''
+                GROUP BY order_id
+            ) AS payment_totals ON payment_totals.order_id = orders.id
         """
         clauses: list[str] = ["COALESCE(orders.is_archived, 0) = 0"]
         params: list[str] = []
         if status:
-            clauses.append("orders.status = ?")
-            params.append(status)
+            statuses = (status,) if isinstance(status, str) else tuple(status)
+            if len(statuses) == 1:
+                clauses.append("orders.status = ?")
+            else:
+                clauses.append("orders.status IN (" + ", ".join("?" for _ in statuses) + ")")
+            params.extend(statuses)
         if pending_only:
-            clauses.append("(TRIM(COALESCE(orders.pending_reason, '')) <> '' OR orders.status = 'Pendiente')")
+            # Incluir pedidos activos que pueden recibir diseños.  También
+            # excluimos ``Archivado`` por compatibilidad con registros creados
+            # antes de que el archivado usara la bandera ``is_archived``.
+            clauses.append("orders.status NOT IN ('Finalizado', 'Entregado', 'Terminado', 'Cancelado', 'Archivado')")
         if query.strip():
             term = f"%{query.strip().lower()}%"
             clauses.append(
@@ -1054,26 +2381,142 @@ class ImageDatabase:
     def pending_orders(self) -> list[dict]:
         return self.orders(pending_only=True)
 
-    def update_order_status(self, order_id: int, status: str) -> None:
+    def set_order_parent(self, order_id: int, parent_order_id: int | None) -> bool:
+        """Vincula un pedido operativo a otro pedido principal del cliente."""
         from datetime import datetime
 
-        self.connection.execute(
-            "UPDATE orders SET status = ?, updated_at = ? WHERE id = ?",
-            (status, datetime.now().isoformat(timespec="seconds"), order_id),
+        order_id = int(order_id)
+        if parent_order_id is not None:
+            parent_order_id = int(parent_order_id)
+            if parent_order_id == order_id:
+                raise ValueError("Un pedido no puede vincularse consigo mismo.")
+            parent = self.connection.execute(
+                "SELECT id FROM orders WHERE id = ?", (parent_order_id,)
+            ).fetchone()
+            if not parent:
+                raise ValueError("El pedido principal indicado no existe.")
+        cursor = self.connection.execute(
+            "UPDATE orders SET parent_order_id = ?, updated_at = ? WHERE id = ?",
+            (parent_order_id, datetime.now().isoformat(timespec="seconds"), order_id),
         )
         self.connection.commit()
-        self.add_order_event(order_id, "Estado", f"Estado actualizado a: {status}.")
+        return bool(cursor.rowcount)
+
+    def update_order_status(self, order_id: int, status: str) -> None:
+        from app.domain.order_states import OrderStateService
+
+        OrderStateService(self.connection).transition(
+            order_id,
+            status,
+            source="desktop",
+            reason="Cambio desde la ficha del pedido",
+        )
+
+    def update_order_priority(self, order_id: int, print_priority: int) -> dict:
+        from datetime import datetime
+
+        print_priority = min(4, max(0, int(print_priority or 0)))
+        now = datetime.now().isoformat(timespec="seconds")
+        self.connection.execute(
+            "UPDATE orders SET print_priority = ?, updated_at = ? WHERE id = ?",
+            (print_priority, now, order_id),
+        )
+        self.connection.commit()
+        self.add_order_event(order_id, "Prioridad", f"Prioridad actualizada a: {print_priority}.")
+        row = self.connection.execute(
+            "SELECT id, print_priority, updated_at FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        return dict(row) if row else {"id": order_id, "print_priority": print_priority, "updated_at": now}
+
+    def update_job_fields(self, order_id: int, job_id: int, quantity: int | None = None, size: str | None = None) -> dict:
+        from datetime import datetime
+
+        now = datetime.now().isoformat(timespec="seconds")
+        job = self.connection.execute(
+            "SELECT id, order_id, quantity, size FROM order_jobs WHERE id = ? AND order_id = ?",
+            (job_id, order_id),
+        ).fetchone()
+        if not job:
+            raise ValueError("Trabajo no encontrado en este pedido.")
+        new_quantity = max(1, int(quantity if quantity is not None else job["quantity"]))
+        new_size = str(size if size is not None else job["size"]).strip()
+        self.connection.execute(
+            "UPDATE order_jobs SET quantity = ?, size = ?, updated_at = ? WHERE id = ?",
+            (new_quantity, new_size, now, job_id),
+        )
+        self._sync_order_from_jobs(order_id, now)
+        self.connection.commit()
+        self.add_order_event(order_id, "Trabajo", f"Trabajo #{job_id}: cantidad={new_quantity}, tamaño={new_size}.")
+        row = self.connection.execute(
+            "SELECT id, quantity, size, updated_at FROM order_jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        return dict(row) if row else {"id": job_id, "quantity": new_quantity, "size": new_size, "updated_at": now}
+
+    def mark_order_delivered(self, order_id: int) -> dict:
+        from datetime import datetime
+
+        now = datetime.now().isoformat(timespec="seconds")
+        order = self.connection.execute(
+            "SELECT id, status FROM orders WHERE id = ? AND is_archived = 0", (order_id,)
+        ).fetchone()
+        if not order:
+            raise ValueError("Pedido no encontrado o archivado.")
+        current = order["status"]
+        if current == "Entregado":
+            raise ValueError("El pedido ya está marcado como Entregado.")
+        with self.connection:
+            from app.services.delivery_readiness import assert_deliverable
+            self.connection.execute("UPDATE orders SET id=id WHERE id=?", (order_id,))
+            assert_deliverable(self.connection, order_id)
+            self.connection.execute(
+                "UPDATE order_jobs SET status = 'Entregado', updated_at = ? WHERE order_id = ?",
+                (now, order_id),
+            )
+            self.connection.execute(
+                """UPDATE orders
+                   SET status = 'Entregado', updated_at = ?, print_priority = 0
+                   WHERE id = ?""",
+                (now, order_id),
+            )
+        self.add_order_event(order_id, "Entrega", f"Pedido marcado como Entregado (estado anterior: {current}).")
+        try:
+            self.event_repo.publish_event(
+                event_type="order.delivered",
+                priority="high",
+                title="Pedido entregado",
+                message=f"Pedido #{order_id} marcado como Entregado",
+                entity_type="order",
+                entity_id=order_id,
+                payload={"old_status": current},
+            )
+        except Exception:
+            pass
+        row = self.connection.execute(
+            "SELECT id, status, updated_at FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        return dict(row) if row else {"id": order_id, "status": "Entregado", "updated_at": now}
 
     def archive_order(self, order_id: int) -> None:
         """Marca el pedido como Archivado sin eliminar ningún dato."""
-        self.update_order_status(order_id, "Archivado")
+        from datetime import datetime
+
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE orders SET is_archived = 1, status = 'Archivado', updated_at = ? "
+                "WHERE id = ? AND COALESCE(is_archived, 0) = 0",
+                (now, order_id),
+            )
+        if cursor.rowcount:
+            self.add_order_event(order_id, "Archivo", "Pedido archivado.")
 
     def delete_order(self, order_id: int) -> None:
         """Elimina permanentemente el pedido y todos sus registros relacionados."""
         from datetime import datetime
         with self.connection:
             for table in (
-                "order_events", "order_payments", "order_designs",
+                "order_events", "order_payments", "plancha_item_assignments",
+                "order_design_job_links", "order_designs",
                 "order_jobs", "order_drafts", "order_snapshots", "order_previews",
                 "plancha_print_queue",
             ):
@@ -1086,7 +2529,7 @@ class ImageDatabase:
             self.connection.execute("DELETE FROM orders WHERE id = ?", (order_id,))
 
     def save_order_draft(self, order_id: int, values: dict, designs: list[dict], jobs: list[dict] | None = None) -> None:
-        """Guarda una recuperaciÃ³n inmediata antes del autoguardado definitivo."""
+        """Guarda una recuperación inmediata antes del autoguardado definitivo."""
         from datetime import datetime
         import json
 
@@ -1120,21 +2563,22 @@ class ImageDatabase:
 
     def save_order_snapshot(self, order_id: int, values: dict, designs: list[dict], jobs: list[dict] | None = None,
                             discard_draft: bool = True) -> None:
-        """Actualiza ficha y diseÃ±os en una sola operaciÃ³n reversible desde la UI."""
+        """Actualiza ficha y diseños en una sola operación reversible desde la UI."""
         from datetime import datetime
 
         now = datetime.now().isoformat(timespec="seconds")
         client = str(values.get("client", "")).strip()
         if not client:
-            raise ValueError("IndicÃ¡ el cliente del pedido.")
+            raise ValueError("Indicá el cliente del pedido.")
         whatsapp = str(values.get("whatsapp", "")).strip()
-        client_id = self._ensure_client(client, whatsapp, now)
         quantity = max(0, int(values.get("quantity", 0) or 0))
         try:
             print_priority = _manual_priority_value(values.get("print_priority", 0))
         except (TypeError, ValueError):
             print_priority = 0
         status = str(values.get("status", "Nuevo") or "Nuevo")
+        if _is_delivered_order_status(status):
+            print_priority = 0
         try:
             price = max(0.0, float(str(values.get("price", 0) or 0).replace(",", ".")))
         except (TypeError, ValueError):
@@ -1143,44 +2587,194 @@ class ImageDatabase:
             discount_percent = min(100.0, max(0.0, float(str(values.get("discount_percent", 0) or 0).replace(",", "."))))
         except (TypeError, ValueError):
             discount_percent = 0.0
+        commission_percent = _seller_commission_percent(values.get("assigned_to"))
         budget_total = round(price * (1 - discount_percent / 100), 2)
+        existing_design_metadata = {
+            row["image_path"]: dict(row)
+            for row in self.connection.execute(
+                """SELECT image_path, source, creator_status, creator_queued_at, order_job_id
+                   FROM order_designs WHERE order_id = ?""",
+                (order_id,),
+            )
+        }
+        existing_demand_lines = {
+            str(row["design_line_id"]): dict(row)
+            for row in self.connection.execute(
+                """SELECT design_line_id,image_path,size_cm,quantity,unit_kind,packing_mode,workspace_format
+                   FROM order_design_demand_lines WHERE order_id=?""",
+                (order_id,),
+            )
+        }
+        incoming_line_ids = {str(design.get("design_line_id") or "") for design in designs}
+        for removed_line_id in set(existing_demand_lines) - incoming_line_ids:
+            active = self.connection.execute(
+                """SELECT 1 FROM plancha_item_assignments
+                   WHERE order_design_line_id=? AND state<>'released' LIMIT 1""",
+                (removed_line_id,),
+            ).fetchone()
+            if active:
+                raise ValueError(
+                    "No se puede quitar una línea que ya tiene unidades reservadas o producidas. "
+                    "Conservála para mantener su trazabilidad."
+                )
+        sole_job_id = None
         with self.connection:
+            client_id = self._ensure_client(client, whatsapp, now)
+            if status.strip().casefold() in {"entregado", "terminado", "completado"}:
+                previous_status = self.connection.execute("SELECT status FROM orders WHERE id=?", (order_id,)).fetchone()
+                if previous_status and previous_status[0] != status:
+                    from app.services.delivery_readiness import assert_deliverable
+                    assert_deliverable(self.connection, order_id)
             self.connection.execute(
                 """UPDATE orders SET client = ?, whatsapp = ?, client_id = ?,
                    status = ?, material = ?, size = ?, quantity = ?, price = ?, discount_percent = ?,
-                   extra_services = ?, budget_total = ?, assigned_to = ?, observations = ?,
+                   extra_services = ?, budget_total = ?, assigned_to = ?, seller_commission_percent = ?, observations = ?,
                    pending_reason = ?, delivery_date = ?, print_priority = ?, order_date = ?,
-                   order_concept = ?, order_description = ?, last_autosave_at = ?, updated_at = ? WHERE id = ?""",
+                   order_concept = ?, order_description = ?, complaint_notes = ?, last_autosave_at = ?, updated_at = ? WHERE id = ?""",
                 (
                     client, whatsapp, client_id,
                     status, str(values.get("material", "")).strip(), str(values.get("size", "")).strip(),
                     quantity, price, discount_percent, str(values.get("extra_services", "")).strip(),
-                    budget_total, str(values.get("assigned_to", "")).strip(), str(values.get("observations", "")).strip(),
+                    budget_total, str(values.get("assigned_to", "")).strip(), commission_percent, str(values.get("observations", "")).strip(),
                     str(values.get("pending_reason", "")).strip(), str(values.get("delivery_date", "")).strip(),
                     print_priority, str(values.get("order_date", "") or "").strip(),
                     str(values.get("order_concept", "") or "").strip(),
                     str(values.get("order_description", "") or "").strip(),
+                    str(values.get("complaint_notes", "") or "").strip(),
                     now, now, order_id,
                 ),
             )
+            if jobs is not None:
+                self._write_order_jobs(order_id, jobs, now)
+                self.connection.execute("UPDATE orders SET order_jobs_deleted = 0 WHERE id = ?", (order_id,))
+            persisted_job_ids = [
+                int(job["id"]) for job in (jobs or [])
+                if job.get("id") is not None and str(job.get("id")).isdigit()
+            ]
+            sole_job_id = persisted_job_ids[0] if len(persisted_job_ids) == 1 else None
+            jobs_by_id = {int(job["id"]): job for job in self.order_jobs(order_id)}
+            if not persisted_job_ids:
+                sole_job_id = next(iter(jobs_by_id)) if len(jobs_by_id) == 1 else None
+            line_ids = [str(d["design_line_id"]) for d in designs if d.get("design_line_id")]
+            if len(line_ids) != len(set(line_ids)):
+                raise ValueError("La misma línea de diseño no puede distribuirse dos veces.")
+            distributed: dict[int, int] = {}
+            for design in designs:
+                if int(design.get("quantity", 1) or 0) <= 0:
+                    raise ValueError("La cantidad de cada diseño debe ser mayor que cero.")
+                linked = design.get("order_job_id") or sole_job_id
+                if linked is None and design.get("order_job_index") is not None and jobs is not None:
+                    try:
+                        linked = jobs[int(design["order_job_index"])].get("id")
+                    except (IndexError, TypeError, ValueError):
+                        linked = None
+                if linked is not None:
+                    linked = int(linked)
+                    if linked not in jobs_by_id:
+                        raise ValueError("El diseño referencia un trabajo ajeno al pedido.")
+                    job_unit = jobs_by_id[linked].get("unit_kind")
+                    if design.get("unit_kind") and job_unit and design["unit_kind"] != job_unit:
+                        raise ValueError("La unidad del diseño debe coincidir con la del trabajo.")
+                    distributed[linked] = distributed.get(linked, 0) + max(1, int(design.get("quantity", 1) or 1))
+            for job_id, assigned in distributed.items():
+                requested = int(jobs_by_id.get(job_id, {}).get("quantity") or 0)
+                if requested and assigned > requested:
+                    raise ValueError(
+                        f"Los diseños del trabajo '{jobs_by_id[job_id].get('title') or job_id}' distribuyen "
+                        f"{assigned} unidades, pero el trabajo solicita {requested}."
+                    )
+            for job_id, job in jobs_by_id.items():
+                if job.get("distribution_policy") == "complete" and distributed.get(job_id, 0) != int(job["quantity"]):
+                    raise ValueError(f"La distribución completa de '{job['title']}' debe coincidir con la cantidad solicitada.")
             self.connection.execute("DELETE FROM order_designs WHERE order_id = ?", (order_id,))
+            self.connection.execute("DELETE FROM order_design_job_links WHERE order_id = ?", (order_id,))
+            self.connection.execute("DELETE FROM order_design_demand_lines WHERE order_id = ?", (order_id,))
+            inserted_paths: set[str] = set()
             for design in designs:
                 path = str(design.get("image_path", "")).strip()
                 if not path:
                     continue
-                self.connection.execute(
-                    """INSERT INTO order_designs(order_id, image_path, quantity, size_cm, rotation, status)
-                       VALUES(?, ?, ?, ?, ?, ?)""",
-                    (
-                        order_id, path, max(1, int(design.get("quantity", 1) or 1)),
-                        float(design.get("size_cm", 5.9) or 5.9), int(design.get("rotation", 0) or 0),
-                        str(design.get("status", "Pendiente") or "Pendiente"),
-                    ),
-                )
+                previous = existing_design_metadata.get(path, {})
+                quantity_value = max(1, int(design.get("quantity", 1) or 1))
+                size_value = float(design.get("size_cm", 5.0) or 5.0)
+                rotation_value = int(design.get("rotation", 0) or 0)
+                linked_job_id = design.get("order_job_id", previous.get("order_job_id")) or sole_job_id
+                if linked_job_id is None and design.get("order_job_index") is not None and jobs is not None:
+                    try:
+                        linked_job_id = jobs[int(design["order_job_index"])].get("id")
+                    except (IndexError, TypeError, ValueError):
+                        linked_job_id = None
+                line_id = str(design.get("design_line_id") or "")
+                if line_id:
+                    old_line = existing_demand_lines.get(line_id)
+                    if old_line and (
+                        str(old_line["image_path"]) != path
+                        or abs(float(old_line["size_cm"] or 0) - size_value) > 0.000001
+                    ):
+                        produced = self.connection.execute(
+                            """SELECT 1 FROM plancha_item_assignments
+                               WHERE order_design_line_id=? AND state IN ('printed','finished') LIMIT 1""",
+                            (line_id,),
+                        ).fetchone()
+                        if produced:
+                            raise ValueError(
+                                "La línea de diseño ya tiene producción. Para cambiar realmente el diseño o la "
+                                "medida, agregá una línea nueva; el historial existente se conservará."
+                            )
+                    active_quantity = float(self.connection.execute(
+                        """SELECT COALESCE(SUM(quantity),0) FROM plancha_item_assignments
+                           WHERE order_design_line_id=? AND state<>'released'""",
+                        (line_id,),
+                    ).fetchone()[0] or 0)
+                    if quantity_value < active_quantity:
+                        raise ValueError(
+                            f"No se puede reducir la línea a {quantity_value}: conserva "
+                            f"{active_quantity:g} unidad(es) reservadas o producidas."
+                        )
+                if path not in inserted_paths:
+                    self.connection.execute(
+                        """INSERT INTO order_designs(
+                               order_id, image_path, quantity, size_cm, rotation, status,
+                               source, creator_status, creator_queued_at, order_job_id
+                           ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            order_id, path, quantity_value, size_value, rotation_value,
+                            str(design.get("status", "Pendiente") or "Pendiente"),
+                            str(design.get("source") or previous.get("source") or ""),
+                            str(design.get("creator_status") or previous.get("creator_status") or "Pendiente"),
+                            str(design.get("creator_queued_at") or previous.get("creator_queued_at") or ""),
+                            linked_job_id,
+                        ),
+                    )
+                    inserted_paths.add(path)
+                if linked_job_id is not None:
+                    line_id = str(design.get("design_line_id") or uuid.uuid4().hex)
+                    design["design_line_id"] = line_id
+                    self.connection.execute(
+                        """INSERT INTO order_design_job_links(
+                               order_id,order_job_id,image_path,quantity,size_cm,rotation,created_at,updated_at)
+                           VALUES(?,?,?,?,?,?,?,?)
+                           ON CONFLICT(order_job_id,image_path,size_cm,rotation) DO UPDATE SET
+                             quantity=excluded.quantity,updated_at=excluded.updated_at""",
+                        (order_id, int(linked_job_id), path, quantity_value, size_value, rotation_value, now, now),
+                    )
+                    old_line = existing_demand_lines.get(line_id, {})
+                    job_unit_kind = str(jobs_by_id.get(int(linked_job_id), {}).get("unit_kind") or "")
+                    unit_kind = str(design.get("unit_kind") or old_line.get("unit_kind") or job_unit_kind or "")
+                    packing_mode = str(design.get("packing_mode") or old_line.get("packing_mode") or "")
+                    workspace_format = str(design.get("workspace_format") or old_line.get("workspace_format") or "a4")
+                    self.connection.execute(
+                        """INSERT INTO order_design_demand_lines(
+                               design_line_id,order_id,order_job_id,image_path,quantity,size_cm,rotation,
+                               unit_kind,packing_mode,workspace_format,created_at,updated_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (line_id, order_id, int(linked_job_id), path, quantity_value,
+                         size_value, rotation_value, unit_kind, packing_mode, workspace_format, now, now),
+                    )
                 self.connection.execute("UPDATE images SET design_order_id = ? WHERE path = ?", (order_id, path))
             if jobs is not None:
-                self._write_order_jobs(order_id, jobs, now)
                 self._sync_order_from_jobs(order_id, now)
+                self._refresh_order_commercial_cost(order_id)
             if discard_draft:
                 self.connection.execute("DELETE FROM order_drafts WHERE order_id = ?", (order_id,))
         # Mantiene el resumen de cobros sincronizado si se modificó el total o
@@ -1199,37 +2793,213 @@ class ImageDatabase:
         self.save_order_snapshot(order_id, draft.get("values", {}), draft.get("designs", []), draft.get("jobs"))
         return True
 
-    def link_design_to_order(self, order_id: int, image_path: str, quantity: int = 1, size_cm: float = 5.9, rotation: int = 0, status: str = "Pendiente") -> None:
+    def _migrate_order_designs_nominal_size(self) -> None:
+        """Normaliza el legado 5.9 y actualiza el default SQLite a 5.0.
+
+        La reconstrucción sólo ocurre en bases con el default histórico; por
+        eso la migración es idempotente y no toca una base ya normalizada.
+        """
+        columns = list(self.connection.execute("PRAGMA table_info(order_designs)"))
+        size_column = next((row for row in columns if row[1] == "size_cm"), None)
+        if size_column is None:
+            return
+        default = str(size_column[4] or "").strip("'\"")
         self.connection.execute(
-            """INSERT INTO order_designs(order_id, image_path, quantity, size_cm, rotation, status)
-               VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(order_id, image_path) DO UPDATE SET
-               quantity=excluded.quantity, size_cm=excluded.size_cm, rotation=excluded.rotation, status=excluded.status""",
-            (order_id, image_path, quantity, size_cm, rotation, status),
+            "UPDATE order_designs SET size_cm = 5.0 WHERE ABS(COALESCE(size_cm, 5.0) - 5.9) < 0.000001"
         )
+        if default not in {"5.9", "5.90"}:
+            self.connection.commit()
+            return
+
+        # Todas estas columnas ya existen antes de llamar a la migración.
+        names = "order_id, image_path, quantity, size_cm, rotation, status, source, creator_status, creator_queued_at, order_job_id, estimated_design_minutes"
+        with self.connection:
+            self.connection.execute("ALTER TABLE order_designs RENAME TO order_designs_legacy_size")
+            self.connection.execute(
+                """CREATE TABLE order_designs (
+                    order_id INTEGER NOT NULL, image_path TEXT NOT NULL, quantity INTEGER DEFAULT 1,
+                    size_cm REAL DEFAULT 5.0, rotation INTEGER DEFAULT 0,
+                    status TEXT DEFAULT 'Pendiente', source TEXT DEFAULT '',
+                    creator_status TEXT DEFAULT 'Pendiente', creator_queued_at TEXT DEFAULT '',
+                    order_job_id INTEGER, estimated_design_minutes REAL DEFAULT 0,
+                    PRIMARY KEY(order_id, image_path),
+                    FOREIGN KEY(order_id) REFERENCES orders(id)
+                )"""
+            )
+            self.connection.execute(
+                f"INSERT INTO order_designs({names}) SELECT {names} FROM order_designs_legacy_size"
+            )
+            self.connection.execute("DROP TABLE order_designs_legacy_size")
+            self.connection.execute("CREATE INDEX IF NOT EXISTS idx_order_designs_job ON order_designs(order_job_id)")
+
+    def link_design_to_order(
+        self, order_id: int, image_path: str, quantity: int = 1,
+        size_cm: float = 5.0, rotation: int = 0, status: str = "Pendiente",
+        source: str = "library", order_job_id: int | None = None,
+        design_line_id: str | None = None,
+    ) -> None:
+        from datetime import datetime
+        self.connection.execute(
+            """INSERT INTO order_designs(
+                   order_id, image_path, quantity, size_cm, rotation, status, source, order_job_id
+               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(order_id, image_path) DO UPDATE SET
+               quantity=excluded.quantity, size_cm=excluded.size_cm, rotation=excluded.rotation,
+               status=excluded.status,
+               order_job_id=COALESCE(excluded.order_job_id, order_designs.order_job_id),
+               source=CASE
+                   WHEN COALESCE(order_designs.source, '') = '' THEN excluded.source
+                   ELSE order_designs.source
+               END""",
+            (order_id, image_path, quantity, size_cm, rotation, status, source, order_job_id),
+        )
+        if order_job_id is not None:
+            now = datetime.now().isoformat(timespec="seconds")
+            stable_line_id = str(design_line_id or uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"doccione-design-line|{int(order_id)}|{int(order_job_id)}|{str(image_path).replace(chr(92), '/').casefold()}|{float(size_cm):.6f}|{int(rotation) % 360}",
+            ).hex)
+            self.connection.execute(
+                """INSERT INTO order_design_job_links(
+                       order_id,order_job_id,image_path,quantity,size_cm,rotation,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?)
+                   ON CONFLICT(order_job_id,image_path,size_cm,rotation) DO UPDATE SET
+                     quantity=excluded.quantity,updated_at=excluded.updated_at""",
+                (order_id, int(order_job_id), image_path, max(1, int(quantity)), float(size_cm),
+                 int(rotation), now, now),
+            )
+            self.connection.execute(
+                """INSERT INTO order_design_demand_lines(
+                       design_line_id,order_id,order_job_id,image_path,quantity,size_cm,rotation,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(design_line_id) DO UPDATE SET
+                      image_path=excluded.image_path,quantity=excluded.quantity,size_cm=excluded.size_cm,
+                      rotation=excluded.rotation,updated_at=excluded.updated_at""",
+                (stable_line_id, order_id, int(order_job_id), image_path, max(1, int(quantity)),
+                 float(size_cm), int(rotation), now, now),
+            )
         self.connection.execute("UPDATE images SET design_order_id = ? WHERE path = ?", (order_id, image_path))
         self.connection.commit()
 
     def order_designs(self, order_id: int) -> list[dict]:
+        demand_exists = self.connection.execute(
+            "SELECT 1 FROM order_design_demand_lines WHERE order_id=? LIMIT 1", (order_id,)
+        ).fetchone()
+        if demand_exists:
+            rows = self.connection.execute(
+                """SELECT lines.order_id,lines.image_path,lines.quantity,lines.size_cm,lines.rotation,
+                          COALESCE(base.status,'Pendiente') AS status,COALESCE(base.source,'') AS source,
+                          COALESCE(base.creator_status,'Pendiente') AS creator_status,
+                          COALESCE(base.creator_queued_at,'') AS creator_queued_at,
+                          COALESCE(base.estimated_design_minutes,0) AS estimated_design_minutes,
+                          lines.order_job_id,lines.id AS job_design_link_id,lines.design_line_id,
+                          images.name,images.tags,images.category,images.caption
+                   FROM order_design_demand_lines lines
+                   LEFT JOIN order_designs base
+                     ON base.order_id=lines.order_id AND base.image_path=lines.image_path
+                   JOIN (
+                        SELECT images.path,images.name,images.category,images.caption,
+                               GROUP_CONCAT(tags.name,' · ') AS tags
+                        FROM images LEFT JOIN image_tags ON image_tags.image_path=images.path
+                        LEFT JOIN tags ON tags.id=image_tags.tag_id GROUP BY images.path
+                   ) images ON images.path=lines.image_path
+                   WHERE lines.order_id=?
+                   ORDER BY images.name COLLATE NOCASE,lines.order_job_id,lines.id""",
+                (order_id,),
+            )
+            return [dict(row) for row in rows]
+        link_table = "order_design_demand_lines" if demand_exists else "order_design_job_links"
+        line_identity = "links.design_line_id" if demand_exists else "''"
         rows = self.connection.execute(
-            """SELECT order_designs.*, images.name, images.tags, images.category
-               FROM order_designs JOIN (
-                    SELECT images.path, images.name, images.category,
+            f"""SELECT order_designs.order_id,order_designs.image_path,
+                      COALESCE(links.quantity,order_designs.quantity) AS quantity,
+                      COALESCE(links.size_cm,order_designs.size_cm) AS size_cm,
+                      COALESCE(links.rotation,order_designs.rotation) AS rotation,
+                      order_designs.status,order_designs.source,order_designs.creator_status,
+                      order_designs.creator_queued_at,order_designs.estimated_design_minutes,
+                      COALESCE(links.order_job_id,order_designs.order_job_id) AS order_job_id,
+                       links.id AS job_design_link_id, {line_identity} AS design_line_id,
+                      images.name, images.tags, images.category, images.caption
+               FROM order_designs
+               LEFT JOIN {link_table} links
+                 ON links.order_id=order_designs.order_id AND links.image_path=order_designs.image_path
+               JOIN (
+                    SELECT images.path, images.name, images.category, images.caption,
                            GROUP_CONCAT(tags.name, ' · ') AS tags
                     FROM images LEFT JOIN image_tags ON image_tags.image_path = images.path
                     LEFT JOIN tags ON tags.id = image_tags.tag_id
                     GROUP BY images.path
                ) AS images ON images.path = order_designs.image_path
-               WHERE order_designs.order_id = ? ORDER BY images.name COLLATE NOCASE""",
+               WHERE order_designs.order_id = ?
+               ORDER BY images.name COLLATE NOCASE, COALESCE(links.order_job_id,0), COALESCE(links.id,0)""",
             (order_id,),
         )
         return [dict(row) for row in rows]
+
+    def mobile_order_images(self, order_id: int) -> list[dict]:
+        """Imágenes originales enviadas por el celular para un pedido."""
+        rows = self.connection.execute(
+            """SELECT order_designs.*, images.name, images.caption
+               FROM order_designs
+               LEFT JOIN images ON images.path = order_designs.image_path
+               WHERE order_designs.order_id = ?
+                 AND (
+                     LOWER(COALESCE(order_designs.source, '')) = 'mobile'
+                     OR LOWER(order_designs.image_path) LIKE '%mobile_uploads%'
+                     OR LOWER(COALESCE(images.caption, '')) = 'imagen recibida desde doccione mobile'
+                 )
+               ORDER BY COALESCE(images.name, order_designs.image_path) COLLATE NOCASE""",
+            (order_id,),
+        )
+        return [dict(row) for row in rows]
+
+    def mark_mobile_images_sent_to_creator(self, order_id: int, image_paths: list[str]) -> int:
+        """Marca sólo adjuntos móviles reales como enviados al Creador."""
+        from datetime import datetime
+
+        requested = {str(path).strip() for path in image_paths if str(path).strip()}
+        if not requested:
+            return 0
+        allowed = {
+            str(image["image_path"])
+            for image in self.mobile_order_images(order_id)
+        }
+        selected = sorted(requested & allowed)
+        if not selected:
+            return 0
+        now = datetime.now().isoformat(timespec="seconds")
+        placeholders = ", ".join("?" for _ in selected)
+        with self.connection:
+            cursor = self.connection.execute(
+                f"""UPDATE order_designs
+                    SET creator_status = 'Enviado', creator_queued_at = ?
+                    WHERE order_id = ? AND image_path IN ({placeholders})""",
+                (now, order_id, *selected),
+            )
+            self.connection.execute(
+                """INSERT INTO order_events(order_id, event_type, message, data_json, created_at)
+                   VALUES(?, 'stickers.creator.queued', ?, ?, ?)""",
+                (
+                    order_id,
+                    f"{len(selected)} imagen(es) del celular enviada(s) al Creador de Stickers.",
+                    json.dumps({"image_paths": selected}, ensure_ascii=False),
+                    now,
+                ),
+            )
+        return int(cursor.rowcount)
 
     def order_jobs(self, order_id: int) -> list[dict]:
         """Detalle de trabajos de un pedido, ordenado como lo ve el usuario."""
         rows = self.connection.execute(
             "SELECT * FROM order_jobs WHERE order_id = ? ORDER BY sort_order, id", (order_id,)
         )
-        return [dict(row) for row in rows]
+        jobs = [dict(row) for row in rows]
+        for job in jobs:
+            estimate = self.connection.execute(
+                "SELECT * FROM order_job_production_estimates WHERE order_job_id = ?", (job["id"],)
+            ).fetchone()
+            if estimate:
+                job["production_estimate"] = dict(estimate)
+        return jobs
 
     def replace_order_jobs(self, order_id: int, jobs: list[dict]) -> list[dict]:
         """Guarda el listado completo de trabajos y actualiza el resumen del pedido."""
@@ -1238,15 +3008,62 @@ class ImageDatabase:
         now = datetime.now().isoformat(timespec="seconds")
         with self.connection:
             saved = self._write_order_jobs(order_id, jobs, now)
+            self.connection.execute("UPDATE orders SET order_jobs_deleted = 0 WHERE id = ?", (order_id,))
             self._sync_order_from_jobs(order_id, now)
+            self._refresh_order_commercial_cost(order_id)
         self.add_order_event(order_id, "Trabajos", f"Se actualizaron {len(saved)} trabajo(s) del pedido.")
         return self.order_jobs(order_id)
+
+    def delete_order_job(self, order_id: int, job_id: int) -> dict:
+        """Elimina cualquier trabajo y sincroniza los totales del pedido."""
+        from datetime import datetime
+
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connection:
+            row = self.connection.execute(
+                "SELECT * FROM order_jobs WHERE id = ? AND order_id = ?", (job_id, order_id)
+            ).fetchone()
+            if not row:
+                raise ValueError("El trabajo ya no existe en este pedido.")
+            job = dict(row)
+            if self.connection.execute(
+                "SELECT 1 FROM plancha_item_assignments WHERE order_job_id=? LIMIT 1",
+                (job_id,),
+            ).fetchone():
+                raise ValueError("El trabajo conserva reservas o historial productivo y no puede eliminarse.")
+            self.connection.execute("DELETE FROM order_design_job_links WHERE order_job_id=?", (job_id,))
+            self.connection.execute("DELETE FROM order_jobs WHERE id = ? AND order_id = ?", (job_id, order_id))
+            remaining = self.connection.execute(
+                "SELECT id FROM order_jobs WHERE order_id = ? ORDER BY sort_order, id", (order_id,)
+            ).fetchall()
+            for position, remaining_job in enumerate(remaining):
+                self.connection.execute(
+                    "UPDATE order_jobs SET sort_order = ?, updated_at = ? WHERE id = ?",
+                    (position, now, remaining_job["id"]),
+                )
+            if remaining:
+                self._sync_order_from_jobs(order_id, now)
+                self._refresh_order_commercial_cost(order_id)
+            else:
+                self.connection.execute(
+                    """UPDATE orders
+                       SET material = '', size = '', quantity = 0, price = 0,
+                           discount_percent = 0, extra_services = '', budget_total = 0,
+                           cost_mp = 0, cost_mo = 0, cost_cf = 0, cost_total = 0,
+                           margin = 0, commercial_cost = 0, final_cost = 0,
+                           final_margin = 0, order_jobs_deleted = 1, updated_at = ?
+                       WHERE id = ?""",
+                    (now, order_id),
+                )
+        self.recalculate_order_costs(order_id)
+        self.add_order_event(order_id, "Trabajos", f"Se eliminó el trabajo: {job.get('title') or 'Sin nombre'}.")
+        return job
 
     def order_jobs_summary(self, order_id: int) -> dict:
         """Resumen de ítems para listas y pantallas de pedido."""
         rows = self.order_jobs(order_id)
         subtotal = round(sum(float(job.get("subtotal") or 0) for job in rows), 2)
-        total = round(sum(float(job.get("subtotal") or 0) * (1 - float(job.get("discount_percent") or 0) / 100) for job in rows), 2)
+        total = subtotal  # Los descuentos individuales ya no se usan
         quantity = sum(max(1, int(job.get("quantity") or 1)) for job in rows)
         return {"count": len(rows), "subtotal": subtotal, "total": total, "quantity": quantity}
 
@@ -1270,18 +3087,21 @@ class ImageDatabase:
 
     def order_financials(self, order_id: int) -> dict:
         row = self.connection.execute(
-            "SELECT price, discount_percent, budget_total, paid_amount, payment_status, cost_mp, cost_mo, cost_cf, cost_total, margin FROM orders WHERE id = ?", (order_id,)
+            "SELECT price, discount_percent, budget_total, paid_amount, payment_status, cost_mp, cost_mo, cost_cf, seller_commission_percent, seller_commission_amount, cost_total, margin FROM orders WHERE id = ?", (order_id,)
         ).fetchone()
         if not row:
-            return {"subtotal": 0.0, "discount_percent": 0.0, "budget_total": 0.0, "paid_amount": 0.0, "pending_amount": 0.0, "payment_status": "Pendiente", "cost_mp": 0.0, "cost_mo": 0.0, "cost_cf": 0.0, "cost_total": 0.0, "margin": 0.0}
+            return {"subtotal": 0.0, "discount_percent": 0.0, "budget_total": 0.0, "paid_amount": 0.0, "pending_amount": 0.0, "payment_status": "Pendiente", "cost_mp": 0.0, "cost_mo": 0.0, "cost_cf": 0.0, "seller_commission_percent": 0.0, "seller_commission_amount": 0.0, "cost_total": 0.0, "margin": 0.0}
         paid = self.connection.execute(
-            "SELECT COALESCE(SUM(amount), 0) FROM order_payments WHERE order_id = ?", (order_id,)
+            """SELECT COALESCE(SUM(amount), 0) FROM order_payments
+               WHERE order_id = ? AND COALESCE(cancelled_at, '') = ''""", (order_id,)
         ).fetchone()[0]
         jobs = self.order_jobs(order_id)
         if jobs:
             subtotal = round(sum(float(job.get("subtotal") or 0) for job in jobs), 2)
-            total = round(sum(float(job.get("subtotal") or 0) * (1 - float(job.get("discount_percent") or 0) / 100) for job in jobs), 2)
-            discount = 0.0
+            total = subtotal  # Los descuentos individuales ya no se usan; se aplica descuento global del pedido
+            discount = float(row["discount_percent"] or 0)  # Descuento global del pedido
+            if discount > 0:
+                total = round(subtotal * (1 - discount / 100), 2)
         else:
             subtotal = float(row["price"] or 0)
             discount = float(row["discount_percent"] or 0)
@@ -1298,6 +3118,8 @@ class ImageDatabase:
             "cost_mp": float(row["cost_mp"] or 0),
             "cost_mo": float(row["cost_mo"] or 0),
             "cost_cf": float(row["cost_cf"] or 0),
+            "seller_commission_percent": float(row["seller_commission_percent"] or 0),
+            "seller_commission_amount": float(row["seller_commission_amount"] or 0),
             "cost_total": float(row["cost_total"] or 0),
             "margin": float(row["margin"] or 0),
         }
@@ -1333,8 +3155,10 @@ class ImageDatabase:
         material = str(order.get("material", "")).strip()
         
         if jobs:
-            # Calcular budget_total y cantidad de trabajos
-            budget_total = round(sum(float(job.get("subtotal") or 0) * (1 - float(job.get("discount_percent") or 0) / 100) for job in jobs), 2)
+            # Calcular budget_total sumando trabajos y aplicando descuento global del pedido
+            subtotal = round(sum(float(job.get("subtotal") or 0) for job in jobs), 2)
+            discount = float(order.get("discount_percent") or 0)
+            budget_total = round(subtotal * (1 - discount / 100), 2) if discount > 0 else subtotal
             quantity = sum(int(j.get("quantity", 1) or 1) for j in jobs)
         else:
             # Usar precio del pedido
@@ -1377,14 +3201,16 @@ class ImageDatabase:
             total_mo += float(component_map.get("mo", 0.0))
             total_cf += float(component_map.get("cf", 0.0))
 
-        cost_total = round(total_mp + total_mo + total_cf, 2)
+        commission_pct = _seller_commission_percent(order.get("assigned_to"))
+        commission = round(max(0.0, budget_total - total_mp - total_mo - total_cf) * commission_pct / 100, 2)
+        cost_total = round(total_mp + total_mo + total_cf + commission, 2)
         margin = round(budget_total - cost_total, 2)
 
         self.connection.execute(
             """UPDATE orders 
-               SET cost_mp = ?, cost_mo = ?, cost_cf = ?, cost_total = ?, margin = ?, budget_total = ?
+               SET cost_mp = ?, cost_mo = ?, cost_cf = ?, seller_commission_percent = ?, seller_commission_amount = ?, cost_total = ?, margin = ?, budget_total = ?
                WHERE id = ?""",
-            (round(total_mp, 2), round(total_mo, 2), round(total_cf, 2), cost_total, margin, budget_total, order_id)
+            (round(total_mp, 2), round(total_mo, 2), round(total_cf, 2), commission_pct, commission, cost_total, margin, budget_total, order_id)
         )
         self.connection.commit()
 
@@ -1499,24 +3325,37 @@ class ImageDatabase:
             "paid_delta_pct":      paid_delta_pct,
         }
 
-    def register_order_payment(self, order_id: int, amount: float, method: str = "", note: str = "") -> dict:
+    def register_order_payment(self, order_id: int, amount: float, method: str = "", note: str = "",
+                               idempotency_key: str = "") -> dict:
         from datetime import datetime
 
         amount = round(float(amount), 2)
-        if amount <= 0:
+        if not math.isfinite(amount) or amount <= 0:
             raise ValueError("El cobro debe ser mayor que cero.")
+        key = str(idempotency_key or "").strip()
         now = datetime.now().isoformat(timespec="seconds")
         with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            if not self.connection.execute("SELECT 1 FROM orders WHERE id=?", (order_id,)).fetchone():
+                raise ValueError("El pedido no existe.")
+            if key:
+                existing = self.connection.execute(
+                    "SELECT * FROM order_payments WHERE order_id=? AND idempotency_key=?", (order_id, key),
+                ).fetchone()
+                if existing:
+                    if (float(existing['amount']), existing['method'], existing['note']) != (amount, method.strip(), note.strip()):
+                        raise ValueError("La clave de pago ya fue utilizada con datos incompatibles.")
+                    return self.order_financials(order_id)
             self.connection.execute(
-                "INSERT INTO order_payments(order_id, amount, method, note, paid_at, created_at) VALUES(?, ?, ?, ?, ?, ?)",
-                (order_id, amount, method.strip(), note.strip(), now, now),
+                """INSERT INTO order_payments(order_id, amount, method, note, paid_at, created_at, idempotency_key)
+                   VALUES(?, ?, ?, ?, ?, ?, ?)""",
+                (order_id, amount, method.strip(), note.strip(), now, now, key),
             )
-        financials = self.order_financials(order_id)
-        self.connection.execute(
-            "UPDATE orders SET budget_total = ?, paid_amount = ?, payment_status = ?, updated_at = ? WHERE id = ?",
-            (financials["budget_total"], financials["paid_amount"], financials["payment_status"], now, order_id),
-        )
-        self.connection.commit()
+            financials = self.order_financials(order_id)
+            self.connection.execute(
+                "UPDATE orders SET budget_total = ?, paid_amount = ?, payment_status = ?, updated_at = ? WHERE id = ?",
+                (financials["budget_total"], financials["paid_amount"], financials["payment_status"], now, order_id),
+            )
         self.add_order_event(order_id, "Cobro", f"Cobro registrado: ${amount:,.2f}" + (f" · {method.strip()}" if method.strip() else ""), {"amount": amount, "method": method, "note": note})
         try:
             self.event_repo.publish_event(
@@ -1537,6 +3376,39 @@ class ImageDatabase:
             "SELECT * FROM order_payments WHERE order_id = ? ORDER BY id DESC", (order_id,)
         )
         return [dict(row) for row in rows]
+
+    def cancel_order_payment(self, order_id: int, payment_id: int, reason: str = "") -> dict:
+        """Anula un cobro sin borrar su registro contable ni su trazabilidad."""
+        from datetime import datetime
+
+        payment = self.connection.execute(
+            "SELECT * FROM order_payments WHERE id = ? AND order_id = ?", (payment_id, order_id)
+        ).fetchone()
+        if not payment:
+            raise ValueError("El cobro ya no existe o no pertenece a este pedido.")
+        if str(payment["cancelled_at"] or ""):
+            raise ValueError("El cobro ya fue cancelado.")
+        amount = float(payment["amount"] or 0)
+        method = str(payment["method"] or "").strip()
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connection:
+            cursor = self.connection.execute(
+                """UPDATE order_payments SET cancelled_at=?, cancellation_reason=?
+                   WHERE id=? AND order_id=? AND COALESCE(cancelled_at,'')=''""",
+                (now, str(reason or "").strip(), payment_id, order_id),
+            )
+            if not cursor.rowcount:
+                raise ValueError("El cobro ya fue cancelado.")
+            financials = self.order_financials(order_id)
+            self.connection.execute(
+                "UPDATE orders SET budget_total = ?, paid_amount = ?, payment_status = ?, updated_at = ? WHERE id = ?",
+                (financials["budget_total"], financials["paid_amount"], financials["payment_status"], now, order_id),
+            )
+        self.add_order_event(
+            order_id, "Cobro cancelado", f"Cobro cancelado: ${amount:,.2f}" + (f" · {method}" if method else ""),
+            {"payment_id": payment_id, "amount": amount, "method": method, "reason": str(reason or "").strip()},
+        )
+        return self.order_financials(order_id)
 
     def save_order_preview(self, order_id: int, preview_path: str, plancha_id: int | None = None) -> dict:
         """Registra una vista previa inalterable para consultar dentro del pedido."""
@@ -1571,9 +3443,11 @@ class ImageDatabase:
                       orders.whatsapp, orders.created_at, orders.order_date, orders.status,
                       orders.budget_total,
                       COALESCE((SELECT SUM(amount) FROM order_payments
-                                WHERE order_id = orders.id), 0) AS paid_amount,
+                                WHERE order_id = orders.id
+                                  AND COALESCE(cancelled_at, '') = ''), 0) AS paid_amount,
                       COALESCE((SELECT MAX(paid_at) FROM order_payments
-                                WHERE order_id = orders.id), '') AS last_payment_at,
+                                WHERE order_id = orders.id
+                                  AND COALESCE(cancelled_at, '') = ''), '') AS last_payment_at,
                       COALESCE((SELECT GROUP_CONCAT(
                           CASE WHEN TRIM(COALESCE(title, '')) <> '' THEN title ELSE 'Producto' END
                           || CASE WHEN TRIM(COALESCE(material, '')) <> '' THEN ' · ' || material ELSE '' END,
@@ -1604,8 +3478,47 @@ class ImageDatabase:
 
     def price_rules(self) -> list[dict]:
         rows = self.connection.execute(
-            "SELECT * FROM price_rules WHERE active = 1 ORDER BY material COLLATE NOCASE, size COLLATE NOCASE, min_quantity DESC, id DESC"
+            """SELECT pr.*
+                 FROM price_rules AS pr
+            LEFT JOIN products AS p ON p.id = pr.product_id
+            LEFT JOIN price_lists AS pl ON pl.id = pr.price_list_id
+                WHERE pr.active = 1
+             ORDER BY COALESCE(p.name, pr.material) COLLATE NOCASE,
+                      COALESCE(pl.name, '') COLLATE NOCASE,
+                      pr.material COLLATE NOCASE,
+                      CAST(REPLACE(LOWER(TRIM(pr.size)), 'cm', '') AS REAL),
+                      pr.size COLLATE NOCASE,
+                      pr.min_quantity, pr.id"""
         )
+        return [dict(row) for row in rows]
+
+    def active_catalog_products(self) -> list[dict]:
+        """Productos disponibles al definir una regla comercial."""
+        rows = self.connection.execute(
+            "SELECT id, code, name FROM products WHERE active = 1 ORDER BY name COLLATE NOCASE"
+        )
+        return [dict(row) for row in rows]
+
+    def active_price_lists(self) -> list[dict]:
+        """Listas de precios que pueden usarse en nuevos pedidos."""
+        rows = self.connection.execute(
+            "SELECT id, code, name FROM price_lists WHERE active = 1 ORDER BY CASE code WHEN 'general' THEN 0 WHEN 'pedidos' THEN 1 ELSE 2 END, name COLLATE NOCASE"
+        )
+        return [dict(row) for row in rows]
+
+    def catalog_product_prices(self, product_id: int) -> list[dict]:
+        """Precios activos de una ficha, ordenados para lectura comercial."""
+        rows = self.connection.execute(
+            """SELECT pr.id, pr.material, pr.size, pr.min_quantity, pr.max_quantity,
+                      pr.price, pr.price_mode, pr.pack_quantity, pl.name AS price_list_name
+                 FROM price_rules AS pr
+            LEFT JOIN price_lists AS pl ON pl.id = pr.price_list_id
+                WHERE pr.product_id = ? AND pr.active = 1
+             ORDER BY COALESCE(pl.name, '') COLLATE NOCASE,
+                      CAST(REPLACE(LOWER(pr.size), 'cm', '') AS REAL),
+                      pr.size COLLATE NOCASE, pr.min_quantity, pr.id""",
+            (int(product_id),),
+        ).fetchall()
         return [dict(row) for row in rows]
 
     def price_rule_presentations(self) -> list[dict]:
@@ -1656,6 +3569,8 @@ class ImageDatabase:
             elif legacy_rule and resolved_rule is not None:
                 status = "Regla antigua"
 
+            product = self.connection.execute("SELECT name FROM products WHERE id = ?", (rule.get("product_id"),)).fetchone() if rule.get("product_id") else None
+            price_list = self.connection.execute("SELECT name, code FROM price_lists WHERE id = ?", (rule.get("price_list_id"),)).fetchone() if rule.get("price_list_id") else None
             presentations.append({
                 **rule,
                 "id": int(rule.get("id") or 0),
@@ -1666,6 +3581,9 @@ class ImageDatabase:
                 "status": status,
                 "detail": detail,
                 "warning": warning if warning else ("Regla antigua" if legacy_rule else None),
+                "product_name": product[0] if product else "",
+                "price_list_name": price_list[0] if price_list else "Precios generales",
+                "price_list_code": price_list[1] if price_list else "general",
             })
         return presentations
 
@@ -1725,6 +3643,7 @@ class ImageDatabase:
                    COALESCE(SUM(amount), 0) AS paid
             FROM order_payments
             WHERE paid_at IS NOT NULL
+              AND COALESCE(cancelled_at, '') = ''
               AND strftime('%Y-%m', paid_at) = ?
             GROUP BY d
             """,
@@ -2030,6 +3949,8 @@ class ImageDatabase:
     @staticmethod
     def _price_material(material: str) -> str:
         value = " ".join((material or "").strip().split())
+        if not value:
+            return ""
         aliases = {
             "full color": "Vinilo Full Color HD",
             "vinilo full color": "Vinilo Full Color HD",
@@ -2042,8 +3963,16 @@ class ImageDatabase:
             "vinilo premium": "Vinilo Premium",
             "plancha vinilo blanco full color": "Plancha A4 - Vinilo Blanco Full Color",
             "plancha a4 vinilo blanco full color": "Plancha A4 - Vinilo Blanco Full Color",
+            "plancha personalizada": "Plancha A4 - Vinilo Blanco Full Color",
+            "plancha a4 personalizada": "Plancha A4 - Vinilo Blanco Full Color",
+            "plancha personalizada 5 cm": "Plancha A4 - Vinilo Blanco Full Color",
+            "plancha personalizada mixta": "Plancha A4 - Vinilo Blanco Full Color",
             "plancha diseño único": "Plancha A4 - Diseño Único",
+            "plancha diseño unico": "Plancha A4 - Diseño Único",
             "plancha a4 diseño único": "Plancha A4 - Diseño Único",
+            "plancha a4 diseño unico": "Plancha A4 - Diseño Único",
+            "plancha doccione": "Plancha A4 - Diseño Único",
+            "plancha a4 doccione": "Plancha A4 - Diseño Único",
             "plancha vinilos especiales": "Plancha A4 - Vinilos Especiales",
             "plancha a4 vinilos especiales": "Plancha A4 - Vinilos Especiales",
         }
@@ -2068,7 +3997,8 @@ class ImageDatabase:
         self, material: str, size: str, min_quantity: int, price: float,
         extra_service: str = "", discount_percent: float = 0,
         price_mode: str = "fijo", pack_quantity: int = 1,
-        variable_cost_model_id: int | None = None,
+        variable_cost_model_id: int | None = None, image_path: str = "",
+        product_id: int | None = None, price_list_id: int | None = None,
     ) -> int:
         minimum = max(1, int(min_quantity or 1))
         amount  = max(0.0, float(price or 0))
@@ -2079,11 +4009,12 @@ class ImageDatabase:
         pack = max(1, int(pack_quantity or 1))
         sql = """INSERT INTO price_rules(
                 material, size, min_quantity, price, extra_service, discount_percent,
-                active, price_mode, pack_quantity, variable_cost_model_id
-               ) VALUES(?, ?, ?, ?, ?, ?, 1, ?, ?, ?)"""
+                active, price_mode, pack_quantity, variable_cost_model_id, image_path, product_id, price_list_id
+               ) VALUES(?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)"""
         params = (
             self._price_material(material), self._price_size(size), minimum, amount,
-            extra_service.strip(), discount, mode, pack, None if variable_cost_model_id in {None, ""} else int(variable_cost_model_id),
+            extra_service.strip(), discount, mode, pack, None if variable_cost_model_id in {None, ""} else int(variable_cost_model_id), image_path.strip(),
+            None if product_id in {None, ""} else int(product_id), None if price_list_id in {None, ""} else int(price_list_id),
         )
         cursor = self.connection.execute(sql, params)
         try:
@@ -2125,7 +4056,8 @@ class ImageDatabase:
         self, rule_id: int, material: str, size: str, min_quantity: int, price: float,
         extra_service: str = "", discount_percent: float = 0,
         price_mode: str = "fijo", pack_quantity: int = 1,
-        variable_cost_model_id: int | None = None,
+        variable_cost_model_id: int | None = None, image_path: str = "",
+        product_id: int | None = None, price_list_id: int | None = None,
     ) -> bool:
         """Actualiza una regla sin alterar su origen ni la clave de catálogo."""
         minimum = max(1, int(min_quantity or 1))
@@ -2138,12 +4070,13 @@ class ImageDatabase:
         sql = """UPDATE price_rules
                SET material = ?, size = ?, min_quantity = ?, price = ?, extra_service = ?,
                    discount_percent = ?, active = 1, price_mode = ?, pack_quantity = ?,
-                   variable_cost_model_id = ?
+                   variable_cost_model_id = ?, image_path = ?, product_id = ?, price_list_id = ?
                WHERE id = ?"""
         params = (
             self._price_material(material), self._price_size(size), minimum, amount,
             extra_service.strip(), discount, mode, pack,
-            None if variable_cost_model_id in {None, ""} else int(variable_cost_model_id),
+            None if variable_cost_model_id in {None, ""} else int(variable_cost_model_id), image_path.strip(),
+            None if product_id in {None, ""} else int(product_id), None if price_list_id in {None, ""} else int(price_list_id),
             int(rule_id),
         )
         cursor = self.connection.execute(sql, params)
@@ -2740,6 +4673,325 @@ class ImageDatabase:
                 products.append({"name": prod, "material_full": mat, "size": str(row[1] or "")})
         return products
 
+    def catalog_products(self, search: str = "", *, include_inactive: bool = False) -> list[dict]:
+        """Devuelve fichas de catálogo con un precio visible y sus reglas asociadas."""
+        filters = []
+        params: list[object] = []
+        if not include_inactive:
+            filters.append("p.active = 1")
+        term = str(search or "").strip()
+        if term:
+            filters.append(
+                "(p.name LIKE ? COLLATE NOCASE OR p.code LIKE ? COLLATE NOCASE "
+                "OR p.category LIKE ? COLLATE NOCASE OR p.description LIKE ? COLLATE NOCASE)"
+            )
+            wildcard = f"%{term}%"
+            params.extend([wildcard, wildcard, wildcard, wildcard])
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        rows = self.connection.execute(
+            f"""SELECT p.*,
+                       COALESCE(p.base_price, MIN(CASE WHEN pr.active = 1 THEN pr.price END), 0) AS price,
+                       COUNT(CASE WHEN pr.active = 1 THEN pr.id END) AS price_rule_count,
+                       MIN(CASE WHEN pr.active = 1 THEN pr.price END) AS min_price,
+                       MAX(CASE WHEN pr.active = 1 THEN pr.price END) AS max_price,
+                       GROUP_CONCAT(DISTINCT NULLIF(pr.size, '')) AS available_sizes
+                  FROM products AS p
+             LEFT JOIN price_rules AS pr ON pr.product_id = p.id
+                  {where}
+              GROUP BY p.id
+              ORDER BY p.active DESC, p.updated_at DESC, p.name COLLATE NOCASE""",
+            params,
+        )
+        return [dict(row) for row in rows]
+
+    def catalog_product(self, product_id: int) -> dict | None:
+        """Devuelve una ficha de producto, incluso si está archivada."""
+        row = self.connection.execute(
+            """SELECT p.*,
+                      COALESCE(p.base_price, MIN(CASE WHEN pr.active = 1 THEN pr.price END), 0) AS price,
+                      COUNT(CASE WHEN pr.active = 1 THEN pr.id END) AS price_rule_count,
+                      MIN(CASE WHEN pr.active = 1 THEN pr.price END) AS min_price,
+                      MAX(CASE WHEN pr.active = 1 THEN pr.price END) AS max_price,
+                      GROUP_CONCAT(DISTINCT NULLIF(pr.size, '')) AS available_sizes
+                 FROM products AS p
+            LEFT JOIN price_rules AS pr ON pr.product_id = p.id
+                WHERE p.id = ?
+             GROUP BY p.id""",
+            (int(product_id),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    @staticmethod
+    def _catalog_product_code(name: str) -> str:
+        """Construye una clave estable y legible para productos creados desde la UI."""
+        normalized = unicodedata.normalize("NFKD", str(name or "producto"))
+        ascii_name = normalized.encode("ascii", "ignore").decode("ascii").casefold()
+        code = re.sub(r"[^a-z0-9]+", "_", ascii_name).strip("_")
+        return code or "producto"
+
+    def _available_catalog_product_code(self, name: str, product_id: int | None = None) -> str:
+        base = self._catalog_product_code(name)
+        candidate = base
+        suffix = 2
+        while True:
+            row = self.connection.execute(
+                "SELECT id FROM products WHERE code = ?",
+                (candidate,),
+            ).fetchone()
+            if row is None or (product_id is not None and int(row[0]) == int(product_id)):
+                return candidate
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+
+    def _save_catalog_base_price_rule(self, product_id: int, name: str, price: float) -> None:
+        """Mantiene una regla base para que un producto nuevo también cotice en pedidos."""
+        from datetime import datetime
+
+        catalog_key = f"product_card_{int(product_id)}"
+        now = datetime.now().isoformat(timespec="seconds")
+        price_list = self.connection.execute(
+            "SELECT id FROM price_lists WHERE code = 'general' AND active = 1"
+        ).fetchone()
+        price_list_id = int(price_list[0]) if price_list else None
+        existing = self.connection.execute(
+            "SELECT id FROM price_rules WHERE catalog_key = ?",
+            (catalog_key,),
+        ).fetchone()
+        if existing:
+            self.connection.execute(
+                """UPDATE price_rules
+                      SET product_id = ?, material = ?, price = ?, price_mode = 'unitario',
+                          min_quantity = 1, pack_quantity = 1, price_list_id = ?,
+                          rule_name = ?, active = 1, priority = 25
+                    WHERE id = ?""",
+                (
+                    int(product_id),
+                    name.strip(),
+                    float(price),
+                    price_list_id,
+                    f"Precio base de {name.strip()}",
+                    int(existing[0]),
+                ),
+            )
+        else:
+            self.connection.execute(
+                """INSERT INTO price_rules(
+                       product_id, material, size, min_quantity, price, active,
+                       price_mode, pack_quantity, catalog_key, price_list_id,
+                       priority, rule_name, source_updated_at
+                   ) VALUES(?, ?, '', 1, ?, 1, 'unitario', 1, ?, ?, 25, ?, ?)""",
+                (
+                    int(product_id),
+                    name.strip(),
+                    float(price),
+                    catalog_key,
+                    price_list_id,
+                    f"Precio base de {name.strip()}",
+                    now,
+                ),
+            )
+
+    def save_catalog_product(
+        self,
+        *,
+        name: str,
+        price: float,
+        description: str = "",
+        category: str = "",
+        image_path: str = "",
+    ) -> int:
+        """Crea una ficha de producto y su regla de precio base."""
+        from datetime import datetime
+
+        cleaned_name = str(name or "").strip()
+        if not cleaned_name:
+            raise ValueError("El nombre del producto es obligatorio.")
+        amount = float(price)
+        if amount < 0:
+            raise ValueError("El precio no puede ser negativo.")
+        now = datetime.now().isoformat(timespec="seconds")
+        code = self._available_catalog_product_code(cleaned_name)
+        cursor = self.connection.execute(
+            """INSERT INTO products(
+                   code, name, description, category, image_path, base_price,
+                   active, created_at, updated_at
+               ) VALUES(?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+            (
+                code,
+                cleaned_name,
+                str(description or "").strip(),
+                str(category or "").strip(),
+                str(image_path or "").strip(),
+                amount,
+                now,
+                now,
+            ),
+        )
+        product_id = int(cursor.lastrowid)
+        self._save_catalog_base_price_rule(product_id, cleaned_name, amount)
+        self.connection.commit()
+        return product_id
+
+    def update_catalog_product(
+        self,
+        product_id: int,
+        *,
+        name: str,
+        price: float,
+        description: str = "",
+        category: str = "",
+        image_path: str = "",
+    ) -> bool:
+        """Actualiza el contenido editable de una ficha y su precio base."""
+        from datetime import datetime
+
+        cleaned_name = str(name or "").strip()
+        if not cleaned_name:
+            raise ValueError("El nombre del producto es obligatorio.")
+        amount = float(price)
+        if amount < 0:
+            raise ValueError("El precio no puede ser negativo.")
+        product_id = int(product_id)
+        existing_product = self.connection.execute(
+            "SELECT name FROM products WHERE id = ?", (product_id,)
+        ).fetchone()
+        if not existing_product:
+            return False
+        previous_name = str(existing_product[0] or "").strip()
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connection:
+            cursor = self.connection.execute(
+                """UPDATE products
+                      SET name = ?, description = ?, category = ?, image_path = ?,
+                          base_price = ?, updated_at = ?
+                    WHERE id = ?""",
+                (
+                    cleaned_name,
+                    str(description or "").strip(),
+                    str(category or "").strip(),
+                    str(image_path or "").strip(),
+                    amount,
+                    now,
+                    product_id,
+                ),
+            )
+            self._save_catalog_base_price_rule(product_id, cleaned_name, amount)
+
+            # Las reglas se vinculan por ``product_id`` y por eso muestran el
+            # nombre nuevo automáticamente. Los trabajos de pedidos, en cambio,
+            # conservan el título para que puedan leerse sin hacer joins. Al
+            # renombrar un producto vinculado mantenemos ese título alineado,
+            # sin tocar los importes ni los snapshots comerciales del pedido.
+            self.connection.execute(
+                "UPDATE order_jobs SET title = ?, updated_at = ? WHERE product_id = ?",
+                (cleaned_name, now, product_id),
+            )
+            # Compatibilidad con pedidos creados antes de que se guardara el
+            # vínculo de catálogo: sólo se actualizan los que aún llevan el
+            # nombre anterior exacto.
+            if previous_name and previous_name != cleaned_name:
+                self.connection.execute(
+                    """UPDATE order_jobs
+                          SET title = ?, updated_at = ?
+                        WHERE product_id IS NULL AND title = ?""",
+                    (cleaned_name, now, previous_name),
+                )
+            self.connection.execute(
+                "UPDATE variable_cost_models SET product_name = ?, updated_at = ? WHERE product_id = ?",
+                (cleaned_name, now, product_id),
+            )
+        return bool(cursor.rowcount)
+
+    def set_catalog_product_active(self, product_id: int, active: bool) -> bool:
+        """Archiva o restaura una ficha sin borrar precios ni pedidos históricos."""
+        from datetime import datetime
+
+        cursor = self.connection.execute(
+            "UPDATE products SET active = ?, updated_at = ? WHERE id = ?",
+            (
+                int(bool(active)),
+                datetime.now().isoformat(timespec="seconds"),
+                int(product_id),
+            ),
+        )
+        self.connection.commit()
+        return bool(cursor.rowcount)
+
+    def delete_catalog_product(self, product_id: int) -> bool:
+        """Elimina permanentemente un producto y sus reglas de precio asociadas."""
+        with self.connection:
+            self.connection.execute("DELETE FROM price_rules WHERE product_id = ?", (int(product_id),))
+            cursor = self.connection.execute("DELETE FROM products WHERE id = ?", (int(product_id),))
+        return bool(cursor.rowcount)
+
+    def resolve_commercial_price(self, *, product_id: int | None = None, product_code: str = "",
+                                 material: str = "", size: str = "", quantity: int = 1,
+                                 price_list_id: int | None = None, price_list_code: str = "",
+                                 manual_price: float | None = None, manual_reason: str = "") -> dict:
+        """Resuelve una regla comercial sin mutar el pedido.
+
+        Los packs se informan como sugerencia: sólo se aplican al confirmar la regla.
+        """
+        quantity = max(1, int(quantity or 1))
+        if manual_price is not None:
+            if not str(manual_reason).strip():
+                return {"matched": False, "warning": "El precio manual requiere un motivo.", "requires_confirmation": True}
+            return {"matched": True, "manual_override": True, "unit_price": float(manual_price),
+                    "fixed_total": None, "subtotal": round(float(manual_price) * quantity, 2),
+                    "calculation_type": "manual", "requires_confirmation": True, "warning": None}
+        if product_code and product_id is None:
+            row = self.connection.execute("SELECT id FROM products WHERE code = ?", (product_code,)).fetchone()
+            product_id = int(row[0]) if row else None
+        if price_list_code and price_list_id is None:
+            row = self.connection.execute("SELECT id FROM price_lists WHERE code = ? AND active = 1", (price_list_code,)).fetchone()
+            price_list_id = int(row[0]) if row else None
+        if price_list_id is None and not price_list_code:
+            row = self.connection.execute("SELECT id FROM price_lists WHERE code = 'general' AND active = 1").fetchone()
+            price_list_id = int(row[0]) if row else None
+        normalized_size = self._price_size(size)
+        normalized_material = self._price_material(material)
+        where, params = ["active = 1"], []
+        if product_id is not None:
+            where.append("product_id = ?"); params.append(product_id)
+        if price_list_id is not None:
+            where.append("price_list_id = ?"); params.append(price_list_id)
+        if normalized_material:
+            where.append("(material = '' OR material = ? COLLATE NOCASE)"); params.append(normalized_material)
+        if normalized_size:
+            where.append("(size = '' OR size = ? COLLATE NOCASE)"); params.append(normalized_size)
+        rows = [dict(row) for row in self.connection.execute(
+            "SELECT * FROM price_rules WHERE " + " AND ".join(where) + " ORDER BY priority DESC, id DESC", params)]
+        rows = [r for r in rows if int(r.get("min_quantity") or 1) <= quantity and (r.get("max_quantity") is None or quantity <= int(r["max_quantity"]))]
+        packs = [r for r in rows if str(r.get("price_mode") or "").casefold() == "pack" and int(r.get("pack_quantity") or 1) == quantity]
+        non_packs = [r for r in rows if str(r.get("price_mode") or "").casefold() != "pack"]
+        if not non_packs and not packs:
+            return {"matched": False, "warning": "No existe una regla de precio para esta selección.", "requires_confirmation": True}
+        rule = max(non_packs or packs, key=lambda r: (int(r.get("priority") or 0), int(r.get("min_quantity") or 1), int(r["id"])))
+        mode = str(rule.get("price_mode") or "fijo").casefold()
+        fixed_total = float(rule["price"]) if mode == "fijo" else None
+        unit_price = float(rule["price"]) if mode == "unitario" else None
+        subtotal = fixed_total if fixed_total is not None else round((unit_price or 0) * quantity, 2)
+        result = {"matched": True, "rule_id": int(rule["id"]), "rule_name": rule.get("rule_name") or rule.get("material") or "Regla de precio",
+                  "price_list_id": rule.get("price_list_id"), "calculation_type": mode, "unit_price": unit_price,
+                  "fixed_total": fixed_total, "subtotal": subtotal, "discount_amount": 0, "requires_confirmation": False,
+                  "warning": None, "preparation_limit": rule.get("preparation_limit")}
+        if packs and mode != "pack":
+            pack = max(packs, key=lambda r: int(r["id"]))
+            result["pack_suggestion"] = {"rule_id": int(pack["id"]), "quantity": quantity, "total": float(pack["price"]), "savings": round(subtotal - float(pack["price"]), 2)}
+        return result
+
+    def save_order_job_price_snapshot(self, order_job_id: int, calculation: dict, *, manual_reason: str = "") -> None:
+        """Fija el cálculo confirmado; los cambios futuros de reglas no lo alteran."""
+        from datetime import datetime
+        if not calculation.get("matched"):
+            raise ValueError("No se puede guardar un cálculo sin regla.")
+        now = datetime.now().isoformat(timespec="seconds")
+        self.connection.execute("""UPDATE order_jobs SET price_rule_id=?, unit_price_snapshot=?, fixed_price_snapshot=?,
+            calculation_type=?, manual_override=?, manual_override_reason=?, calculated_at=? WHERE id=?""",
+            (calculation.get("rule_id"), calculation.get("unit_price"), calculation.get("fixed_total"), calculation.get("calculation_type", ""),
+             int(bool(calculation.get("manual_override"))), manual_reason, now, int(order_job_id)))
+        self.connection.commit()
+
     def suggest_price(self, material: str, size: str, quantity: int) -> dict | None:
         """Propone el importe más conveniente sin cambiar el pedido."""
         quantity = max(1, int(quantity or 1))
@@ -2753,6 +5005,11 @@ class ImageDatabase:
             (material, size),
         ).fetchall()
         rules = [dict(row) for row in rows]
+        rules = [
+            rule for rule in rules
+            if int(rule.get("min_quantity") or 1) <= quantity
+            and (rule.get("max_quantity") is None or quantity <= int(rule["max_quantity"]))
+        ]
         if not rules:
             return None
 
@@ -2825,6 +5082,36 @@ class ImageDatabase:
             "margin_pct": margin_pct,
         }
 
+    def quantity_discount_details(self, material: str, size: str, quantity: int) -> dict | None:
+        """Devuelve el beneficio de la escala aplicada frente al precio de lista.
+
+        Solo informa descuentos reales de reglas unitarias; los precios fijos y
+        packs conservan su forma de cotización sin presentar un ahorro supuesto.
+        """
+        quantity = max(1, int(quantity or 1))
+        applied = self.suggest_price(material, size, quantity)
+        list_price = self.suggest_price(material, size, 1)
+        if not applied or not list_price:
+            return None
+        if str(applied.get("price_mode") or "").casefold() != "unitario":
+            return None
+        if str(list_price.get("price_mode") or "").casefold() != "unitario":
+            return None
+        applied_unit = float(applied.get("price") or 0)
+        list_unit = float(list_price.get("price") or 0)
+        if list_unit <= 0 or applied_unit >= list_unit:
+            return None
+        savings = round((list_unit - applied_unit) * quantity, 2)
+        return {
+            "list_unit_price": list_unit,
+            "tier_unit_price": applied_unit,
+            "list_total": round(list_unit * quantity, 2),
+            "tier_total": round(applied_unit * quantity, 2),
+            "savings": savings,
+            "discount_percent": round((list_unit - applied_unit) * 100 / list_unit, 2),
+            "rule_id": applied.get("id"),
+        }
+
     # Preparación con Photoshop -----------------------------------------
     def app_setting(self, key: str, default: str = "") -> str:
         row = self.connection.execute("SELECT setting_value FROM app_settings WHERE setting_key = ?", (key,)).fetchone()
@@ -2839,6 +5126,61 @@ class ImageDatabase:
             (key, value, datetime.now().isoformat(timespec="seconds")),
         )
         self.connection.commit()
+
+    def productive_plancha_a4_settings(self) -> dict[str, float]:
+        """Devuelve la configuración persistente para el cálculo A4."""
+        prefix = "productive_plancha_a4."
+        rows = self.connection.execute(
+            "SELECT setting_key, setting_value FROM app_settings WHERE setting_key LIKE ?", (prefix + "%",)
+        )
+        values: dict[str, float] = {}
+        for row in rows:
+            try:
+                values[str(row["setting_key"])[len(prefix):]] = float(row["setting_value"])
+            except (TypeError, ValueError):
+                continue
+        return values
+
+    def resolve_plancha_a4_base_price(self) -> dict:
+        """Resuelve el precio A4 vigente desde una sola fuente comercial.
+
+        ``price_rules`` es canónica. ``app_settings`` sólo conserva el valor
+        legado para instalaciones donde aún no existe el catálogo comercial.
+        Los pedidos deben guardar el resultado como snapshot, nunca releerlo.
+        """
+        row = self.connection.execute(
+            """SELECT id, price, catalog_key, rule_name, last_synced_at, source_updated_at
+               FROM price_rules WHERE active = 1 AND catalog_key = ? LIMIT 1""",
+            ("commercial_plancha_a4_diseno_unico",),
+        ).fetchone()
+        if row:
+            return {"price": float(row["price"] or 0), "source": "price_rules",
+                    "rule_id": int(row["id"]), "rule_key": str(row["catalog_key"] or ""),
+                    "version": str(row["last_synced_at"] or row["source_updated_at"] or "")}
+        legacy = self.app_setting("productive_plancha_a4.base_price", "5000")
+        try:
+            price = max(0.0, float(legacy))
+        except (TypeError, ValueError):
+            price = 5000.0
+        return {"price": price, "source": "legacy_app_settings", "rule_id": None,
+                "rule_key": "productive_plancha_a4.base_price", "version": ""}
+
+    def save_productive_plancha_a4_setting(self, key: str, value: float) -> None:
+        """Actualiza una variable permitida sin introducir configuraciones ad hoc."""
+        allowed = set(self.productive_plancha_a4_settings())
+        if key not in allowed:
+            raise ValueError("Configuración productiva no reconocida")
+        self.save_app_setting(f"productive_plancha_a4.{key}", str(float(value)))
+
+    def calculate_productive_plancha_a4(self, context: dict) -> dict:
+        """Punto de entrada persistente del motor unificado para planchas A4."""
+        resolved = self.resolve_plancha_a4_base_price()
+        calculation_context = dict(context or {})
+        calculation_context.setdefault("base_price", resolved["price"])
+        calculation_context.setdefault("base_price_source", resolved["source"])
+        calculation_context.setdefault("base_price_rule_id", resolved["rule_id"])
+        calculation_context.setdefault("base_price_version", resolved["version"])
+        return asdict(CostCalculator.calculate_plancha_a4(calculation_context, self.productive_plancha_a4_settings()))
 
     def register_private_design(self, file_path: str, order_id: int | None = None, client: str = "") -> None:
         """Indexa la copia de trabajo como privada, sin tocar ni renombrar el original."""
@@ -2982,10 +5324,18 @@ class ImageDatabase:
                VALUES(:path, :name, :extension, :size, :modified, :caption)
                ON CONFLICT(path) DO UPDATE SET
                  name=excluded.name, extension=excluded.extension, size=excluded.size,
-                 modified=excluded.modified, caption=excluded.caption, visual_score=-1""",
+                 modified=excluded.modified, caption=excluded.caption,
+                 recognized_text=CASE
+                    WHEN images.size != excluded.size OR images.modified != excluded.modified
+                    THEN '' ELSE images.recognized_text END,
+                 visual_score=CASE
+                    WHEN images.size != excluded.size OR images.modified != excluded.modified
+                    THEN -1 ELSE images.visual_score END""",
             image,
         )
         self.update_plancha_metrics(image["path"], image["modified"])
+        self._refresh_sticker_search_entry(image["path"])
+        self._search_cache.clear()
 
     def update_plancha_metrics(self, image_path: str, modified: float) -> None:
         """Registra la hitbox visible sin alterar el archivo original."""
@@ -3028,6 +5378,8 @@ class ImageDatabase:
         la capa de UI (que lo envía a la papelera de stickers).
         """
         with self.connection:
+            if getattr(self, "_sticker_search_fts", False):
+                self.connection.execute("DELETE FROM sticker_search WHERE image_path = ?", (path,))
             self.connection.execute("DELETE FROM image_tags WHERE image_path = ?", (path,))
             self.connection.execute("DELETE FROM visual_similarities WHERE query_path = ? OR candidate_path = ?", (path, path))
             self.connection.execute("DELETE FROM ai_results WHERE image_path = ?", (path,))
@@ -3039,7 +5391,7 @@ class ImageDatabase:
     def commit(self) -> None:
         self.connection.commit()
 
-    def _query_parts(self, query: str, extension: str | None = None, tags: list[str] | None = None, categories: list[str] | None = None) -> tuple[str, list[str]]:
+    def _query_parts(self, query: str, extension: str | None = None, tags: list[str] | None = None, categories: list[str] | None = None, untagged_only: bool = False) -> tuple[str, list[str]]:
         terms = [f"%{term}%" for term in query.lower().split()]
         clauses = []
         params: list[str] = []
@@ -3053,6 +5405,7 @@ class ImageDatabase:
                     "OR LOWER(COALESCE(tags.name, '')) LIKE ? "
                     "OR LOWER(COALESCE(images.category, '')) LIKE ? "
                     "OR LOWER(COALESCE(images.design_client, '')) LIKE ? "
+                    "OR LOWER(COALESCE(images.recognized_text, '')) LIKE ? "
                     "OR EXISTS (SELECT 1 FROM order_designs AS od "
                     "JOIN orders AS o ON o.id = od.order_id "
                     "WHERE od.image_path = images.path "
@@ -3063,7 +5416,7 @@ class ImageDatabase:
                     "AND (LOWER(COALESCE(pu.client, '')) LIKE ? "
                     "OR LOWER(COALESCE(pu.order_number, '')) LIKE ?)))"
                 )
-                params.extend([term] * 8)
+                params.extend([term] * 9)
         if extension:
             clauses.append("images.extension = ?")
             params.append(extension)
@@ -3082,15 +5435,133 @@ class ImageDatabase:
             placeholders = ", ".join("?" for _ in categories)
             clauses.append(f"images.category IN ({placeholders})")
             params.extend(categories)
+        if untagged_only:
+            clauses.append("NOT EXISTS (SELECT 1 FROM image_tags WHERE image_tags.image_path = images.path)")
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         return where, params
 
-    def search(self, query: str = "", limit: int = 50, extension: str | None = None, tags: list[str] | None = None, categories: list[str] | None = None, random_order: bool = False) -> list[dict]:
-        where, params = self._query_parts(query, extension, tags, categories)
+    def _database_cache_version(self) -> int:
+        """Versión bajo-coste del contenido de SQLite para invalidar cachés sin tocar la UI."""
+        try:
+            return int(self.connection.execute("PRAGMA data_version").fetchone()[0])
+        except Exception:
+            return 0
+
+    def search(self, query: str = "", limit: int = 50, extension: str | None = None, tags: list[str] | None = None, categories: list[str] | None = None, random_order: bool = False, untagged_only: bool = False) -> list[dict]:
+        cache_key = (
+            "random" if random_order else "query",
+            limit,
+            extension,
+            tuple(sorted((tags or []))),
+            tuple(sorted((categories or []))),
+            untagged_only,
+            query.strip(),
+            self._database_cache_version(),
+        )
+        cached = self._search_cache.get(cache_key)
+        if cached is not None:
+            return [row.copy() for row in cached]
+
+        if query.strip() and getattr(self, "_sticker_search_fts", False) and not random_order:
+            results = self._search_indexed(query, limit, extension, tags, categories, untagged_only)
+            self._search_cache[cache_key] = results
+            return results
+
+        where, params = self._query_parts(query, extension, tags, categories, untagged_only)
         order = "RANDOM()" if random_order else "images.modified DESC"
         sql = "SELECT images.*, GROUP_CONCAT(tags.name, ' · ') AS tags FROM images LEFT JOIN image_tags ON image_tags.image_path = images.path LEFT JOIN tags ON tags.id = image_tags.tag_id" + where + " GROUP BY images.path ORDER BY " + order + " LIMIT ?"
         params.append(limit)
-        return [dict(row) for row in self.connection.execute(sql, params)]
+        results = [dict(row) for row in self.connection.execute(sql, params)]
+        self._search_cache[cache_key] = results
+        return results
+
+    def _search_indexed(self, query: str, limit: int, extension: str | None, tags: list[str] | None, categories: list[str] | None, untagged_only: bool = False) -> list[dict]:
+        """Búsqueda instantánea, con etiquetas por delante de texto secundario."""
+        where, params = self._query_parts("", extension, tags, categories, untagged_only)
+        sql = (
+            "SELECT images.*, GROUP_CONCAT(tags.name, ' · ') AS tags, "
+            "bm25(sticker_search, 1.5, 10.0, 4.0, 3.0, 2.0) AS relevance "
+            "FROM sticker_search JOIN images ON images.path = sticker_search.image_path "
+            "LEFT JOIN image_tags ON image_tags.image_path = images.path "
+            "LEFT JOIN tags ON tags.id = image_tags.tag_id "
+            "WHERE sticker_search MATCH ?" +
+            (" AND " + where.removeprefix(" WHERE ") if where else "") +
+            " GROUP BY images.path ORDER BY relevance ASC, images.modified DESC LIMIT ?"
+        )
+        try:
+            results = [dict(row) for row in self.connection.execute(sql, [self._fts_query(query), *params, limit])]
+            if results:
+                return results
+            # La corrección ortográfica solo se activa sin resultados exactos:
+            # conserva la velocidad y evita que una coincidencia débil opaque
+            # una etiqueta que el usuario escribió bien.
+            corrected = self._fuzzy_fts_query(query)
+            if not corrected:
+                return []
+            paths = [row[0] for row in self.connection.execute(
+                "SELECT image_path FROM sticker_search WHERE sticker_search MATCH ? LIMIT ?",
+                (corrected, limit),
+            )]
+            if not paths:
+                return []
+            # bm25 no es necesario en este fallback: todas las entradas ya
+            # son correcciones cercanas. Reutilizamos la recuperación normal
+            # para conservar tarjetas, etiquetas y orden de resultados.
+            if not extension and not tags and not categories and not untagged_only:
+                return self.images_by_paths(paths)
+            placeholders = ", ".join("?" for _ in paths)
+            filter_where, filter_params = self._query_parts("", extension, tags, categories, untagged_only)
+            filtered = (
+                "SELECT images.path FROM images WHERE images.path IN (" + placeholders + ")" +
+                (" AND " + filter_where.removeprefix(" WHERE ") if filter_where else "")
+            )
+            allowed = {row[0] for row in self.connection.execute(filtered, [*paths, *filter_params])}
+            return self.images_by_paths([path for path in paths if path in allowed])
+        except sqlite3.OperationalError:
+            where, params = self._query_parts(query, extension, tags, categories, untagged_only)
+            sql = "SELECT images.*, GROUP_CONCAT(tags.name, ' · ') AS tags FROM images LEFT JOIN image_tags ON image_tags.image_path = images.path LEFT JOIN tags ON tags.id = image_tags.tag_id" + where + " GROUP BY images.path ORDER BY images.modified DESC LIMIT ?"
+            return [dict(row) for row in self.connection.execute(sql, [*params, limit])]
+
+    def _fuzzy_fts_query(self, query: str) -> str:
+        """Propone palabras conocidas para una consulta sin coincidencias.
+
+        La base se consulta únicamente en este fallback; no se carga un
+        diccionario en memoria ni se agrega latencia a una búsqueda correcta.
+        """
+        asked = [self._normalise_search_token(token) for token in re.findall(r"[\wÀ-ÿ]+", query)]
+        asked = [token for token in asked if len(token) >= 4]
+        if not asked:
+            return ""
+        rows = self.connection.execute(
+            """SELECT name FROM tags
+               UNION SELECT caption FROM images WHERE caption <> ''
+               UNION SELECT category FROM images WHERE category <> ''
+               UNION SELECT design_client FROM images WHERE design_client <> ''
+               UNION SELECT recognized_text FROM images WHERE recognized_text <> ''"""
+        )
+        vocabulary = {
+            self._normalise_search_token(token)
+            for (value,) in rows
+            for token in re.findall(r"[\wÀ-ÿ]+", str(value))
+            if len(token) >= 3
+        }
+        parts = []
+        for token in asked:
+            matches = difflib.get_close_matches(token, vocabulary, n=3, cutoff=0.78)
+            if not matches:
+                return ""
+            alternatives = " OR ".join(f"{match}*" for match in matches)
+            # Los paréntesis solo son necesarios cuando existen alternativas;
+            # así se mantiene compatibilidad con todas las compilaciones FTS5.
+            parts.append(f"({alternatives})" if len(matches) > 1 else alternatives)
+        return " AND ".join(parts)
+
+    @staticmethod
+    def _normalise_search_token(value: str) -> str:
+        return "".join(
+            char for char in unicodedata.normalize("NFKD", value.casefold())
+            if not unicodedata.combining(char)
+        )
 
     def plancha_browser_images(
         self,
@@ -3099,6 +5570,7 @@ class ImageDatabase:
         category: str = "",
         collection: str = "",
         limit: int = 300,
+        order_id: int | None = None,
     ) -> list[dict]:
         """Diseños para el selector de plancha sin mirar nombres de archivo.
 
@@ -3109,6 +5581,17 @@ class ImageDatabase:
         term = query.strip().casefold()
         clauses: list[str] = []
         params: list[object] = []
+        # El banco aporta diseños reutilizables. Desde un pedido se suman sólo
+        # los diseños privados de ese pedido, nunca los de otro cliente.
+        if order_id is None:
+            clauses.append("images.is_reusable = 1")
+        else:
+            clauses.append(
+                "(images.is_reusable = 1 OR EXISTS ("
+                "SELECT 1 FROM order_designs AS own_design "
+                "WHERE own_design.order_id = ? AND own_design.image_path = images.path))"
+            )
+            params.append(int(order_id))
         if category and category != "Todas las categorías":
             clauses.append("images.category = ? COLLATE NOCASE")
             params.append(category)
@@ -3162,10 +5645,37 @@ class ImageDatabase:
         params.append(max(1, min(int(limit), 500)))
         return [dict(row) for row in self.connection.execute(sql, params)]
 
-    def count(self, query: str = "", extension: str | None = None, tags: list[str] | None = None, categories: list[str] | None = None) -> int:
-        where, params = self._query_parts(query, extension, tags, categories)
+    def count(self, query: str = "", extension: str | None = None, tags: list[str] | None = None, categories: list[str] | None = None, untagged_only: bool = False) -> int:
+        cache_key = (
+            "count",
+            query.strip(),
+            extension,
+            tuple(sorted((tags or []))),
+            tuple(sorted((categories or []))),
+            untagged_only,
+            self._database_cache_version(),
+        )
+        cached = self._count_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        if query.strip() and getattr(self, "_sticker_search_fts", False):
+            where, params = self._query_parts("", extension, tags, categories, untagged_only)
+            sql = "SELECT COUNT(DISTINCT images.path) FROM sticker_search JOIN images ON images.path = sticker_search.image_path WHERE sticker_search MATCH ?"
+            if where:
+                sql += " AND " + where.removeprefix(" WHERE ")
+            try:
+                value = int(self.connection.execute(sql, [self._fts_query(query), *params]).fetchone()[0])
+                if value > 0:
+                    self._count_cache[cache_key] = value
+                    return value
+            except sqlite3.OperationalError:
+                pass
+        where, params = self._query_parts(query, extension, tags, categories, untagged_only)
         sql = "SELECT COUNT(DISTINCT images.path) FROM images LEFT JOIN image_tags ON image_tags.image_path = images.path LEFT JOIN tags ON tags.id = image_tags.tag_id"
-        return self.connection.execute(sql + where, params).fetchone()[0]
+        value = int(self.connection.execute(sql + where, params).fetchone()[0])
+        self._count_cache[cache_key] = value
+        return value
 
     def extension_counts(self) -> list[tuple[str, int]]:
         return [tuple(row) for row in self.connection.execute(
@@ -3179,11 +5689,13 @@ class ImageDatabase:
         self.connection.execute("INSERT OR IGNORE INTO tags(name) VALUES(?)", (name,))
         tag_id = self.connection.execute("SELECT id FROM tags WHERE name = ? COLLATE NOCASE", (name,)).fetchone()[0]
         self.connection.execute("INSERT OR IGNORE INTO image_tags(image_path, tag_id) VALUES(?, ?)", (image_path, tag_id))
+        self._refresh_sticker_search_entry(image_path)
         if commit:
             self.connection.commit()
 
     def set_caption(self, image_path: str, caption: str) -> None:
         self.connection.execute("UPDATE images SET caption = ? WHERE path = ?", (caption.strip(), image_path))
+        self._refresh_sticker_search_entry(image_path)
         self.connection.commit()
 
     def set_classification(self, image_path: str, caption: str, category: str) -> None:
@@ -3191,6 +5703,7 @@ class ImageDatabase:
             "UPDATE images SET caption = ?, category = ? WHERE path = ?",
             (caption.strip(), category.strip().title(), image_path),
         )
+        self._refresh_sticker_search_entry(image_path)
         self.connection.commit()
 
     def set_image_category(self, image_path: str, category: str) -> None:
@@ -3199,7 +5712,23 @@ class ImageDatabase:
             "UPDATE images SET category = ? WHERE path = ?",
             (category.strip().title(), image_path),
         )
+        self._refresh_sticker_search_entry(image_path)
         self.connection.commit()
+
+    @staticmethod
+    def _update_native_publication_metadata(artifacts):
+        """Mantiene reabribles los resultados nativos después de publicar."""
+        if not artifacts.get("native_master") or not artifacts.get("metadata"):
+            return
+        path = Path(artifacts["metadata"])
+        if not path.is_file():
+            return
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["artifacts"] = artifacts
+        data["status"] = "Confirmado"
+        temporary = path.with_suffix(".publication.tmp")
+        temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(path)
 
     def save_sticker_processing(self, result, category: str = "", tags: list[str] | None = None) -> None:
         """Persiste el proceso y sus archivos sin tocar el original."""
@@ -3255,8 +5784,66 @@ class ImageDatabase:
         )
         self.connection.commit()
 
+    def discard_processed_sticker(self, job_id: str) -> bool:
+        """Descarta un resultado y elimina el origen si provino del monitor automático."""
+        import tempfile
+        from datetime import datetime
+
+        row = self.connection.execute(
+            "SELECT source_path, analysis FROM sticker_processing_jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        if not row:
+            return False
+        try:
+            analysis = json.loads(row["analysis"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            analysis = {}
+        automatic = bool(analysis.get("auto_process"))
+        artifact_paths = [
+            Path(item[0]) for item in self.connection.execute(
+                "SELECT path FROM sticker_artifacts WHERE job_id = ?", (job_id,)
+            )
+        ]
+
+        source = Path(row["source_path"])
+
+        # Los artefactos del monitor siempre viven bajo este directorio temporal.
+        if automatic:
+            auto_root = (Path(tempfile.gettempdir()) / "visionvault_auto").resolve()
+            for artifact in artifact_paths:
+                try:
+                    relative = artifact.resolve().relative_to(auto_root)
+                except (OSError, ValueError):
+                    continue
+                shutil.rmtree(auto_root / relative.parts[0], ignore_errors=True)
+
+            try:
+                if source.is_file():
+                    source.unlink()
+            except OSError:
+                pass
+            self.remove_image(str(source))
+
+        # El resultado rechazado nunca debe quedar disponible como archivo
+        # procesado. El original manual se conserva; solo se eliminan los
+        # artefactos generados por el pipeline.
+        for artifact in artifact_paths:
+            try:
+                if artifact != source and artifact.is_file():
+                    artifact.unlink()
+            except OSError:
+                pass
+
+        with self.connection:
+            self.connection.execute(
+                "UPDATE sticker_processing_jobs SET status = ?, artifacts = ?, updated_at = ? WHERE id = ?",
+                ("Descartado", "{}", datetime.now().isoformat(timespec="seconds"), job_id),
+            )
+            self.connection.execute("DELETE FROM sticker_artifacts WHERE job_id = ?", (job_id,))
+        return True
+
     def approve_processed_sticker(self, result, category: str = "", tags: list[str] | None = None) -> dict:
-        """Agrega el PNG de impresión aprobado al banco con categoría y etiquetas."""
+        """Publica el PNG aprobado en el banco y elimina sus archivos temporales."""
         from pathlib import Path
 
         if isinstance(result, dict):
@@ -3266,11 +5853,46 @@ class ImageDatabase:
             payload = asdict(result)
         artifacts = payload.get("artifacts") or {}
         master = Path(artifacts.get("master") or artifacts["print"])
-        stat = master.stat()
+        if not master.is_file():
+            raise FileNotFoundError(f"No se encontró el PNG aprobado: {master}")
+
+        # El proceso genera una carpeta temporal por sticker. El resultado
+        # confirmado se publica en una carpeta común: la raíz de la biblioteca
+        # elegida por el usuario o, si aún no existe, el banco del creador.
+        library_root = self.get_library_root().strip()
+        bank_dir = Path(library_root) if library_root else master.parent.parent / "banco"
+        bank_dir.mkdir(parents=True, exist_ok=True)
+        def build_candidate(sequence: int) -> Path:
+            # La publicación ocurre sólo al confirmar y conserva una serie
+            # numérica continua en el banco.
+            return bank_dir / f"{sequence:05d}.png"
+
+        existing_numbers = []
+        for candidate in bank_dir.glob("*.png"):
+            match = re.match(r"^(\d+)\.png$", candidate.name, flags=re.IGNORECASE)
+            if match:
+                existing_numbers.append(int(match.group(1)))
+
+        sequence = max(existing_numbers, default=0) + 1
+        approved_path = build_candidate(sequence)
+        while approved_path.exists():
+            sequence += 1
+            approved_path = build_candidate(sequence)
+        shutil.move(str(master), str(approved_path))
+        approved_path = approved_path.resolve()
+
+        # Sólo se borra una carpeta que coincida exactamente con el identificador
+        # temporal generado por el pipeline; así no se puede borrar una biblioteca.
+        temporary_dir = master.parent
+        job_id = str(payload.get("job_id") or "")
+        if master.name == "sticker_master.png" and job_id and temporary_dir.name == job_id and not artifacts.get("native_master"):
+            shutil.rmtree(temporary_dir, ignore_errors=True)
+
+        stat = approved_path.stat()
         image = {
-            "path": str(master.resolve()),
-            "name": master.name,
-            "extension": master.suffix.lower(),
+            "path": str(approved_path),
+            "name": approved_path.name,
+            "extension": approved_path.suffix.lower(),
             "size": stat.st_size,
             "modified": stat.st_mtime,
             "caption": "",
@@ -3279,12 +5901,78 @@ class ImageDatabase:
         self.set_image_category(image["path"], category)
         for tag in tags or []:
             self.add_tag(image["path"], tag, commit=False)
+        # Los resultados nativos conservan sus máscaras, geometría y trazabilidad.
+        # Los trabajos legacy mantienen la publicación histórica de un solo PNG.
+        published_artifacts = ({**artifacts, "master": str(approved_path)}
+                               if artifacts.get("native_master") else {"master": str(approved_path)})
+        self._update_native_publication_metadata(published_artifacts)
+        self.connection.execute(
+            "UPDATE sticker_processing_jobs SET artifacts = ? WHERE id = ?",
+            (json.dumps(published_artifacts, ensure_ascii=False), payload["job_id"]),
+        )
+        self.connection.execute("DELETE FROM sticker_artifacts WHERE job_id = ?", (payload["job_id"],))
+        self.connection.executemany(
+            "INSERT INTO sticker_artifacts(job_id, kind, path) VALUES(?, ?, ?)",
+            [(payload["job_id"], kind, path) for kind, path in published_artifacts.items()],
+        )
         self.connection.execute(
             "UPDATE images SET is_private = 0, is_reusable = 1, import_status = 'Biblioteca' WHERE path = ?",
             (image["path"],),
         )
         self.connection.commit()
-        self.set_sticker_processing_status(payload["job_id"], "Aprobado")
+        self.set_sticker_processing_status(payload["job_id"], "Confirmado")
+        return image
+
+    def approve_processed_sticker_for_order(
+        self, result, order_id: int, category: str = "", tags: list[str] | None = None,
+    ) -> dict:
+        """Publica un sticker sólo para un pedido, fuera de la biblioteca reutilizable."""
+        from pathlib import Path
+
+        payload = result if isinstance(result, dict) else asdict(result)
+        artifacts = payload.get("artifacts") or {}
+        master = Path(artifacts.get("master") or artifacts["print"])
+        if not master.is_file():
+            raise FileNotFoundError(f"No se encontró el PNG aprobado: {master}")
+        order_id = int(order_id)
+        if not self.order(order_id):
+            raise ValueError(f"No existe el pedido #{order_id}.")
+
+        # La plancha conserva una fuente privada, sin publicar el diseño en el banco.
+        destination_dir = master.parent.parent.parent / "orders" / str(order_id) / "stickers"
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        job_id = str(payload.get("job_id") or "sticker")
+        destination = destination_dir / f"{job_id}.png"
+        suffix = 2
+        while destination.exists():
+            destination = destination_dir / f"{job_id}-{suffix}.png"
+            suffix += 1
+        shutil.move(str(master), str(destination))
+        destination = destination.resolve()
+
+        temporary_dir = master.parent
+        if master.name == "sticker_master.png" and job_id and temporary_dir.name == job_id and not artifacts.get("native_master"):
+            shutil.rmtree(temporary_dir, ignore_errors=True)
+        stat = destination.stat()
+        image = {"path": str(destination), "name": destination.name,
+                 "extension": destination.suffix.lower(), "size": stat.st_size,
+                 "modified": stat.st_mtime, "caption": f"Diseño privado del pedido #{order_id}"}
+        self.upsert(image)
+        self.set_image_category(image["path"], category)
+        for tag in tags or []:
+            self.add_tag(image["path"], tag, commit=False)
+        published_artifacts = ({**artifacts, "master": str(destination)}
+                               if artifacts.get("native_master") else {"master": str(destination)})
+        self._update_native_publication_metadata(published_artifacts)
+        self.connection.execute("UPDATE sticker_processing_jobs SET artifacts = ? WHERE id = ?",
+                                (json.dumps(published_artifacts, ensure_ascii=False), payload["job_id"]))
+        self.connection.execute("DELETE FROM sticker_artifacts WHERE job_id = ?", (payload["job_id"],))
+        self.connection.executemany("INSERT INTO sticker_artifacts(job_id, kind, path) VALUES(?, ?, ?)",
+                                   [(payload["job_id"], kind, path) for kind, path in published_artifacts.items()])
+        self.connection.execute("UPDATE images SET is_private = 1, is_reusable = 0, import_status = 'Pedido' WHERE path = ?",
+                                (image["path"],))
+        self.connection.commit()
+        self.set_sticker_processing_status(payload["job_id"], "Confirmado")
         return image
 
     def sticker_processing_jobs(self, limit: int = 200) -> list[dict]:
@@ -3296,7 +5984,16 @@ class ImageDatabase:
         return [dict(row) for row in self.connection.execute("SELECT path, name FROM images")]
 
     def visual_search_images(self) -> list[dict]:
-        """Datos mínimos para comparar localmente sin cargar toda la biblioteca."""
+        """Datos mínimos para comparar localmente sin cargar toda la biblioteca.
+
+        Se cachea por versión de base de datos para evitar repetir el mismo JOIN
+        masivo en cada cambio de sección o cada recarga de UI.
+        """
+        cache_version = self._database_cache_version()
+        cached = self._visual_search_cache
+        if cached is not None and cached[0] == cache_version:
+            return [row.copy() for row in cached[1]]
+
         rows = self.connection.execute(
             """SELECT images.path, images.name, images.modified, images.visual_signature,
                       images.visual_signature_modified, GROUP_CONCAT(tags.name, ' · ') AS tags
@@ -3305,7 +6002,157 @@ class ImageDatabase:
                LEFT JOIN tags ON tags.id = image_tags.tag_id
                GROUP BY images.path"""
         )
+        results = [dict(row) for row in rows]
+        self._visual_search_cache = (cache_version, results)
+        return [row.copy() for row in results]
+
+    def indexed_visual_search_images(self) -> list[dict]:
+        """Devuelve firmas vigentes sin indexar durante una acción de UI.
+        
+        OPTIMIZACIÓN: Eliminado JOIN con tags para acelerar la consulta.
+        Los tags no son necesarios para la búsqueda de duplicados rápida.
+        """
+        rows = self.connection.execute(
+            """SELECT images.path, images.name, images.modified, images.visual_signature,
+                      images.visual_signature_modified
+               FROM images
+               WHERE images.visual_signature IS NOT NULL AND images.visual_signature != ''
+                 AND images.visual_signature_modified = images.modified
+               ORDER BY images.modified DESC"""
+        )
         return [dict(row) for row in rows]
+
+    def images_missing_visual_signature(self) -> list[dict]:
+        """Imágenes nuevas o modificadas que todavía no están en el índice visual."""
+        rows = self.connection.execute(
+            """SELECT images.path, images.modified, images.caption,
+                      images.visual_signature, images.visual_signature_modified,
+                      GROUP_CONCAT(tags.name, ' · ') AS tags,
+                      (SELECT result FROM ai_results
+                        WHERE ai_results.image_path = images.path
+                          AND ai_results.modified = images.modified LIMIT 1) AS ai_result
+                 FROM images
+                 LEFT JOIN image_tags ON image_tags.image_path = images.path
+                 LEFT JOIN tags ON tags.id = image_tags.tag_id
+                WHERE images.visual_signature IS NULL OR images.visual_signature = ''
+                   OR images.visual_signature_modified != images.modified
+                GROUP BY images.path"""
+        )
+        return [self._visual_index_row(dict(row)) for row in rows]
+
+    @staticmethod
+    def _visual_index_row(row: dict) -> dict:
+        values = [str(row.get("caption") or ""), str(row.get("tags") or "")]
+        try:
+            result = json.loads(row.get("ai_result") or "{}")
+            values.extend((str(result.get("text") or ""), str(result.get("caption") or "")))
+        except (TypeError, ValueError, json.JSONDecodeError, AttributeError):
+            pass
+        row["index_text"] = " ".join(value for value in values if value).strip()
+        row["existing_embedding"] = None
+        try:
+            signature_is_current = (
+                float(row.get("visual_signature_modified", -1))
+                == float(row.get("modified", -2))
+            )
+            decoded_signature = json.loads(row.get("visual_signature") or "{}")
+            embedding = decoded_signature.get("embedding") if signature_is_current else None
+            if isinstance(embedding, list) and embedding:
+                row["existing_embedding"] = embedding
+        except (TypeError, ValueError, json.JSONDecodeError, AttributeError):
+            pass
+        return row
+
+    def images_needing_index_migration(self, target_version: int) -> list[dict]:
+        """Imágenes que necesitan migración por cambio de versión del índice visual."""
+        try:
+            rows = self.connection.execute(
+                """SELECT images.path, images.modified, images.caption,
+                          images.visual_signature, images.visual_signature_modified,
+                          GROUP_CONCAT(tags.name, ' · ') AS tags,
+                          (SELECT result FROM ai_results
+                            WHERE ai_results.image_path = images.path
+                              AND ai_results.modified = images.modified LIMIT 1) AS ai_result
+                     FROM images
+                     LEFT JOIN image_tags ON image_tags.image_path = images.path
+                     LEFT JOIN tags ON tags.id = image_tags.tag_id
+                    WHERE images.visual_signature IS NULL OR images.visual_signature = ''
+                       OR images.visual_signature_modified != images.modified
+                       OR json_extract(images.visual_signature, '$.index_version') IS NULL
+                       OR json_extract(images.visual_signature, '$.index_version') != ?
+                    GROUP BY images.path""",
+                (target_version,)
+            )
+            return [self._visual_index_row(dict(row)) for row in rows]
+        except Exception:
+            # Si falla el json_extract, retornar todas las imágenes con signature
+            rows = self.connection.execute(
+                """SELECT path, modified, visual_signature, visual_signature_modified FROM images"""
+            )
+            return [self._visual_index_row(dict(row)) for row in rows]
+
+    def set_visual_index_version(self, version: int) -> None:
+        """Actualiza la versión del índice visual en la base de datos."""
+        # Crear tabla de metadatos si no existe
+        self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS visual_index_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )"""
+        )
+        self.connection.execute(
+            "INSERT OR REPLACE INTO visual_index_metadata (key, value) VALUES ('index_version', ?)",
+            (str(version),)
+        )
+        self.connection.commit()
+
+    def get_visual_index_version(self) -> int:
+        """Obtiene la versión actual del índice visual."""
+        try:
+            row = self.connection.execute(
+                "SELECT value FROM visual_index_metadata WHERE key = 'index_version'"
+            ).fetchone()
+            if row:
+                return int(row[0])
+        except Exception:
+            pass
+        return 1  # Default version
+
+    def needs_visual_index_rebuild(self, target_version: int) -> bool:
+        """Verifica si el índice visual necesita reconstrucción por cambio de versión."""
+        current_version = self.get_visual_index_version()
+        return current_version != target_version
+
+    def mark_visual_index_rebuild_in_progress(self) -> None:
+        """Marca que una reconstrucción del índice está en progreso."""
+        self.connection.execute(
+            "INSERT OR REPLACE INTO visual_index_metadata (key, value) VALUES ('rebuild_in_progress', '1')"
+        )
+        self.connection.commit()
+
+    def clear_visual_index_rebuild_flag(self) -> None:
+        """Limpia la marca de reconstrucción en progreso."""
+        self.connection.execute(
+            "DELETE FROM visual_index_metadata WHERE key = 'rebuild_in_progress'"
+        )
+        self.connection.commit()
+
+    def is_visual_index_rebuild_in_progress(self) -> bool:
+        """Verifica si hay una reconstrucción en progreso interrumpida."""
+        try:
+            row = self.connection.execute(
+                "SELECT value FROM visual_index_metadata WHERE key = 'rebuild_in_progress'"
+            ).fetchone()
+            return row is not None and row[0] == '1'
+        except Exception:
+            return False
+
+    def invalidate_all_visual_signatures(self) -> None:
+        """Invalida todas las firmas visuales para forzar reconstrucción completa."""
+        self.connection.execute(
+            "UPDATE images SET visual_signature = NULL, visual_signature_modified = NULL"
+        )
+        self.connection.commit()
 
     def update_visual_signatures(self, signatures: list[tuple[str, float, str]]) -> None:
         """Persiste huellas visuales para no recalcular 5000 archivos en cada búsqueda."""
@@ -3316,6 +6163,7 @@ class ImageDatabase:
             signatures,
         )
         self.connection.commit()
+        self._visual_search_cache = None
 
     def tags_for_image(self, image_path: str) -> str:
         row = self.connection.execute(
@@ -3336,6 +6184,35 @@ class ImageDatabase:
             (query_path, query_modified, limit),
         )
         return [(row[0], float(row[1])) for row in rows]
+
+    def cached_visual_run(self, cache_key: str, query_path: str, query_modified: float, candidate_fingerprint: str) -> list[tuple[str, float]] | None:
+        """Resultados completos reutilizables para cualquier combinación de opciones."""
+        row = self.connection.execute(
+            """SELECT matches_json FROM visual_search_runs
+               WHERE cache_key = ? AND query_path = ? AND query_modified = ?
+                 AND candidate_fingerprint = ?""",
+            (cache_key, query_path, query_modified, candidate_fingerprint),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            return [(str(path), float(score)) for path, score in json.loads(row[0])]
+        except (TypeError, ValueError):
+            return None
+
+    def save_visual_run(self, cache_key: str, query_path: str, query_modified: float, candidate_fingerprint: str, options: dict, matches: list[tuple[str, float]]) -> None:
+        from datetime import datetime
+
+        self.connection.execute(
+            """INSERT OR REPLACE INTO visual_search_runs(
+                cache_key, query_path, query_modified, candidate_fingerprint,
+                options_json, matches_json, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?)""",
+            (cache_key, query_path, query_modified, candidate_fingerprint,
+             json.dumps(options, sort_keys=True), json.dumps(matches),
+             datetime.now().isoformat(timespec="seconds")),
+        )
+        self.connection.commit()
 
     def save_visual_matches(self, query_path: str, query_modified: float, matches: list[tuple[str, float]], candidate_modified: dict[str, float]) -> None:
         from datetime import datetime
@@ -3358,16 +6235,24 @@ class ImageDatabase:
     def images_by_paths(self, paths: list[str]) -> list[dict]:
         if not paths:
             return []
-        placeholders = ", ".join("?" for _ in paths)
+        normalized = list(dict.fromkeys(paths))
+        cache_key = (self._database_cache_version(), tuple(normalized))
+        cached = self._images_by_paths_cache.get(cache_key)
+        if cached is not None:
+            return [row.copy() for row in cached]
+
+        placeholders = ", ".join("?" for _ in normalized)
         rows = self.connection.execute(
             "SELECT images.*, GROUP_CONCAT(tags.name, ' · ') AS tags "
             "FROM images LEFT JOIN image_tags ON image_tags.image_path = images.path "
             "LEFT JOIN tags ON tags.id = image_tags.tag_id "
             f"WHERE images.path IN ({placeholders}) GROUP BY images.path",
-            paths,
+            normalized,
         )
         by_path = {row["path"]: dict(row) for row in rows}
-        return [by_path[path] for path in paths if path in by_path]
+        result = [by_path[path] for path in normalized if path in by_path]
+        self._images_by_paths_cache[cache_key] = result
+        return [row.copy() for row in result]
 
     def images_missing_visual_score(self) -> list[dict]:
         return [dict(row) for row in self.connection.execute("SELECT path FROM images WHERE visual_score < 0")]
@@ -3402,6 +6287,53 @@ class ImageDatabase:
         )
         return [dict(row) for row in rows]
 
+    def visual_products(self) -> list[dict]:
+        """Agrupa reglas por producto para los selectores visuales."""
+        grouped: dict[str, dict] = {}
+        for rule in self.price_rules():
+            material = str(rule.get("material") or "").strip()
+            if not material:
+                continue
+            item = grouped.setdefault(material, {**rule, "sizes": []})
+            size = str(rule.get("size") or "").strip()
+            if size and size not in item["sizes"]:
+                item["sizes"].append(size)
+            if not item.get("image_path") and rule.get("image_path"):
+                item["image_path"] = rule["image_path"]
+            if float(rule.get("price") or 0) < float(item.get("price") or 0):
+                item["price"] = rule["price"]
+        def size_key(value: str) -> tuple[int, float, str]:
+            match = re.search(r"\d+(?:[.,]\d+)?", str(value))
+            if match:
+                return (0, float(match.group(0).replace(",", ".")), str(value).casefold())
+            return (1, 0.0, str(value).casefold())
+        for item in grouped.values():
+            item["sizes"].sort(key=size_key)
+        return sorted(grouped.values(), key=lambda item: str(item["material"]).casefold())
+
+    def ai_review_images(self, provider: str, model: str, limit: int = 100) -> list[dict]:
+        """Analisis vigentes de disenos aun sin etiquetas, listos para revisar."""
+        import json
+
+        rows = self.connection.execute(
+            """SELECT images.*, ai_results.result
+               FROM images JOIN ai_results ON ai_results.image_path = images.path
+               WHERE ai_results.provider = ? AND ai_results.model = ?
+                 AND ai_results.modified = images.modified
+                 AND NOT EXISTS (SELECT 1 FROM image_tags WHERE image_tags.image_path = images.path)
+               ORDER BY images.modified DESC LIMIT ?""",
+            (provider, model, limit),
+        )
+        items = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["ai_result"] = json.loads(item.pop("result") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            items.append(item)
+        return items
+
     def save_ai_result(self, image_path: str, provider: str, model: str, modified: float, result: dict) -> None:
         import json
 
@@ -3410,6 +6342,16 @@ class ImageDatabase:
                ON CONFLICT(image_path, provider, model) DO UPDATE SET modified=excluded.modified, result=excluded.result""",
             (image_path, provider, model, modified, json.dumps(result, ensure_ascii=False)),
         )
+        # El OCR es información de búsqueda, no una etiqueta aprobada. Así el
+        # usuario puede encontrar una palabra del diseño inmediatamente sin
+        # llenar la biblioteca con etiquetas automáticas o poco confiables.
+        recognized_text = " ".join(str(result.get("text") or "").split())
+        self.connection.execute(
+            "UPDATE images SET recognized_text = ? WHERE path = ? AND modified = ?",
+            (recognized_text, image_path, modified),
+        )
+        self._refresh_sticker_search_entry(image_path)
+        self._search_cache.clear()
         self.connection.commit()
 
     def dismissed_ai_tags(self, image_path: str) -> set[str]:
@@ -3554,6 +6496,20 @@ class ImageDatabase:
         self.connection.commit()
         return int(cursor.rowcount)
 
+    def rename_category(self, category: str, new_name: str) -> int:
+        """Renombra o fusiona una categoria conservando todos sus disenos."""
+        source = category.strip()
+        target = new_name.strip().title()
+        if not target:
+            raise ValueError("La categoria no puede estar vacia.")
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE images SET category = ? WHERE category = ? COLLATE NOCASE",
+                (target, source),
+            )
+        self.connection.commit()
+        return int(cursor.rowcount)
+
     def clear_image_category(self, image_path: str) -> None:
         self.connection.execute("UPDATE images SET category = '' WHERE path = ?", (image_path,))
         self.connection.commit()
@@ -3564,26 +6520,73 @@ class ImageDatabase:
         self.connection.execute("DELETE FROM tags")
         self.connection.commit()
 
-    def suggestions(self, query: str, limit: int = 6) -> list[str]:
+    def suggestions(self, query: str, limit: int = 6, typed: bool = False) -> list[str]:
         """Predicciones rápidas: prioriza etiquetas, incluso si son frases largas."""
         term = query.strip().lower()
         if len(term) < 2:
             return []
         like = f"%{term}%"
         rows = self.connection.execute(
-            """SELECT name FROM (
+            """SELECT name, MIN(priority) AS priority FROM (
                    SELECT tags.name AS name, 0 AS priority, COUNT(image_tags.image_path) AS usage
                    FROM tags JOIN image_tags ON image_tags.tag_id = tags.id
                    WHERE LOWER(tags.name) LIKE ?
                    GROUP BY tags.id
+                   UNION ALL
+                   SELECT images.category AS name, 1 AS priority, COUNT(*) AS usage
+                   FROM images
+                   WHERE images.category <> '' AND LOWER(images.category) LIKE ?
+                   GROUP BY images.category COLLATE NOCASE
+                   UNION ALL
+                   SELECT images.caption AS name, 2 AS priority, COUNT(*) AS usage
+                   FROM images
+                   WHERE images.caption <> '' AND LOWER(images.caption) LIKE ?
+                   GROUP BY images.caption COLLATE NOCASE
+                   UNION ALL
+                   SELECT images.design_client AS name, 3 AS priority, COUNT(*) AS usage
+                   FROM images
+                   WHERE images.design_client <> '' AND LOWER(images.design_client) LIKE ?
+                   GROUP BY images.design_client COLLATE NOCASE
+                   UNION ALL
+                   SELECT orders.client AS name, 4 AS priority, COUNT(*) AS usage
+                   FROM orders
+                   WHERE orders.client <> '' AND LOWER(orders.client) LIKE ?
+                   GROUP BY orders.client COLLATE NOCASE
                )
                GROUP BY name COLLATE NOCASE
                ORDER BY MIN(priority), CASE WHEN LOWER(name) LIKE ? THEN 0 ELSE 1 END,
                         MAX(usage) DESC, name COLLATE NOCASE
                LIMIT ?""",
-            (like, f"{term}%", limit),
+            (like, like, like, like, like, f"{term}%", limit),
         )
-        return [row[0] for row in rows]
+        rows = list(rows)
+        # SQLite LIKE no ignora tildes. El recorrido completo solo se usa
+        # cuando la consulta rápida no devolvió resultados.
+        if not rows:
+            normalized_term = self._normalise_search_token(term)
+            candidates = self.connection.execute(
+                """SELECT name, priority FROM (
+                       SELECT name, 0 AS priority FROM tags
+                       UNION ALL SELECT category, 1 FROM images WHERE category <> ''
+                       UNION ALL SELECT caption, 2 FROM images WHERE caption <> ''
+                       UNION ALL SELECT design_client, 3 FROM images WHERE design_client <> ''
+                       UNION ALL SELECT client, 4 FROM orders WHERE client <> ''
+                   )"""
+            )
+            matches: dict[str, tuple[str, int]] = {}
+            for name, priority in candidates:
+                clean_name = str(name or "").strip()
+                if not clean_name or normalized_term not in self._normalise_search_token(clean_name):
+                    continue
+                key = clean_name.casefold()
+                existing = matches.get(key)
+                if existing is None or priority < existing[1]:
+                    matches[key] = (clean_name, int(priority))
+            rows = sorted(matches.values(), key=lambda item: (item[1], item[0].casefold()))[:limit]
+        if not typed:
+            return [row[0] for row in rows]
+        labels = {0: "Etiqueta", 1: "Categoría", 2: "Nombre", 3: "Cliente del diseño", 4: "Cliente"}
+        return [f"{labels.get(row[1], 'Sticker')}: {row[0]}" for row in rows]
 
     def remove_tag(self, image_path: str, tag_name: str) -> None:
         self.connection.execute(
@@ -3592,16 +6595,110 @@ class ImageDatabase:
             (image_path, tag_name),
         )
         self.connection.execute("DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM image_tags)")
+        self._refresh_sticker_search_entry(image_path)
+        self.connection.commit()
+
+    def remove_tag_from_images(self, image_paths: list[str], tag_name: str) -> int:
+        """Quita una etiqueta de varias imagenes en una sola transaccion."""
+        paths = [path for path in image_paths if path]
+        if not paths:
+            return 0
+        tag_row = self.connection.execute(
+            "SELECT id FROM tags WHERE name = ? COLLATE NOCASE", (tag_name.strip(),)
+        ).fetchone()
+        if tag_row is None:
+            return 0
+        tag_id = tag_row[0]
+        placeholders = ", ".join("?" for _ in paths)
+        with self.connection:
+            cursor = self.connection.execute(
+                f"DELETE FROM image_tags WHERE tag_id = ? AND image_path IN ({placeholders})",
+                (tag_id, *paths),
+            )
+            self.connection.execute("DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM image_tags)")
+        for path in paths:
+            self._refresh_sticker_search_entry(path)
+        self.connection.commit()
+        return int(cursor.rowcount)
+
+    def record_sticker_similarity_check(
+        self, job_id: str, match_path: str = "", score: float = 0.0,
+        color_variant_applied: bool = False,
+    ) -> None:
+        """Registra la revisión diferida de similitud de un procesado."""
+        from datetime import datetime
+
+        row = self.connection.execute(
+            "SELECT analysis FROM sticker_processing_jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        try:
+            analysis = json.loads(row[0] or "{}") if row else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            analysis = {}
+        analysis["similarity_checked"] = True
+        analysis["similar_design_path"] = match_path
+        analysis["similar_design_score"] = round(float(score), 2)
+        analysis["color_variant_applied"] = bool(color_variant_applied)
+        self.connection.execute(
+            """UPDATE sticker_processing_jobs
+               SET analysis = ?, duplicate_path = ?, duplicate_score = ?, updated_at = ?
+               WHERE id = ?""",
+            (
+                json.dumps(analysis, ensure_ascii=False), match_path, float(score),
+                datetime.now().isoformat(timespec="seconds"), job_id,
+            ),
+        )
         self.connection.commit()
 
     def delete_tag(self, tag_name: str) -> None:
         """Elimina una etiqueta de todos los diseños, sin borrar archivos."""
+        paths = [row[0] for row in self.connection.execute(
+            "SELECT image_path FROM image_tags WHERE tag_id = (SELECT id FROM tags WHERE name = ? COLLATE NOCASE)",
+            (tag_name,),
+        )]
         self.connection.execute(
             "DELETE FROM image_tags WHERE tag_id = (SELECT id FROM tags WHERE name = ? COLLATE NOCASE)",
             (tag_name,),
         )
         self.connection.execute("DELETE FROM tags WHERE name = ? COLLATE NOCASE", (tag_name,))
+        for path in paths:
+            self._refresh_sticker_search_entry(path)
         self.connection.commit()
+
+    def rename_tag(self, tag_name: str, new_name: str) -> str:
+        """Renombra una etiqueta o fusiona las asociaciones con una existente."""
+        source = tag_name.strip()
+        target = new_name.strip().title()
+        if not target:
+            raise ValueError("La etiqueta no puede estar vacia.")
+        source_row = self.connection.execute(
+            "SELECT id FROM tags WHERE name = ? COLLATE NOCASE", (source,)
+        ).fetchone()
+        if source_row is None:
+            raise ValueError("La etiqueta original ya no existe.")
+        source_id = source_row[0]
+        target_row = self.connection.execute(
+            "SELECT id, name FROM tags WHERE name = ? COLLATE NOCASE", (target,)
+        ).fetchone()
+        paths = [row[0] for row in self.connection.execute(
+            "SELECT image_path FROM image_tags WHERE tag_id = ?", (source_id,)
+        )]
+        with self.connection:
+            if target_row and target_row[0] != source_id:
+                target_id, target = target_row
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO image_tags(image_path, tag_id) "
+                    "SELECT image_path, ? FROM image_tags WHERE tag_id = ?",
+                    (target_id, source_id),
+                )
+                self.connection.execute("DELETE FROM image_tags WHERE tag_id = ?", (source_id,))
+                self.connection.execute("DELETE FROM tags WHERE id = ?", (source_id,))
+            else:
+                self.connection.execute("UPDATE tags SET name = ? WHERE id = ?", (target, source_id))
+        for path in paths:
+            self._refresh_sticker_search_entry(path)
+        self.connection.commit()
+        return target
 
     def delete_image(self, image_path: str) -> None:
         """Elimina las referencias internas de un sticker ya borrado del disco."""
@@ -3630,6 +6727,7 @@ class ImageDatabase:
         default = {
             "printer_name": "", "paper": "A4", "orientation": "Vertical",
             "scale": 97.27, "quality": "Alta", "color": "Color", "copies": 1,
+            "printer_profiles": {},
         }
         row = self.connection.execute(
             "SELECT setting_value FROM app_settings WHERE setting_key = 'printing_config'"
@@ -3640,7 +6738,15 @@ class ImageDatabase:
             saved = json.loads(row[0])
         except (TypeError, ValueError):
             saved = {}
-        return {**default, **saved}
+        config = {**default, **saved}
+        profiles = config.get("printer_profiles")
+        config["printer_profiles"] = profiles if isinstance(profiles, dict) else {}
+        active_profile = config["printer_profiles"].get(config.get("printer_name") or "")
+        if isinstance(active_profile, dict):
+            config.update({key: value for key, value in active_profile.items() if key in {
+                "copies", "devmode_b64", "devmode_summary",
+            }})
+        return config
 
     def save_printing_config(self, printer_name: str, preferences: dict | None = None) -> dict:
         """Guarda la impresora y el perfil fijo que usará toda la producción."""
@@ -3648,7 +6754,7 @@ class ImageDatabase:
         import json
 
         config = self.printing_config()
-        config["printer_name"] = printer_name.strip()
+        selected_printer = printer_name.strip()
         preferences = preferences or {}
         # La aplicación imprime planchas A4 reales: estos valores quedan
         # protegidos aunque se restauren configuraciones antiguas o dañadas.
@@ -3658,14 +6764,31 @@ class ImageDatabase:
         config["quality"] = "Alta"
         config["color"] = "Color"
         # Preservar la configuración del driver (DEVMODE) y su resumen si están siendo guardadas
-        if "devmode_b64" in preferences:
-            config["devmode_b64"] = preferences["devmode_b64"]
-        if "devmode_summary" in preferences:
-            config["devmode_summary"] = preferences["devmode_summary"]
+        # Cada impresora conserva su propio DEVMODE. Cambiar de impresora no
+        # puede reemplazar ni aplicar la configuración de otra por accidente.
+        profiles = dict(config.get("printer_profiles") or {})
+        previous_printer = str(config.get("printer_name") or "")
+        profile = dict(profiles.get(selected_printer) or {})
+        if not profile and selected_printer and selected_printer == previous_printer:
+            for key in ("copies", "devmode_b64", "devmode_summary"):
+                if key in config:
+                    profile[key] = config[key]
+        for key in ("devmode_b64", "devmode_summary"):
+            if key in preferences:
+                profile[key] = preferences[key]
         try:
-            config["copies"] = min(99, max(1, int(preferences.get("copies", config.get("copies", 1)))))
+            profile["copies"] = min(99, max(1, int(preferences.get("copies", profile.get("copies", config.get("copies", 1))))))
         except (TypeError, ValueError):
-            config["copies"] = 1
+            profile["copies"] = 1
+        if selected_printer:
+            profiles[selected_printer] = profile
+        config["printer_name"] = selected_printer
+        config["printer_profiles"] = profiles
+        # Las claves superiores mantienen compatibilidad con los flujos
+        # actuales, y siempre reflejan solo la impresora activa.
+        for key in ("copies", "devmode_b64", "devmode_summary"):
+            config.pop(key, None)
+        config.update(profile)
         now = datetime.now().isoformat(timespec="seconds")
         self.connection.execute(
             """INSERT INTO app_settings(setting_key, setting_value, updated_at) VALUES('printing_config', ?, ?)
@@ -3676,43 +6799,299 @@ class ImageDatabase:
         return config
 
     def save_plancha_project(self, order_id: int | None, name: str, material: str, project_json: str,
-                             project_path: str, plancha_id: int | None = None) -> int:
-        """Registra el proyecto editable sin alterar los PNG originales de cada diseño."""
+                             project_path: str, plancha_id: int | None = None,
+                             person_name: str = "", person_phone: str = "", workspace_format: str = "a4") -> int:
+        """Guarda proyecto y reservas trazables en una única transacción."""
         from datetime import datetime
 
         now = datetime.now().isoformat(timespec="seconds")
-        if plancha_id:
-            previous = self.connection.execute(
-                "SELECT approval_status, order_id FROM plancha_projects WHERE id = ?", (plancha_id,)
+        if str(name).startswith("plancha_borrador"):
+            name = "Plancha (Cliente)" if order_id else "Plancha Doccione"
+        try:
+            payload = json.loads(project_json or "{}")
+            items = payload.get("items", []) if isinstance(payload, dict) else []
+        except (TypeError, json.JSONDecodeError):
+            items = []
+        previous = None
+        with self.connection:
+            if plancha_id:
+                previous = self.connection.execute(
+                    "SELECT approval_status, order_id FROM plancha_projects WHERE id = ?", (plancha_id,)
+                ).fetchone()
+                self.connection.execute(
+                    """UPDATE plancha_projects SET order_id = ?, name = ?, material = ?, project_json = ?,
+                       project_path = ?, person_name = ?, person_phone = ?, workspace_format = ?,
+                       approval_status = CASE WHEN approval_status = 'Aprobada' THEN 'Borrador' ELSE approval_status END,
+                       updated_at = ? WHERE id = ?""",
+                    (order_id, name, material, project_json, project_path, person_name, person_phone, workspace_format, now, plancha_id),
+                )
+                saved_id = int(plancha_id)
+            else:
+                cursor = self.connection.execute(
+                    """INSERT INTO plancha_projects(order_id, name, material, project_json, project_path,
+                       person_name, person_phone, workspace_format, created_at, updated_at)
+                       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (order_id, name, material, project_json, project_path, person_name, person_phone, workspace_format, now, now),
+                )
+                saved_id = int(cursor.lastrowid)
+            self._sync_plancha_assignments(saved_id, items, now)
+        if previous and previous["approval_status"] == "Aprobada" and (order_id or previous["order_id"]):
+            self._sync_order_approval(int(order_id or previous["order_id"]))
+        return saved_id
+
+    def _sync_plancha_assignments(self, plancha_id: int, items: list[dict], now: str) -> None:
+        """Sincroniza reservas; el llamador controla la transacción."""
+        desired: dict[str, dict] = {}
+        for raw in items or []:
+            item = dict(raw) if isinstance(raw, dict) else {}
+            item_id = str(item.get("item_id") or "").strip()
+            unit_key = str(item.get("requested_unit_key") or "").strip()
+            order_id = item.get("order_id")
+            order_job_id = item.get("order_job_id")
+            if not item_id or not unit_key or order_id is None or order_job_id is None:
+                continue
+            job = self.connection.execute(
+                "SELECT order_id FROM order_jobs WHERE id = ?", (int(order_job_id),)
             ).fetchone()
-            self.connection.execute(
-                """UPDATE plancha_projects SET order_id = ?, name = ?, material = ?, project_json = ?,
-                   project_path = ?,
-                   approval_status = CASE WHEN approval_status = 'Aprobada' THEN 'Borrador' ELSE approval_status END,
-                   updated_at = ? WHERE id = ?""",
-                (order_id, name, material, project_json, project_path, now, plancha_id),
+            if not job or int(job[0]) != int(order_id):
+                raise ValueError("La procedencia de un elemento no coincide con el trabajo del pedido.")
+            raw_quantity = float(item.get("production_quantity", 1))
+            if not math.isfinite(raw_quantity) or raw_quantity <= 0:
+                raise ValueError("La cantidad productiva debe ser mayor que cero.")
+            if item_id in desired:
+                raise ValueError("La plancha contiene un elemento productivo repetido.")
+            desired[item_id] = {
+                "item_id": item_id, "requested_unit_key": unit_key,
+                "order_id": int(order_id), "order_job_id": int(order_job_id),
+                "order_design_line_id": str(item.get("order_design_line_id") or ""),
+                "image_path": str(item.get("path") or ""),
+                "copy_number": max(1, int(item.get("copy_number") or 1)),
+                "unit_kind": str(item.get("production_unit_kind") or "item"),
+                "quantity": raw_quantity,
+            }
+        existing = {
+            str(row["item_id"]): dict(row)
+            for row in self.connection.execute(
+                "SELECT * FROM plancha_item_assignments WHERE plancha_id = ?", (int(plancha_id),)
             )
-            self.connection.commit()
-            if previous and previous["approval_status"] == "Aprobada" and (order_id or previous["order_id"]):
-                self._sync_order_approval(int(order_id or previous["order_id"]))
-            return int(plancha_id)
-        cursor = self.connection.execute(
-            """INSERT INTO plancha_projects(order_id, name, material, project_json, project_path, created_at, updated_at)
-               VALUES(?, ?, ?, ?, ?, ?, ?)""",
-            (order_id, name, material, project_json, project_path, now, now),
+        }
+        for item_id, row in existing.items():
+            if item_id not in desired and row["state"] == "prepared":
+                self.connection.execute(
+                    "UPDATE plancha_item_assignments SET state='released',released_at=?,updated_at=? WHERE id=?",
+                    (now, now, row["id"]),
+                )
+        for item_id, item in desired.items():
+            previous = existing.get(item_id)
+            if previous and previous["state"] in {"printed", "finished"}:
+                if previous["requested_unit_key"] != item["requested_unit_key"]:
+                    raise ValueError("Un elemento ya impreso no puede cambiar de unidad solicitada.")
+                continue
+            conflict = self.connection.execute(
+                """SELECT plancha_id FROM plancha_item_assignments
+                   WHERE requested_unit_key=? AND state<>'released' AND plancha_id<>? LIMIT 1""",
+                (item["requested_unit_key"], int(plancha_id)),
+            ).fetchone()
+            if conflict:
+                raise ValueError(
+                    f"La unidad {item['copy_number']} ya está preparada en la plancha #{int(conflict[0])}."
+                )
+            if previous:
+                self.connection.execute(
+                    """UPDATE plancha_item_assignments SET requested_unit_key=?,order_id=?,order_job_id=?,order_design_line_id=?,
+                       image_path=?,copy_number=?,unit_kind=?,quantity=?,state='prepared',released_at='',updated_at=?
+                       WHERE id=?""",
+                    (item["requested_unit_key"], item["order_id"], item["order_job_id"], item["order_design_line_id"], item["image_path"],
+                     item["copy_number"], item["unit_kind"], item["quantity"], now, previous["id"]),
+                )
+            else:
+                self.connection.execute(
+                    """INSERT INTO plancha_item_assignments(
+                       plancha_id,item_id,requested_unit_key,order_id,order_job_id,order_design_line_id,image_path,copy_number,
+                       unit_kind,quantity,state,prepared_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,'prepared',?,?)""",
+                    (int(plancha_id), item_id, item["requested_unit_key"], item["order_id"],
+                     item["order_job_id"], item["order_design_line_id"], item["image_path"], item["copy_number"], item["unit_kind"],
+                     item["quantity"], now, now),
+                )
+
+    def plancha_assignments(self, plancha_id: int, *, include_released: bool = False) -> list[dict]:
+        sql = "SELECT * FROM plancha_item_assignments WHERE plancha_id=?"
+        if not include_released:
+            sql += " AND state<>'released'"
+        sql += " ORDER BY id"
+        return [dict(row) for row in self.connection.execute(sql, (int(plancha_id),))]
+
+    def plancha_order_ids(self, plancha_id: int) -> list[int]:
+        rows = self.connection.execute(
+            """SELECT DISTINCT order_id FROM plancha_item_assignments
+               WHERE plancha_id=? AND state<>'released' ORDER BY order_id""", (int(plancha_id),)
         )
-        self.connection.commit()
-        return int(cursor.lastrowid)
+        values = [int(row[0]) for row in rows]
+        if values:
+            return values
+        legacy = self.plancha_project(plancha_id)
+        return [int(legacy["order_id"])] if legacy and legacy.get("order_id") else []
+
+    def confirm_plancha_printed_assignments(self, plancha_id: int) -> int:
+        """Confirma salida física; enviar al driver no llama a este método."""
+        from datetime import datetime
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connection:
+            cursor = self.connection.execute(
+                """UPDATE plancha_item_assignments SET state='printed',printed_at=?,updated_at=?
+                   WHERE plancha_id=? AND state='prepared'""", (now, now, int(plancha_id)),
+            )
+        return int(cursor.rowcount)
+
+    def confirm_plancha_finished_assignments(self, plancha_id: int, item_ids: list[str] | None = None) -> int:
+        """Confirma terminación parcial e idempotente sólo sobre unidades impresas."""
+        from datetime import datetime
+        now = datetime.now().isoformat(timespec="seconds")
+        params: list[object] = [now, now, int(plancha_id)]
+        sql = """UPDATE plancha_item_assignments SET state='finished',finished_at=?,updated_at=?
+                 WHERE plancha_id=? AND state='printed'"""
+        if item_ids is not None:
+            clean = sorted({str(value) for value in item_ids if str(value)})
+            if not clean:
+                return 0
+            sql += " AND item_id IN (" + ",".join("?" for _ in clean) + ")"
+            params.extend(clean)
+        with self.connection:
+            cursor = self.connection.execute(sql, params)
+        return int(cursor.rowcount)
+
+    def order_job_production_quantities(self, order_job_id: int) -> dict:
+        job = self.connection.execute(
+            "SELECT id,order_id,quantity,title,material,size FROM order_jobs WHERE id=?", (int(order_job_id),)
+        ).fetchone()
+        if not job:
+            raise ValueError("Trabajo no encontrado.")
+        requested = max(0.0, float(job["quantity"] or 0))
+        rows = self.connection.execute(
+            """SELECT state,COALESCE(SUM(quantity),0) AS total FROM plancha_item_assignments
+               WHERE order_job_id=? AND state<>'released' GROUP BY state""", (int(order_job_id),)
+        )
+        totals = {str(row["state"]): float(row["total"] or 0) for row in rows}
+        prepared = totals.get("prepared", 0.0)
+        printed = totals.get("printed", 0.0)
+        finished = totals.get("finished", 0.0)
+        linked_designs = int(self.connection.execute(
+            """SELECT
+                 (SELECT COUNT(*) FROM order_designs WHERE order_job_id=?) +
+                 (SELECT COUNT(*) FROM order_design_job_links WHERE order_job_id=?)""",
+            (int(order_job_id), int(order_job_id)),
+        ).fetchone()[0])
+        traced = prepared + printed + finished
+        return {
+            "order_job_id": int(order_job_id), "requested": requested,
+            "unprepared": max(0.0, requested - traced),
+            "prepared_unprinted": prepared, "printed_unfinished": printed,
+            "finished": finished, "pending_finish": max(0.0, requested - finished),
+            "traceability": "configured" if linked_designs or traced else "untracked",
+        }
+
+    def available_requested_copy_numbers(
+        self, *, order_id: int, order_job_id: int, image_path: str,
+        nominal_size_cm: float, rotation: int, requested_quantity: int,
+        design_line_id: str = "",
+    ) -> list[int]:
+        """Devuelve sólo unidades todavía no reservadas ni producidas."""
+        from app.planchas.model import requested_unit_key
+        active = {
+            str(row[0]) for row in self.connection.execute(
+                "SELECT requested_unit_key FROM plancha_item_assignments WHERE state<>'released'"
+            )
+        }
+        legacy_copy_numbers: set[int] = set()
+        if design_line_id:
+            matching_lines = int(self.connection.execute(
+                """SELECT COUNT(*) FROM order_design_demand_lines
+                   WHERE order_job_id=? AND LOWER(REPLACE(image_path,'\\','/'))=LOWER(REPLACE(?,'\\','/'))""",
+                (int(order_job_id), image_path),
+            ).fetchone()[0] or 0)
+            legacy_rows = self.connection.execute(
+                """SELECT copy_number FROM plancha_item_assignments
+                   WHERE order_job_id=? AND COALESCE(order_design_line_id,'')=''
+                     AND LOWER(REPLACE(image_path,'\\','/'))=LOWER(REPLACE(?,'\\','/'))
+                     AND state<>'released'""",
+                (int(order_job_id), image_path),
+            ).fetchall()
+            if legacy_rows and matching_lines != 1:
+                raise ValueError("Historial v1 ambiguo: resolvé la correspondencia antes de preparar una tanda.")
+            legacy_copy_numbers = {max(1, int(row[0] or 1)) for row in legacy_rows}
+        return [
+            copy_number for copy_number in range(1, max(0, int(requested_quantity)) + 1)
+            if copy_number not in legacy_copy_numbers and requested_unit_key(
+                int(order_id), int(order_job_id), image_path,
+                float(nominal_size_cm), int(rotation), copy_number,
+                design_line_id=design_line_id,
+            ) not in active
+        ]
 
     def plancha_project(self, plancha_id: int) -> dict | None:
         row = self.connection.execute("SELECT * FROM plancha_projects WHERE id = ?", (plancha_id,)).fetchone()
         return dict(row) if row else None
+
+    def link_plancha_to_order(self, plancha_id: int, order_id: int) -> bool:
+        """Vincula una plancha guardada a un pedido existente."""
+        from datetime import datetime
+
+        plancha_id, order_id = int(plancha_id), int(order_id)
+        if not self.plancha_project(plancha_id):
+            raise ValueError("No se encontró la plancha guardada.")
+        order = self.order(order_id)
+        if not order:
+            raise ValueError("No se encontró el pedido indicado.")
+        now = datetime.now().isoformat(timespec="seconds")
+        self.connection.execute(
+            """UPDATE plancha_projects
+               SET order_id = ?, material = CASE WHEN material = '' THEN ? ELSE material END,
+                   updated_at = ?
+               WHERE id = ?""",
+            (order_id, order.get("material") or "", now, plancha_id),
+        )
+        self.connection.commit()
+        return True
 
     def plancha_by_project_path(self, project_path: str) -> dict | None:
         row = self.connection.execute(
             "SELECT * FROM plancha_projects WHERE project_path = ? ORDER BY id DESC LIMIT 1", (project_path,)
         ).fetchone()
         return dict(row) if row else None
+
+    def delete_plancha_project(self, plancha_id: int) -> bool:
+        """Elimina una plancha y sus registros de producción asociados.
+
+        No borra los archivos del proyecto ni los PNG del disco; así se evita
+        eliminar material que pueda ser necesario recuperar manualmente.
+        """
+        plancha_id = int(plancha_id)
+        if not self.plancha_project(plancha_id):
+            return False
+
+        try:
+            with self.connection:
+                produced = self.connection.execute(
+                    """SELECT 1 FROM plancha_item_assignments
+                       WHERE plancha_id=? AND state IN ('printed','finished') LIMIT 1""", (plancha_id,),
+                ).fetchone()
+                printed_history = self.connection.execute(
+                    """SELECT 1 FROM print_history
+                       WHERE plancha_id=? AND status='Impresa' LIMIT 1""", (plancha_id,),
+                ).fetchone()
+                if produced or printed_history:
+                    raise RuntimeError("La plancha tiene producción registrada y debe conservarse como historial.")
+                if self.connection.execute("SELECT 1 FROM production_batch_planchas WHERE plancha_id=?", (plancha_id,)).fetchone():
+                    raise RuntimeError("La plancha pertenece a una tanda; cancelá la tanda para conservar su trazabilidad.")
+                self.connection.execute("DELETE FROM plancha_item_assignments WHERE plancha_id = ?", (plancha_id,))
+                self.connection.execute("DELETE FROM order_previews WHERE plancha_id = ?", (plancha_id,))
+                self.connection.execute("DELETE FROM print_history WHERE plancha_id = ?", (plancha_id,))
+                self.connection.execute("DELETE FROM print_jobs WHERE plancha_id = ?", (plancha_id,))
+                self.connection.execute("DELETE FROM plancha_projects WHERE id = ?", (plancha_id,))
+        except sqlite3.Error as error:
+            raise RuntimeError(f"No se pudo eliminar la plancha: {error}") from error
+        return True
 
     def set_plancha_final_png(self, plancha_id: int, final_png_path: str) -> None:
         from datetime import datetime
@@ -3721,7 +7100,7 @@ class ImageDatabase:
         self.connection.execute(
             """UPDATE plancha_projects SET final_png_path = ?, print_status = 'Lista para imprimir',
                print_error = '', print_updated_at = ?,
-               production_status = CASE WHEN production_status IN ('borrador', 'guardada') THEN 'lista' ELSE production_status END,
+               production_status = CASE WHEN production_status = 'borrador' THEN 'guardada' ELSE production_status END,
                updated_at = ? WHERE id = ?""",
             (final_png_path, now, now, plancha_id),
         )
@@ -3765,7 +7144,11 @@ class ImageDatabase:
 
     def order_planchas(self, order_id: int) -> list[dict]:
         rows = self.connection.execute(
-            "SELECT * FROM plancha_projects WHERE order_id = ? ORDER BY updated_at DESC, id DESC", (order_id,)
+            """SELECT DISTINCT pp.* FROM plancha_projects pp
+               LEFT JOIN plancha_item_assignments pia
+                 ON pia.plancha_id=pp.id AND pia.state<>'released'
+               WHERE pp.order_id=? OR pia.order_id=?
+               ORDER BY pp.updated_at DESC, pp.id DESC""", (order_id, order_id)
         )
         return [dict(row) for row in rows]
 
@@ -3774,13 +7157,21 @@ class ImageDatabase:
         """Todas las planchas guardadas con datos del pedido, para la tabla de Producción."""
         rows = self.connection.execute(
             """SELECT pp.*,
-                      COALESCE(clients.name, o.client, '') AS order_client,
+                      COALESCE(NULLIF(pp.person_name, ''), clients.name, o.client, '') AS order_client,
                       COALESCE(o.delivery_date, '') AS delivery_date,
                       COALESCE(o.print_priority, 0) AS print_priority,
                       COALESCE(o.whatsapp, '') AS order_whatsapp,
                       (SELECT COUNT(*) FROM print_jobs pj WHERE pj.plancha_id = pp.id) AS total_jobs,
                       (SELECT COUNT(*) FROM print_jobs pj WHERE pj.plancha_id = pp.id
-                       AND pj.status = 'Impresa') AS printed_jobs
+                       AND pj.status = 'Impresa') AS printed_jobs,
+                      (SELECT GROUP_CONCAT(DISTINCT pia.order_id)
+                         FROM plancha_item_assignments pia
+                        WHERE pia.plancha_id=pp.id AND pia.state<>'released') AS represented_order_ids,
+                      (SELECT GROUP_CONCAT(DISTINCT COALESCE(c2.name,o2.client,'') )
+                         FROM plancha_item_assignments pia2
+                         JOIN orders o2 ON o2.id=pia2.order_id
+                         LEFT JOIN clients c2 ON c2.id=o2.client_id
+                        WHERE pia2.plancha_id=pp.id AND pia2.state<>'released') AS represented_clients
                FROM plancha_projects pp
                LEFT JOIN orders o ON o.id = pp.order_id
                LEFT JOIN clients ON clients.id = o.client_id
@@ -3792,13 +7183,21 @@ class ImageDatabase:
         """Planchas filtradas por production_status."""
         rows = self.connection.execute(
             """SELECT pp.*,
-                      COALESCE(clients.name, o.client, '') AS order_client,
+                      COALESCE(NULLIF(pp.person_name, ''), clients.name, o.client, '') AS order_client,
                       COALESCE(o.delivery_date, '') AS delivery_date,
                       COALESCE(o.print_priority, 0) AS print_priority,
                       COALESCE(o.whatsapp, '') AS order_whatsapp,
                       (SELECT COUNT(*) FROM print_jobs pj WHERE pj.plancha_id = pp.id) AS total_jobs,
                       (SELECT COUNT(*) FROM print_jobs pj WHERE pj.plancha_id = pp.id
-                       AND pj.status = 'Impresa') AS printed_jobs
+                       AND pj.status = 'Impresa') AS printed_jobs,
+                      (SELECT GROUP_CONCAT(DISTINCT pia.order_id)
+                         FROM plancha_item_assignments pia
+                        WHERE pia.plancha_id=pp.id AND pia.state<>'released') AS represented_order_ids,
+                      (SELECT GROUP_CONCAT(DISTINCT COALESCE(c2.name,o2.client,''))
+                         FROM plancha_item_assignments pia2
+                         JOIN orders o2 ON o2.id=pia2.order_id
+                         LEFT JOIN clients c2 ON c2.id=o2.client_id
+                        WHERE pia2.plancha_id=pp.id AND pia2.state<>'released') AS represented_clients
                FROM plancha_projects pp
                LEFT JOIN orders o ON o.id = pp.order_id
                LEFT JOIN clients ON clients.id = o.client_id
@@ -3845,6 +7244,8 @@ class ImageDatabase:
 
     def save_plancha_status_before_continuous(self, plancha_id: int) -> None:
         """Guarda el production_status actual en previous_production_status antes de marcar usada_en_continua."""
+        from datetime import datetime
+
         project = self.plancha_project(plancha_id)
         if not project:
             return
@@ -3868,7 +7269,10 @@ class ImageDatabase:
             prev = "lista" if has_png else "guardada"
         now = datetime.now().isoformat(timespec="seconds")
         self.connection.execute(
-            "UPDATE plancha_projects SET production_status = ?, previous_production_status = '', updated_at = ? WHERE id = ?",
+            """UPDATE plancha_projects
+               SET production_status = ?, continuous_confirmed = 0,
+                   previous_production_status = '', updated_at = ?
+               WHERE id = ?""",
             (prev, now, plancha_id),
         )
         self.connection.commit()
@@ -3928,17 +7332,79 @@ class ImageDatabase:
 
     # Produccion continua ------------------------------------------------
     def available_planchas_for_continuous(self) -> list[dict]:
-        """Planchas guardadas y exportadas que pueden combinarse en una tira."""
+        """Planchas confirmadas con PNG final que pueden combinarse en una tira."""
         rows = self.connection.execute(
             """SELECT plancha_projects.*, orders.client AS order_client,
                       orders.material AS order_material, orders.status AS order_status
                FROM plancha_projects
                LEFT JOIN orders ON orders.id = plancha_projects.order_id
-               WHERE COALESCE(plancha_projects.project_path, '') <> ''
-                 AND COALESCE(plancha_projects.final_png_path, '') <> ''
+               WHERE COALESCE(plancha_projects.final_png_path, '') <> ''
+                 AND COALESCE(plancha_projects.production_status, '') = 'lista'
+                 AND COALESCE(plancha_projects.continuous_confirmed, 0) = 1
+                 AND COALESCE(plancha_projects.production_status, 'lista') <> 'usada_en_continua'
                ORDER BY plancha_projects.updated_at DESC, plancha_projects.id DESC"""
         )
         return [dict(row) for row in rows]
+
+    def confirm_plancha_for_continuous(self, plancha_id: int) -> None:
+        """Marca una A4 verificada para que pueda entrar a impresión continua."""
+        self.connection.execute(
+            "UPDATE plancha_projects SET continuous_confirmed = 1, production_status = 'lista' WHERE id = ?", (plancha_id,),
+        )
+        self.connection.commit()
+        self._sync_order_printing(plancha_id)
+
+    def release_plancha_from_continuous(self, plancha_id: int) -> bool:
+        """Quita una plancha de tiras pendientes y libera su reserva.
+
+        Sirve para recuperar una plancha marcada como usada cuando la tira no
+        está abierta en pantalla. No afecta trabajos ya enviados a imprimir.
+        """
+        from datetime import datetime
+        import json
+
+        plancha_id = int(plancha_id)
+        changed = False
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connection:
+            records = self.connection.execute(
+                "SELECT id, production_json FROM continuous_productions WHERE status = 'Pendiente'"
+            ).fetchall()
+            for record in records:
+                try:
+                    data = json.loads(record["production_json"] or "{}")
+                    sections = list(data.get("sections") or [])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                remaining = [section for section in sections if int(section.get("plancha_id") or 0) != plancha_id]
+                if len(remaining) == len(sections):
+                    continue
+                changed = True
+                if remaining:
+                    data["sections"] = remaining
+                    self.connection.execute(
+                        "UPDATE continuous_productions SET production_json = ?, updated_at = ? WHERE id = ?",
+                        (json.dumps(data, ensure_ascii=False), now, int(record["id"])),
+                    )
+                else:
+                    self.connection.execute("DELETE FROM continuous_productions WHERE id = ?", (int(record["id"]),))
+            if changed:
+                self.connection.execute(
+                    """UPDATE plancha_projects
+                       SET production_status = CASE
+                               WHEN COALESCE(previous_production_status, '') <> '' THEN previous_production_status
+                               WHEN COALESCE(final_png_path, '') <> '' THEN 'lista'
+                               ELSE 'guardada' END,
+                           continuous_confirmed = 0, previous_production_status = '', updated_at = ?
+                       WHERE id = ?""",
+                    (now, plancha_id),
+                )
+        return changed
+
+    def delete_continuous_production(self, production_id: int) -> None:
+        """Elimina una tira pendiente que quedó sin secciones."""
+        self.connection.execute("DELETE FROM continuous_productions WHERE id = ?", (int(production_id),))
+        self.connection.commit()
 
     def save_continuous_production(
         self, name: str, mode: str, width_cm: float, length_cm: float,
@@ -3976,6 +7442,16 @@ class ImageDatabase:
             "SELECT * FROM continuous_productions ORDER BY updated_at DESC, id DESC"
         )
         return [dict(row) for row in rows]
+
+    def mark_continuous_production_print_submitted(self, production_id: int) -> None:
+        """Registra que la tira fue entregada a la cola, sin marcarla como impresa."""
+        from datetime import datetime
+
+        self.connection.execute(
+            "UPDATE continuous_productions SET status = 'Enviada a impresión', updated_at = ? WHERE id = ?",
+            (datetime.now().isoformat(timespec="seconds"), production_id),
+        )
+        self.connection.commit()
 
     def _sync_order_approval(self, order_id: int) -> None:
         """Un pedido solo pasa a Aprobado cuando todas sus planchas lo están."""
@@ -4041,6 +7517,8 @@ class ImageDatabase:
         project = self.plancha_project(plancha_id)
         if not project:
             raise ValueError("La plancha no está guardada.")
+        if project.get("production_status") == "Cancelada":
+            raise ValueError("La plancha fue retirada de una tanda cancelada y no puede imprimirse.")
         order = self.order(int(project["order_id"])) if project.get("order_id") else None
         priority = max(0, int((order or {}).get("print_priority", 0) or 0))
         delivery_date = (order or {}).get("delivery_date", "") or ""
@@ -4139,6 +7617,9 @@ class ImageDatabase:
         self.set_plancha_print_status(job["plancha_id"], status, message)
         # Sincronizar production_status y contadores SOLO si el estado realmente cambió
         if status == "Impresa" and prev_status != "Impresa":
+            # Sólo la confirmación física existente mueve las unidades. El
+            # envío al spool queda en "En cola" y no acredita producción.
+            self.confirm_plancha_printed_assignments(job["plancha_id"])
             self.increment_plancha_print_count(job["plancha_id"], success=True)
             current = self.plancha_project(job["plancha_id"]) or {}
             if current.get("production_status") not in {"usada_en_continua"}:
@@ -4159,5 +7640,188 @@ class ImageDatabase:
         )
         return [dict(row) for row in rows]
 
+    @property
+    def connection(self) -> sqlite3.Connection:
+        if not hasattr(self._thread_connections, 'conn'):
+            self._thread_connections.conn = self._create_connection()
+        return self._thread_connections.conn
+
     def close(self) -> None:
         self.connection.close()
+
+    # Biblioteca activa ----------------------------------------------------
+    def get_library_root(self) -> str:
+        """Obtiene la carpeta raíz de la biblioteca activa."""
+        return self.app_setting("library_root", "")
+
+    def save_library_root(self, folder: str) -> None:
+        """Guarda la carpeta raíz de la biblioteca activa."""
+        self.save_app_setting("library_root", folder)
+
+    def import_and_number_external_library_images(self) -> list[dict]:
+        """Number and index images added directly to the active library folder."""
+        from app.indexer.scanner import IMAGE_EXTENSIONS
+
+        root_value = self.get_library_root().strip()
+        if not root_value:
+            return []
+        library_root = Path(root_value)
+        if not library_root.is_dir():
+            return []
+
+        images = [
+            path for path in library_root.iterdir()
+            if path.is_file()
+            and path.suffix.lower() in IMAGE_EXTENSIONS
+            and not path.name.startswith((".", "~"))
+        ]
+        numbered = [path for path in images if re.fullmatch(r"\d+", path.stem)]
+        unnumbered = sorted(
+            (path for path in images if not re.fullmatch(r"\d+", path.stem)),
+            key=lambda path: (path.stat().st_mtime, path.name.casefold()),
+        )
+        if not unnumbered:
+            return []
+
+        occupied = {int(path.stem) for path in numbered}
+        occupied_stems = {path.stem for path in images}
+        width = max(5, *(len(path.stem) for path in numbered)) if numbered else 5
+        next_number = max(occupied, default=0) + 1
+        imported = []
+
+        for source in unnumbered:
+            while next_number in occupied:
+                next_number += 1
+            destination = library_root / f"{next_number:0{width}d}{source.suffix.lower()}"
+            # A sequence number is unique even if another image has a different extension.
+            while destination.stem in occupied_stems:
+                next_number += 1
+                destination = library_root / f"{next_number:0{width}d}{source.suffix.lower()}"
+
+            old_path = str(source.resolve())
+            try:
+                source.rename(destination)
+            except OSError:
+                # Another app may still be writing this file; retry next startup.
+                continue
+
+            destination = destination.resolve()
+            new_path = str(destination)
+            stat = destination.stat()
+            with self.connection:
+                # Preserve metadata if the file was indexed by the watcher first.
+                for table in (
+                    "image_tags", "ai_results", "dismissed_ai_tags",
+                    "plancha_usage", "order_designs", "image_collections",
+                    "sticker_search",
+                ):
+                    self.connection.execute(
+                        f"UPDATE {table} SET image_path = ? WHERE image_path = ?",
+                        (new_path, old_path),
+                    )
+                self.connection.execute(
+                    "UPDATE visual_similarities SET query_path = ? WHERE query_path = ?",
+                    (new_path, old_path),
+                )
+                self.connection.execute(
+                    "UPDATE visual_similarities SET candidate_path = ? WHERE candidate_path = ?",
+                    (new_path, old_path),
+                )
+                self.connection.execute(
+                    "UPDATE images SET path = ?, name = ?, extension = ?, size = ?, modified = ? WHERE path = ?",
+                    (new_path, destination.name, destination.suffix.lower(), stat.st_size, stat.st_mtime, old_path),
+                )
+                self.upsert({
+                    "path": new_path,
+                    "name": destination.name,
+                    "extension": destination.suffix.lower(),
+                    "size": stat.st_size,
+                    "modified": stat.st_mtime,
+                    "caption": "Agregado desde otra aplicacion",
+                })
+                self.connection.execute(
+                    "UPDATE images SET is_private = 0, is_reusable = 1, import_status = 'Biblioteca' WHERE path = ?",
+                    (new_path,),
+                )
+            self._refresh_sticker_search_entry(new_path)
+            imported.append({"path": new_path, "name": destination.name})
+            occupied.add(next_number)
+            occupied_stems.discard(source.stem)
+            occupied_stems.add(destination.stem)
+            next_number += 1
+
+        return imported
+
+    def backup_database(self) -> str:
+        """Crea una copia consistente, incluyendo cambios que aún estén en WAL."""
+        return str(self.maintenance.create_backup("manual"))
+
+    def remove_images_outside_folder(self, folder: str) -> dict:
+        """Elimina todos los registros de imágenes fuera de la carpeta especificada.
+        
+        No borra archivos físicos, solo registros de la base de datos.
+        Retorna un diccionario con estadísticas de eliminación.
+        """
+        folder_path = Path(folder).resolve()
+        stats = {
+            "images_removed": 0,
+            "tags_removed": 0,
+            "similarities_removed": 0,
+            "ai_results_removed": 0,
+            "dismissed_tags_removed": 0,
+            "order_designs_removed": 0,
+            "plancha_usage_removed": 0,
+        }
+        
+        # Obtener todas las rutas de imágenes fuera de la carpeta
+        rows = self.connection.execute("SELECT path FROM images").fetchall()
+        paths_to_remove = []
+        
+        for row in rows:
+            img_path = Path(row["path"])
+            try:
+                if not img_path.resolve().is_relative_to(folder_path):
+                    paths_to_remove.append(row["path"])
+            except (ValueError, OSError):
+                # Si no se puede resolver la ruta, asumir que está fuera
+                paths_to_remove.append(row["path"])
+        
+        # Eliminar registros para cada imagen fuera de la carpeta
+        for path in paths_to_remove:
+            with self.connection:
+                # Contar antes de eliminar
+                stats["tags_removed"] += self.connection.execute(
+                    "SELECT COUNT(*) FROM image_tags WHERE image_path = ?", (path,)
+                ).fetchone()[0]
+                stats["similarities_removed"] += self.connection.execute(
+                    "SELECT COUNT(*) FROM visual_similarities WHERE query_path = ? OR candidate_path = ?", (path, path)
+                ).fetchone()[0]
+                stats["ai_results_removed"] += self.connection.execute(
+                    "SELECT COUNT(*) FROM ai_results WHERE image_path = ?", (path,)
+                ).fetchone()[0]
+                stats["dismissed_tags_removed"] += self.connection.execute(
+                    "SELECT COUNT(*) FROM dismissed_ai_tags WHERE image_path = ?", (path,)
+                ).fetchone()[0]
+                stats["order_designs_removed"] += self.connection.execute(
+                    "SELECT COUNT(*) FROM order_designs WHERE image_path = ?", (path,)
+                ).fetchone()[0]
+                stats["plancha_usage_removed"] += self.connection.execute(
+                    "SELECT COUNT(*) FROM plancha_usage WHERE image_path = ?", (path,)
+                ).fetchone()[0]
+                
+                # Eliminar registros
+                self.connection.execute("DELETE FROM image_tags WHERE image_path = ?", (path,))
+                self.connection.execute("DELETE FROM visual_similarities WHERE query_path = ? OR candidate_path = ?", (path, path))
+                self.connection.execute("DELETE FROM ai_results WHERE image_path = ?", (path,))
+                self.connection.execute("DELETE FROM dismissed_ai_tags WHERE image_path = ?", (path,))
+                self.connection.execute("DELETE FROM order_designs WHERE image_path = ?", (path,))
+                self.connection.execute("DELETE FROM plancha_usage WHERE image_path = ?", (path,))
+                self.connection.execute("DELETE FROM images WHERE path = ?", (path,))
+                
+                stats["images_removed"] += 1
+        
+        # Limpiar etiquetas huérfanas
+        self.connection.execute("DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM image_tags)")
+        
+        self.commit()
+        return stats

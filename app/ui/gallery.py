@@ -1,4 +1,5 @@
 import tkinter as tk
+import unicodedata
 from collections import deque
 from tkinter import ttk
 
@@ -25,7 +26,9 @@ class Gallery(ttk.Frame):
         "horizontal": "▤  Mosaico horizontal",
     }
 
-    def __init__(self, master, on_preview, on_add_tag, on_remove_tag, on_capacity_change, on_toggle_selection=None, is_selected=None, drag_paths=None, on_trash=None):
+    def __init__(self, master, on_preview, on_add_tag, on_remove_tag, on_capacity_change,
+                 on_toggle_selection=None, is_selected=None, drag_paths=None, on_trash=None,
+                 responsive_columns: bool = False):
         super().__init__(master, padding=(12, 0, 12, 12))
         self.on_preview = on_preview
         self.on_add_tag = on_add_tag
@@ -35,6 +38,7 @@ class Gallery(ttk.Frame):
         self.is_selected = is_selected or (lambda _image: False)
         self.on_trash = on_trash
         self.drag_paths = drag_paths or (lambda image: [image["path"]])
+        self.responsive_columns = bool(responsive_columns)
         self.layout = tk.StringVar(value="grid")
         self.thumbnail_scale = tk.IntVar(value=0)
         # El usuario elige cuántos diseños revisar. Las columnas permanecen
@@ -44,6 +48,7 @@ class Gallery(ttk.Frame):
         self.images = []
         self.context_image = None
         self.tag_hint = None
+        self._last_render_signature: tuple[tuple[str, object, object, object, object], ...] | None = None
         self._last_capacity = None
         self._last_render_width = 0
         self._resize_render_pending = False
@@ -52,6 +57,7 @@ class Gallery(ttk.Frame):
         self.card_backgrounds = {}
         self.render_generation = 0
         self.thumbnail_queue = deque()
+        self.search_context = ""
         # Imagen bajo el cursor (para selección con Ctrl sin clic)
         self._hovered_image: dict | None = None
         # Estado del rubber-band (selección por área)
@@ -86,6 +92,11 @@ class Gallery(ttk.Frame):
         self.menu.add_command(label="Agregar etiqueta", command=lambda: self.on_add_tag(self.context_image))
     def grid_columns(self) -> int:
         """Columnas que caben en el área visible, sin dejar huecos a la derecha."""
+        if self.responsive_columns:
+            width = self.canvas.winfo_width()
+            if width <= 1:
+                width = 780
+            return max(1, min(self.FIXED_COLUMNS, width // (self.TILE_SIZE + self.TILE_GAP)))
         return self.FIXED_COLUMNS
 
     def display_capacity(self) -> int:
@@ -126,9 +137,50 @@ class Gallery(ttk.Frame):
             self._last_capacity = capacity
             self.after_idle(self.on_capacity_change)
 
+    @staticmethod
+    def render_signature(images: list[dict]) -> tuple[tuple[str, object, object, object, object], ...]:
+        return tuple(
+            (
+                str(item.get("path", "")),
+                item.get("modified"),
+                item.get("tags"),
+                item.get("visual_match_score"),
+                item.get("caption"),
+            )
+            for item in images
+        )
+
     def show_images(self, images: list[dict]) -> None:
+        signature = self.render_signature(images)
+        if signature == self._last_render_signature:
+            return
+        self._last_render_signature = signature
         self.current_items = images
         self.render()
+
+    def set_search_context(self, query: str) -> None:
+        """Conserva el término para explicar por qué apareció cada tarjeta."""
+        self.search_context = str(query or "").strip()
+
+    @staticmethod
+    def _plain(value: object) -> str:
+        return "".join(
+            char for char in unicodedata.normalize("NFKD", str(value or "").casefold())
+            if not unicodedata.combining(char)
+        )
+
+    def match_reason(self, item: dict) -> str:
+        tokens = [token for token in self._plain(self.search_context).split() if token]
+        if not tokens:
+            return ""
+        fields = (("Etiqueta", item.get("tags")), ("Categoría", item.get("category")),
+                  ("Nombre", item.get("caption")), ("Cliente", item.get("design_client")),
+                  ("Texto detectado", item.get("recognized_text")))
+        for label, value in fields:
+            text = self._plain(value)
+            if text and all(token in text for token in tokens):
+                return f"Por {label.lower()}"
+        return ""
 
     def render(self):
         self.render_generation += 1
@@ -152,7 +204,7 @@ class Gallery(ttk.Frame):
             self.card_backgrounds[item["path"]] = self.rounded_rect(card, 1, 1, tile_size - 1, tile_size - 1, 10, fill=COLORS.wine_soft if selected else COLORS.panel)
             self.cards_by_path[item["path"]] = card
             placeholder = card.create_text(tile_size // 2, tile_size // 2, text="Cargando…", fill=COLORS.muted, width=tile_size - 8)
-            self.thumbnail_queue.append((card, item, tile_size, placeholder))
+            self.thumbnail_queue.append((card, item, tile_size, placeholder, self.match_reason(item)))
             score = item.get("visual_match_score")
             if score is not None:
                 score = float(score)
@@ -171,12 +223,10 @@ class Gallery(ttk.Frame):
             card.bind("<Button-3>", lambda event, current=item: self.show_context(event, current))
             card.bind("<MouseWheel>", self.scroll_with_wheel)
             card.bind("<Double-Button-1>", lambda _event, current=item: self.on_preview(current))
-            # Absorber el clic-1 sobre la tarjeta para que el evento no llegue
-            # al canvas de fondo y active el rubber-band o deseleccione todo.
-            # Solo se absorbe el ButtonPress/Release; B1-Motion se deja pasar
-            # para que tkinterdnd2 pueda iniciar el arrastre de archivos.
-            card.bind("<ButtonPress-1>", lambda _e: "break")
-            card.bind("<ButtonRelease-1>", lambda _e: "break")
+            # Ctrl + clic alterna la tarjeta sin abrir la ficha: es la forma
+            # habitual de armar una selección múltiple en Windows. El clic
+            # normal sigue reservado para arrastrar y el doble clic para ver.
+            card.bind("<ButtonPress-1>", lambda event, current=item: self._on_card_click(event, current))
             card.bind("<Enter>", lambda event, current=item, text=tags: self._on_card_enter(event, current, text))
             card.bind("<Leave>", lambda _event: self._on_card_leave())
             if selected:
@@ -222,13 +272,16 @@ class Gallery(ttk.Frame):
             if abs(cx - x0) < _DRAG_THRESHOLD and abs(cy - y0) < _DRAG_THRESHOLD:
                 return
             self._band_dragging = True
-        if self._band_rect is not None:
-            self.canvas.delete(self._band_rect)
-        self._band_rect = self.canvas.create_rectangle(
-            x0, y0, cx, cy,
-            outline=COLORS.wine_active, fill=COLORS.wine_soft,
-            width=1, stipple="gray25",
-        )
+        if self._band_rect is None:
+            self._band_rect = self.canvas.create_rectangle(
+                x0, y0, cx, cy,
+                outline=COLORS.wine_active, fill=COLORS.wine_soft,
+                width=1, stipple="gray25",
+            )
+        else:
+            # Conservar el mismo objeto evita borrar/crear elementos Tcl por
+            # cada píxel recorrido durante la selección múltiple.
+            self.canvas.coords(self._band_rect, x0, y0, cx, cy)
 
     def _band_release(self, event):
         """Al soltar: selecciona las tarjetas contenidas en el rectángulo."""
@@ -298,10 +351,13 @@ class Gallery(ttk.Frame):
         for _ in range(10):
             if not self.thumbnail_queue:
                 return
-            card, item, tile_size, placeholder = self.thumbnail_queue.popleft()
+            card, item, tile_size, placeholder, reason = self.thumbnail_queue.popleft()
             if not card.winfo_exists():
                 continue
-            thumb = load_thumbnail(item["path"], (tile_size - 6, tile_size - 6))
+            thumb = load_thumbnail(
+                item["path"], (tile_size - 6, tile_size - 6),
+                upscale=True, trim_transparency=True,
+            )
             card.delete(placeholder)
             if thumb:
                 card.create_image(tile_size // 2, tile_size // 2, image=thumb)
@@ -309,17 +365,33 @@ class Gallery(ttk.Frame):
                 self.images.append(thumb)
             else:
                 card.create_text(tile_size // 2, tile_size // 2, text="Sin vista previa", fill=COLORS.text, width=tile_size - 8)
+            if reason:
+                card.create_rectangle(5, 5, min(tile_size - 5, 72), 23, fill="#31445a", outline="")
+                card.create_text(min(tile_size - 5, 72) // 2 + 5, 14, text=reason, fill=COLORS.text, font=(UI_FONT, 7, "bold"))
         if self.thumbnail_queue:
             self.after(1, lambda: self.load_thumbnail_batch(generation))
 
     def position_for(self, index: int) -> tuple[int, int, str]:
-        return index // self.FIXED_COLUMNS, index % self.FIXED_COLUMNS, "n"
+        columns = self.grid_columns()
+        return index // columns, index % columns, "n"
 
     def toggle_selection(self, image: dict):
         if self.on_toggle_selection is None:
             return
-        selected = self.on_toggle_selection(image)
-        self.set_selection_visual(image["path"], selected)
+        self.on_toggle_selection(image)
+        # Los controladores actualizan su propio estado; no todos devuelven
+        # un booleano. Consultarlo de nuevo evita perder el borde al hacer
+        # Ctrl + clic.
+        self.set_selection_visual(image["path"], self.is_selected(image))
+
+    def _on_card_click(self, event, image: dict):
+        """Gestiona Ctrl + clic sin bloquear el arrastre nativo de archivos."""
+        if event.state & 0x0004:  # Control en Tk/Windows
+            self.toggle_selection(image)
+            return "break"
+        # tkinterdnd2 necesita recibir la pulsación y el movimiento normales
+        # para iniciar un arrastre. No devolver "break" en este caso.
+        return None
 
     def _on_card_enter(self, _event, image: dict, tags: str):
         """Registra la imagen bajo el cursor y otorga foco para recibir teclas."""
@@ -372,7 +444,7 @@ class Gallery(ttk.Frame):
             widget.dnd_bind("<<DragInitCmd>>", drag_init)
         # En algunos equipos Windows protege la carpeta de dependencias. La
         # biblioteca debe seguir abriendo aunque el arrastre no esté disponible.
-        except (AttributeError, ImportError, OSError, PermissionError):
+        except (AttributeError, ImportError, OSError, PermissionError, tk.TclError):
             pass
 
     def show_tag_hint(self, event, tags: str):
@@ -414,7 +486,7 @@ class Gallery(ttk.Frame):
 
     @staticmethod
     def tag_names(tags: str) -> list[str]:
-        for separator in (" · ", " Â· "):
+        for separator in (" · ", " \u00c2\u00b7 "):
             if separator in tags:
                 return [tag.strip() for tag in tags.split(separator) if tag.strip()]
         return [tags] if tags else []

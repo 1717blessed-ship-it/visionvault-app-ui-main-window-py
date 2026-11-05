@@ -96,6 +96,13 @@ STEPS: list[tuple] = [
         "px", 0, 30, 1,
     ),
     (
+        "Limpieza del borde blanco final",
+        "0 conserva todos los detalles; 1 elimina microburbujas; 2 suaviza más para fondos con halo.",
+        None,
+        "final_white_polish_strength",
+        "nivel", 0, 2, 1,
+    ),
+    (
         "Borde blanco exterior",
         "Ancho del borde blanco alrededor del diseño (capa de impresión).",
         None,

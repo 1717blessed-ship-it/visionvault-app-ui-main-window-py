@@ -1,0 +1,34 @@
+{
+  "contract_version": 1,
+  "operation_id": "shared-contract-op",
+  "client_order_id": "shared-contract-order",
+  "desktop_order_id": null,
+  "expected_revision": 0,
+  "client": "Cliente contrato",
+  "whatsapp": "",
+  "observations": "Solo integración aislada",
+  "jobs": [
+    {
+      "client_job_id": "shared-job-1",
+      "product_code": "fixture-code",
+      "variant_code": "",
+      "material": "Producto fixture",
+      "size": "5cm",
+      "quantity": 10,
+      "unit_kind": "item",
+      "notes": "",
+      "designs": []
+    },
+    {
+      "client_job_id": "shared-job-2",
+      "product_code": "fixture-code",
+      "variant_code": "",
+      "material": "Producto fixture",
+      "size": "5cm",
+      "quantity": 2,
+      "unit_kind": "sheet",
+      "notes": "",
+      "designs": []
+    }
+  ]
+}

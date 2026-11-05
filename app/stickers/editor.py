@@ -1,6 +1,7 @@
 """Interfaz de cola, revisión y aprobación para crear stickers."""
 from __future__ import annotations
 import json
+import inspect
 import math
 import threading
 import time
@@ -8,9 +9,13 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, ttk
 from app.indexer.scanner import IMAGE_EXTENSIONS
-from app.stickers.pipeline import ProcessingProfile, ProcessingResult, StickerProcessor
+from app.stickers.pipeline import (
+    ProcessingProfile, ProcessingResult, StickerProcessor,
+    ProcessingCancelled,
+    VISUAL_STICKER_TYPES, VISUAL_STICKER_TYPE_IDS_BY_LABEL,
+)
 from app.stickers.profile_editor import ProcessingProfileEditor
-from app.ui.theme import COLORS, IDENTITY_FONT, UI_FONT
+from app.ui.theme import COLORS, IDENTITY_FONT, UI_FONT, apply_ttk_theme
 
 
 def _fit_window_to_screen(window, default_width, default_height, min_width, min_height,
@@ -70,6 +75,50 @@ def _build_superposition_image(original_path, mask_path):
     return result_img
 
 
+def make_checkerboard_preview(image, tile_size=12):
+    """Crea una vista previa con patrón cuadriculado para mostrar transparencia."""
+    from PIL import Image, ImageDraw
+    
+    rgba = image.convert("RGBA")
+    width, height = rgba.size
+
+    checker = Image.new("RGBA", (width, height), (238, 238, 238, 255))
+    draw = ImageDraw.Draw(checker)
+
+    secondary = (205, 205, 205, 255)
+
+    for y in range(0, height, tile_size):
+        for x in range(0, width, tile_size):
+            if (x // tile_size + y // tile_size) % 2:
+                draw.rectangle(
+                    (x, y, min(x + tile_size - 1, width - 1), min(y + tile_size - 1, height - 1)),
+                    fill=secondary,
+                )
+
+    checker.alpha_composite(rgba)
+    return checker.convert("RGB")
+
+
+def make_white_background_preview(image):
+    """Crea una vista previa con fondo blanco para mostrar transparencia."""
+    from PIL import Image
+    
+    rgba = image.convert("RGBA")
+    background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+    background.alpha_composite(rgba)
+    return background.convert("RGB")
+
+
+def make_black_background_preview(image):
+    """Crea una vista previa con fondo negro para mostrar transparencia."""
+    from PIL import Image
+    
+    rgba = image.convert("RGBA")
+    background = Image.new("RGBA", rgba.size, (17, 19, 20, 255))
+    background.alpha_composite(rgba)
+    return background.convert("RGB")
+
+
 class AreaSelectionEditor(tk.Toplevel):
     """Recorte rectangular no destructivo para fotos, capturas y publicaciones."""
 
@@ -91,11 +140,13 @@ class AreaSelectionEditor(tk.Toplevel):
         self.image_item = None
         self.display_scale = 1.0
         self.display_offset = (0, 0)
+        self.zoom = 1.0
         self.drag_start = None
         self.drag_start_image = None
         self.selection_action = None
         self.selection_handle = None
         self.selection_box = None
+        self.selection_angle = tk.DoubleVar(value=0.0)
         self.selection_item = None
         self.selection_handle_items = []
         self._build()
@@ -122,48 +173,91 @@ class AreaSelectionEditor(tk.Toplevel):
                  font=(IDENTITY_FONT, 14, "bold")).pack(anchor="w")
         tk.Label(
             title,
-            text="Arrastrá sobre la foto para conservar solamente esa zona. El archivo original no cambia.",
+            text="Arrastrá sobre la foto: se conservará esa zona íntegra y el borde se agregará solo alrededor de ella.",
             background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 9),
         ).pack(anchor="w", pady=(2, 0))
         ttk.Button(header, text="Cancelar", command=self.destroy,
                    style="Secondary.TButton").pack(side="right", padx=(3, 10), pady=10)
         ttk.Button(header, text="Usar imagen completa", command=self.use_full_image,
                    style="Secondary.TButton").pack(side="right", padx=3, pady=10)
-        ttk.Button(header, text="Extraer silueta", command=lambda: self.confirm_selection("silhouette"),
+        ttk.Button(header, text="Aplicar borde a selección", command=lambda: self.confirm_selection("selection"),
                    style="Primary.TButton").pack(side="right", padx=3, pady=10)
-        ttk.Button(header, text="Guardar selección", command=lambda: self.confirm_selection("selection"),
-                   style="Secondary.TButton").pack(side="right", padx=3, pady=10)
 
+        rotation = tk.Frame(self, background=COLORS.panel)
+        rotation.pack(fill="x", padx=12, pady=(0, 8))
+        tk.Label(rotation, text="Rotación libre", background=COLORS.panel,
+                 foreground=COLORS.text, font=(UI_FONT, 9, "bold")).pack(side="left", padx=(12, 8), pady=7)
+        self.rotation_value = tk.Label(rotation, text="0°", width=6,
+                                       background=COLORS.panel, foreground=COLORS.muted,
+                                       font=(UI_FONT, 9))
+        self.rotation_value.pack(side="right", padx=(4, 12))
+        ttk.Button(rotation, text="Restablecer", command=self.reset_rotation,
+                   style="Secondary.TButton").pack(side="right", padx=4, pady=4)
+        self.rotation_scale = tk.Scale(
+            rotation, from_=-180, to=180, resolution=1, orient="horizontal",
+            showvalue=False, variable=self.selection_angle, command=self.update_rotation,
+            background=COLORS.panel, foreground=COLORS.text, troughcolor=COLORS.border,
+            highlightthickness=0, borderwidth=0,
+        )
+        self.rotation_scale.pack(side="left", fill="x", expand=True, padx=(0, 10), pady=2)
+
+        view = tk.Frame(self, background=COLORS.background)
+        view.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         self.canvas = tk.Canvas(
-            self, background="#0d0f10", highlightthickness=1,
+            view, background="#0d0f10", highlightthickness=1,
             highlightbackground=COLORS.border, cursor="crosshair",
         )
-        self.canvas.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        vert = ttk.Scrollbar(view, orient="vertical", command=self.canvas.yview)
+        horz = ttk.Scrollbar(view, orient="horizontal", command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=vert.set, xscrollcommand=horz.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        vert.grid(row=0, column=1, sticky="ns")
+        horz.grid(row=1, column=0, sticky="ew")
+        view.grid_rowconfigure(0, weight=1)
+        view.grid_columnconfigure(0, weight=1)
         self.canvas.bind("<Configure>", lambda _event: self.render())
         self.canvas.bind("<ButtonPress-1>", self.start_selection)
         self.canvas.bind("<B1-Motion>", self.update_selection)
         self.canvas.bind("<ButtonRelease-1>", self.finish_selection)
+        self.canvas.bind("<MouseWheel>", lambda e: self.canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+        self.canvas.bind("<Shift-MouseWheel>", lambda e: self.canvas.xview_scroll(-1 if e.delta > 0 else 1, "units"))
+        self.canvas.bind("<Control-MouseWheel>", self.zoom_with_wheel)
         self.bind("<Escape>", lambda _event: self.destroy())
+
+    def zoom_with_wheel(self, event):
+        factor = 1.18 if event.delta > 0 else 1 / 1.18
+        self.zoom = min(6.0, max(0.35, self.zoom * factor))
+        self.render()
+        return "break"
+
+    def update_rotation(self, value):
+        angle = float(value)
+        self.rotation_value.configure(text=f"{angle:.0f}°")
+        self._draw_selection()
+
+    def reset_rotation(self):
+        self.selection_angle.set(0.0)
+        self.update_rotation(0.0)
 
     def render(self):
         from PIL import Image, ImageTk
 
         available_w = max(100, self.canvas.winfo_width() - 32)
         available_h = max(100, self.canvas.winfo_height() - 32)
-        self.display_scale = min(available_w / self.original.width, available_h / self.original.height)
+        fit_scale = min(available_w / self.original.width, available_h / self.original.height)
+        self.display_scale = fit_scale * self.zoom
         size = (
             max(1, round(self.original.width * self.display_scale)),
             max(1, round(self.original.height * self.display_scale)),
         )
         preview = self.original.resize(size, Image.Resampling.LANCZOS)
         self.photo = ImageTk.PhotoImage(preview)
-        offset_x = max(8, (self.canvas.winfo_width() - size[0]) // 2)
-        offset_y = max(8, (self.canvas.winfo_height() - size[1]) // 2)
-        self.display_offset = (offset_x, offset_y)
+        self.display_offset = (0, 0)
         self.canvas.delete("all")
         self.selection_item = None
         self.selection_handle_items = []
-        self.image_item = self.canvas.create_image(offset_x, offset_y, anchor="nw", image=self.photo)
+        self.image_item = self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
+        self.canvas.configure(scrollregion=(0, 0, size[0], size[1]))
         if self.selection_box:
             self._draw_selection()
 
@@ -239,8 +333,8 @@ class AreaSelectionEditor(tk.Toplevel):
             self.selection_handle_items = []
 
     def _draw_selection(self):
-        self._clear_selection_items()
         if not self.selection_box:
+            self._clear_selection_items()
             return
         x1, y1, x2, y2 = self.selection_box
         offset_x, offset_y = self.display_offset
@@ -250,9 +344,24 @@ class AreaSelectionEditor(tk.Toplevel):
             offset_x + x2 * self.display_scale,
             offset_y + y2 * self.display_scale,
         )
-        self.selection_item = self.canvas.create_rectangle(
-            *coords, outline=COLORS.wine_active, width=3, dash=(8, 4)
-        )
+        # Dibujar la selección con el ángulo elegido para que la vista previa
+        # coincida con el recorte que se guardará.
+        x1c, y1c, x2c, y2c = coords
+        cx, cy = (x1c + x2c) / 2, (y1c + y2c) / 2
+        angle = math.radians(float(self.selection_angle.get()))
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+        polygon = []
+        for px, py in ((x1c, y1c), (x2c, y1c), (x2c, y2c), (x1c, y2c)):
+            dx, dy = px - cx, py - cy
+            polygon.extend((cx + dx * cos_a - dy * sin_a,
+                            cy + dx * sin_a + dy * cos_a))
+        if self.selection_item is None:
+            self.selection_item = self.canvas.create_polygon(
+                *polygon, outline=COLORS.wine_active, fill="", width=3,
+                dash=(8, 4)
+            )
+        else:
+            self.canvas.coords(self.selection_item, *polygon)
         self._draw_selection_handles()
 
     def _draw_selection_handles(self):
@@ -262,6 +371,7 @@ class AreaSelectionEditor(tk.Toplevel):
         offset_x, offset_y = self.display_offset
         size = 10
         half = size // 2
+        handle_coordinates = []
         for cx, cy in ((x1, y1), (x2, y1), (x1, y2), (x2, y2)):
             canvas_coords = (
                 offset_x + cx * self.display_scale - half,
@@ -269,11 +379,20 @@ class AreaSelectionEditor(tk.Toplevel):
                 offset_x + cx * self.display_scale + half,
                 offset_y + cy * self.display_scale + half,
             )
-            handle = self.canvas.create_rectangle(
-                *canvas_coords, fill=COLORS.wine_active,
-                outline=COLORS.panel, width=1,
-            )
-            self.selection_handle_items.append(handle)
+            handle_coordinates.append(canvas_coords)
+        if len(self.selection_handle_items) == len(handle_coordinates):
+            for handle, canvas_coords in zip(self.selection_handle_items, handle_coordinates):
+                self.canvas.coords(handle, *canvas_coords)
+        else:
+            for handle in self.selection_handle_items:
+                self.canvas.delete(handle)
+            self.selection_handle_items = [
+                self.canvas.create_rectangle(
+                    *canvas_coords, fill=COLORS.wine_active,
+                    outline=COLORS.panel, width=1,
+                )
+                for canvas_coords in handle_coordinates
+            ]
 
     def _clip_box_to_bounds(self, x1, y1, x2, y2):
         min_x = min(x1, x2)
@@ -317,12 +436,29 @@ class AreaSelectionEditor(tk.Toplevel):
             return
         self.grab_release()
         self.destroy()
-        self.on_selected(self.selection_box, self.original.copy(), mode)
+        self._notify_selected(
+            self.selection_box, self.original.copy(), mode,
+            float(self.selection_angle.get()),
+        )
+
+    def _notify_selected(self, box, image, mode, angle):
+        """Notifica con ángulo y conserva callbacks antiguos de tres args."""
+        try:
+            parameters = inspect.signature(self.on_selected).parameters.values()
+            accepts_angle = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in parameters) or len(
+                [p for p in parameters if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+            ) >= 4
+        except (TypeError, ValueError):
+            accepts_angle = True
+        if accepts_angle:
+            self.on_selected(box, image, mode, angle)
+        else:
+            self.on_selected(box, image, mode)
 
     def use_full_image(self):
         self.grab_release()
         self.destroy()
-        self.on_selected(None, None, "full")
+        self._notify_selected(None, None, "full", 0.0)
 
 
 class ProtectionZoneEditor(tk.Toplevel):
@@ -359,6 +495,7 @@ class ProtectionZoneEditor(tk.Toplevel):
         self._live_rect     = None   # ítem canvas del rect en curso
         self.display_scale  = 1.0
         self.display_offset = (0, 0)
+        self.zoom           = 1.0
         self._photo_base    = None   # foto base sin overlay
         self._photo_overlay = None   # foto con overlay renderizado
 
@@ -412,16 +549,28 @@ class ProtectionZoneEditor(tk.Toplevel):
                  background=COLORS.panel, foreground=COLORS.wine_active,
                  font=(UI_FONT, 9, "bold")).pack(side="right", padx=12)
 
+        view = tk.Frame(self, background=COLORS.background)
+        view.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         self._canvas = tk.Canvas(
-            self, background="#0d0f10",
+            view, background="#0d0f10",
             highlightthickness=1, highlightbackground=COLORS.border,
             cursor="crosshair",
         )
-        self._canvas.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        vert = ttk.Scrollbar(view, orient="vertical", command=self._canvas.yview)
+        horz = ttk.Scrollbar(view, orient="horizontal", command=self._canvas.xview)
+        self._canvas.configure(yscrollcommand=vert.set, xscrollcommand=horz.set)
+        self._canvas.grid(row=0, column=0, sticky="nsew")
+        vert.grid(row=0, column=1, sticky="ns")
+        horz.grid(row=1, column=0, sticky="ew")
+        view.grid_rowconfigure(0, weight=1)
+        view.grid_columnconfigure(0, weight=1)
         self._canvas.bind("<Configure>", lambda _e: self._render())
         self._canvas.bind("<ButtonPress-1>",   self._on_press)
         self._canvas.bind("<B1-Motion>",       self._on_drag)
         self._canvas.bind("<ButtonRelease-1>", self._on_release)
+        self._canvas.bind("<MouseWheel>", lambda e: self._canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+        self._canvas.bind("<Shift-MouseWheel>", lambda e: self._canvas.xview_scroll(-1 if e.delta > 0 else 1, "units"))
+        self._canvas.bind("<Control-MouseWheel>", self.zoom_with_wheel)
         self.bind("<Control-z>", lambda _e: self._undo())
         self.bind("<Escape>",    lambda _e: self.destroy())
 
@@ -442,19 +591,24 @@ class ProtectionZoneEditor(tk.Toplevel):
 
     # ── Render ────────────────────────────────────────────────────────────
 
+    def zoom_with_wheel(self, event):
+        factor = 1.18 if event.delta > 0 else 1 / 1.18
+        self.zoom = min(6.0, max(0.35, self.zoom * factor))
+        self._render()
+        return "break"
+
     def _render(self):
         from PIL import Image, ImageDraw, ImageTk
 
         cw = max(100, self._canvas.winfo_width()  - 32)
         ch = max(100, self._canvas.winfo_height() - 32)
-        self.display_scale = min(cw / self._original.width,
-                                 ch / self._original.height)
+        fit_scale = min(cw / self._original.width,
+                        ch / self._original.height)
+        self.display_scale = fit_scale * self.zoom
         sw = max(1, round(self._original.width  * self.display_scale))
         sh = max(1, round(self._original.height * self.display_scale))
 
-        ox = max(8, (self._canvas.winfo_width()  - sw) // 2)
-        oy = max(8, (self._canvas.winfo_height() - sh) // 2)
-        self.display_offset = (ox, oy)
+        self.display_offset = (0, 0)
 
         # Base: imagen escalada sobre fondo oscuro
         base = Image.new("RGBA", (sw, sh), "#111314")
@@ -479,8 +633,9 @@ class ProtectionZoneEditor(tk.Toplevel):
         self._photo_overlay = ImageTk.PhotoImage(base)
         self._canvas.delete("all")
         self._live_rect = None
-        self._canvas.create_image(ox, oy, anchor="nw",
+        self._canvas.create_image(0, 0, anchor="nw",
                                   image=self._photo_overlay)
+        self._canvas.configure(scrollregion=(0, 0, sw, sh))
         self._update_counter()
 
     def _update_counter(self):
@@ -502,12 +657,13 @@ class ProtectionZoneEditor(tk.Toplevel):
         x2, y2 = self._canvas_to_image(event.x, event.y)
         cx1, cy1 = self._image_to_canvas(min(x1,x2), min(y1,y2))
         cx2, cy2 = self._image_to_canvas(max(x1,x2), max(y1,y2))
-        if self._live_rect:
-            self._canvas.delete(self._live_rect)
-        self._live_rect = self._canvas.create_rectangle(
-            cx1, cy1, cx2, cy2,
-            outline=self._OUTLINE, width=2, dash=(6, 3),
-        )
+        if self._live_rect is None:
+            self._live_rect = self._canvas.create_rectangle(
+                cx1, cy1, cx2, cy2,
+                outline=self._OUTLINE, width=2, dash=(6, 3),
+            )
+        else:
+            self._canvas.coords(self._live_rect, cx1, cy1, cx2, cy2)
 
     def _on_release(self, event):
         if not self._drag_start:
@@ -552,7 +708,16 @@ class ProtectionZoneEditor(tk.Toplevel):
 class MaskEditor(tk.Toplevel):
     """Edición no destructiva: silueta, pincel, cuentagotas y zoom."""
 
-    def __init__(self, master, original_path, mask_path, on_saved):
+    _VIEW_LEGENDS = {
+        "Superposición": (
+            "Verde = se conserva · rojo = se quita · el color original permanece como referencia."
+        ),
+        "Máscara": "Blanco = se conserva · negro = transparencia. Esta vista no muestra el diseño.",
+        "Original": "Referencia original: esta vista no aplica la máscara.",
+        "Recorte": "Vista del recorte actual sobre el fondo elegido; el borde final se genera al reprocesar.",
+    }
+
+    def __init__(self, master, original_path, mask_path, on_saved, *, editing_target="mask"):
         super().__init__(master)
         from PIL import Image
 
@@ -563,12 +728,25 @@ class MaskEditor(tk.Toplevel):
         self.original_path = Path(original_path)
         self.mask_path = Path(mask_path)
         self.on_saved = on_saved
+        self.editing_target = editing_target
         with Image.open(self.original_path) as source:
             self.original = source.convert("RGBA")
         with Image.open(self.mask_path) as source:
-            self.mask = source.convert("L").resize(self.original.size, Image.Resampling.LANCZOS)
+            # Usar NEAREST para mantener la precisión de la máscara al redimensionar
+            self.mask = source.convert("L").resize(self.original.size, Image.Resampling.NEAREST)
+        # La máscara se guarda sobre el artefacto de trabajo al confirmar. Esta
+        # copia permite volver al estado con el que se abrió el editor sin tocar
+        # ningún archivo hasta que el usuario aplique los cambios.
+        self._opened_mask = self.mask.copy()
         self.mode = tk.StringVar(value="erase")
         self.brush = tk.IntVar(value=36)
+        self.brush_label = tk.StringVar(value="36 px")
+        self.lasso_action = tk.StringVar(value="Quitar")
+        self.preview_mode = tk.StringVar(value="Superposición")
+        self.preview_background = tk.StringVar(value="Cuadriculado")
+        self.preview_legend = tk.StringVar()
+        self.zoom_label = tk.StringVar(value="Ajustar")
+        self._lasso_points: list[tuple[float, float]] = []
         self.brush_color = "#ffffff"
         self.zoom = 1.0
         self.image_modified = False
@@ -576,27 +754,81 @@ class MaskEditor(tk.Toplevel):
         self.display_scale = 1.0
         self._render_after = None
         self._undo_stack: list[dict] = []
+        self._redo_stack: list[dict] = []
         self._active_stroke: dict | None = None
         self._build()
+        self.preview_mode.trace_add("write", self._preview_options_changed)
+        self.preview_background.trace_add("write", self._preview_options_changed)
+        self._update_preview_legend()
         self.after_idle(self.render)
 
     def _build(self):
         bar = tk.Frame(self, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
         bar.pack(fill="x", padx=12, pady=12)
-        tk.Label(bar, text="MODIFICAR STICKER", background=COLORS.panel, foreground=COLORS.text,
-                 font=(IDENTITY_FONT, 13, "bold")).pack(side="left", padx=12)
-        ttk.Radiobutton(bar, text="Quitar", value="erase", variable=self.mode).pack(side="left", padx=(20, 4), pady=10)
-        ttk.Radiobutton(bar, text="Recuperar", value="restore", variable=self.mode).pack(side="left", padx=4, pady=10)
-        ttk.Radiobutton(bar, text="Pincel", value="paint", variable=self.mode).pack(side="left", padx=4, pady=10)
-        ttk.Button(bar, text="Cuentagotas", command=lambda *a, _fn=(lambda: self.mode.set("eyedropper")): _fn(),).pack(side="left", padx=(8, 3))
-        self.color_button = tk.Button(bar, text="   ", background=self.brush_color, activebackground=self.brush_color,
+        title_row = tk.Frame(bar, background=COLORS.panel)
+        title_row.pack(fill="x", padx=12, pady=(8, 2))
+        tk.Label(title_row, text="MODIFICAR STICKER", background=COLORS.panel, foreground=COLORS.text,
+                 font=(IDENTITY_FONT, 13, "bold")).pack(side="left")
+        tk.Label(
+            title_row,
+            text="La máscara se edita sobre una copia hasta aplicar.",
+            background=COLORS.panel,
+            foreground=COLORS.muted,
+            font=(UI_FONT, 9),
+        ).pack(side="right")
+
+        # Separar las herramientas de la vista evita que una ventana angosta
+        # oculte los controles más importantes.
+        tools_row = tk.Frame(bar, background=COLORS.panel)
+        tools_row.pack(fill="x", padx=12, pady=(2, 2))
+        ttk.Radiobutton(tools_row, text="Quitar", value="erase", variable=self.mode).pack(side="left", padx=(0, 4), pady=3)
+        ttk.Radiobutton(tools_row, text="Recuperar", value="restore", variable=self.mode).pack(side="left", padx=4, pady=3)
+        ttk.Radiobutton(tools_row, text="Pincel", value="paint", variable=self.mode).pack(side="left", padx=4, pady=3)
+        ttk.Radiobutton(tools_row, text="Lazo", value="lasso", variable=self.mode).pack(side="left", padx=4, pady=3)
+        ttk.Radiobutton(tools_row, text="Lazo poligonal", value="polygon_lasso", variable=self.mode).pack(side="left", padx=4, pady=3)
+
+        brush_row = tk.Frame(bar, background=COLORS.panel)
+        brush_row.pack(fill="x", padx=12, pady=(0, 2))
+        ttk.Combobox(brush_row, textvariable=self.lasso_action, values=("Quitar", "Recuperar"),
+                     state="readonly", width=10).pack(side="left", padx=(0, 6))
+        ttk.Button(brush_row, text="Cuentagotas", command=lambda: self.mode.set("eyedropper")).pack(side="left", padx=(0, 5))
+        self.color_button = tk.Button(brush_row, text="   ", background=self.brush_color, activebackground=self.brush_color,
                           command=lambda *a, _fn=self.choose_color: _fn(*a), relief="flat", cursor="hand2")
         self.color_button.pack(side="left", padx=3)
-        tk.Label(bar, text="Pincel", background=COLORS.panel, foreground=COLORS.muted).pack(side="left", padx=(18, 4))
-        ttk.Scale(bar, from_=6, to=140, variable=self.brush, orient="horizontal", length=140).pack(side="left")
-        ttk.Button(bar, text="Guardar y reprocesar", command=lambda *a, _fn=self.save: _fn(*a), style="Primary.TButton").pack(side="right", padx=10)
-        ttk.Button(bar, text="Cancelar", command=lambda *a, _fn=self.destroy: _fn(*a), style="Secondary.TButton").pack(side="right")
-        ttk.Button(bar, text="Deshacer", command=lambda *a, _fn=self.undo: _fn(*a), style="Secondary.TButton").pack(side="right", padx=6)
+        tk.Label(brush_row, text="Pincel", background=COLORS.panel, foreground=COLORS.muted).pack(side="left", padx=(12, 4))
+        ttk.Scale(brush_row, from_=6, to=140, variable=self.brush, orient="horizontal", length=105).pack(side="left")
+        tk.Label(brush_row, textvariable=self.brush_label, background=COLORS.panel,
+                 foreground=COLORS.muted, width=6, anchor="e").pack(side="left", padx=(4, 10))
+        self.brush.trace_add("write", self._refresh_brush_label)
+
+        preview_row = tk.Frame(bar, background=COLORS.panel)
+        preview_row.pack(fill="x", padx=12, pady=(0, 2))
+        tk.Label(preview_row, text="Vista", background=COLORS.panel, foreground=COLORS.muted).pack(side="left", padx=(0, 4))
+        preview_mode = ttk.Combobox(
+            preview_row,
+            textvariable=self.preview_mode,
+            values=("Superposición", "Máscara", "Original", "Recorte"),
+            state="readonly",
+            width=13,
+        )
+        preview_mode.pack(side="left", padx=(0, 10))
+        tk.Label(preview_row, text="Fondo", background=COLORS.panel, foreground=COLORS.muted).pack(side="left", padx=(0, 4))
+        preview_background = ttk.Combobox(
+            preview_row,
+            textvariable=self.preview_background,
+            values=("Cuadriculado", "Blanco", "Negro"),
+            state="readonly",
+            width=12,
+        )
+        preview_background.pack(side="left", padx=(0, 12))
+        ttk.Button(preview_row, text="−", width=3, command=self.zoom_out).pack(side="left")
+        ttk.Button(preview_row, text="Ajustar", command=self.fit_to_screen).pack(side="left", padx=(3, 0))
+        ttk.Button(preview_row, text="100 %", command=self.actual_size).pack(side="left", padx=(3, 0))
+        ttk.Button(preview_row, text="+", width=3, command=self.zoom_in).pack(side="left", padx=(3, 0))
+        tk.Label(preview_row, textvariable=self.zoom_label, background=COLORS.panel,
+                 foreground=COLORS.muted, width=7, anchor="e").pack(side="left", padx=(5, 0))
+        tk.Label(bar, textvariable=self.preview_legend, background=COLORS.panel,
+                 foreground=COLORS.muted, font=(UI_FONT, 8), anchor="w").pack(fill="x", padx=12, pady=(0, 7))
         view = tk.Frame(self, background=COLORS.background)
         view.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         self.canvas = tk.Canvas(view, background="#111314", highlightthickness=1, highlightbackground=COLORS.border, cursor="crosshair")
@@ -612,12 +844,39 @@ class MaskEditor(tk.Toplevel):
         self.canvas.bind("<ButtonPress-1>", self.begin_stroke)
         self.canvas.bind("<B1-Motion>", self.continue_stroke)
         self.canvas.bind("<ButtonRelease-1>", self.end_stroke)
+        self.canvas.bind("<Double-Button-1>", self.finish_polygon_lasso)
+        self.canvas.bind("<Button-3>", self.remove_polygon_point)
         self.canvas.bind("<Control-MouseWheel>", self.zoom_with_wheel)
         self.canvas.bind("<MouseWheel>", lambda event: self.canvas.yview_scroll(-1 if event.delta > 0 else 1, "units"))
         self.canvas.bind("<Shift-MouseWheel>", lambda event: self.canvas.xview_scroll(-1 if event.delta > 0 else 1, "units"))
         self.bind("<Control-z>", self.undo)
         self.bind("<Control-Z>", self.undo)
+        self.bind("<Control-y>", self.redo)
+        self.bind("<Control-Shift-Z>", self.redo)
+        self.bind("<KeyPress>", self._handle_shortcut, add="+")
+        self.bind("<Return>", self.finish_polygon_lasso)
+        self.bind("<BackSpace>", self.remove_polygon_point)
         self.bind("<Escape>", lambda _event: self.destroy())
+
+        # Las acciones se separan de las herramientas para que no queden
+        # truncadas cuando la ventana es angosta y el reprocesado sea evidente.
+        footer = tk.Frame(self, background=COLORS.background)
+        footer.pack(fill="x", padx=12, pady=(0, 12))
+        tk.Label(footer, text="Los cambios se aplican sobre una copia y se reprocesan al confirmar.",
+                 background=COLORS.background, foreground=COLORS.muted, font=(UI_FONT, 9)).pack(side="left")
+        ttk.Button(footer, text="Cancelar", command=self.destroy,
+                   style="Secondary.TButton").pack(side="right")
+        ttk.Button(footer, text="Aplicar y reprocesar", command=self.save,
+                   style="Primary.TButton").pack(side="right", padx=(0, 8))
+        ttk.Button(footer, text="Deshacer", command=self.undo,
+                   style="Secondary.TButton").pack(side="right", padx=(0, 8))
+        ttk.Button(footer, text="Rehacer", command=self.redo,
+                   style="Secondary.TButton").pack(side="right", padx=(0, 8))
+        ttk.Button(footer, text="Restaurar al abrir", command=self.restore_opened_mask,
+                   style="Secondary.TButton").pack(side="right", padx=(0, 8))
+
+    def _refresh_brush_label(self, *_):
+        self.brush_label.set(f"{int(float(self.brush.get()))} px")
 
     def choose_color(self):
         chosen = colorchooser.askcolor(self.brush_color, parent=self, title="Color del pincel")[1]
@@ -626,44 +885,195 @@ class MaskEditor(tk.Toplevel):
             self.color_button.configure(background=chosen, activebackground=chosen)
             self.mode.set("paint")
 
-    def zoom_with_wheel(self, event):
-        factor = 1.18 if event.delta > 0 else 1 / 1.18
-        self.zoom = min(6.0, max(0.35, self.zoom * factor))
-        self.render()
-        return "break"
+    def _preview_options_changed(self, *_):
+        self._update_preview_legend()
+        self.request_render()
 
-    def render(self):
-        from PIL import Image, ImageTk
+    def _update_preview_legend(self):
+        self.preview_legend.set(self._VIEW_LEGENDS.get(self.preview_mode.get(), ""))
 
+    def _fit_scale(self):
         width = max(100, self.canvas.winfo_width() - 20)
         height = max(100, self.canvas.winfo_height() - 20)
-        fit_scale = min(width / self.original.width, height / self.original.height, 1.0)
-        self.display_scale = fit_scale * self.zoom
-        size = (max(1, round(self.original.width * self.display_scale)), max(1, round(self.original.height * self.display_scale)))
-        image = self.original.resize(size, Image.Resampling.LANCZOS)
-        mask = self.mask.resize(size, Image.Resampling.NEAREST)
-        retained = image.copy()
-        retained.putalpha(mask)
-        preview = Image.new("RGBA", size, (34, 36, 38, 255))
-        preview.alpha_composite(retained)
-        self.photo = ImageTk.PhotoImage(preview)
-        self.canvas.delete("all")
-        self.canvas.create_image(10, 10, anchor="nw", image=self.photo)
-        self.canvas.create_text(18, size[1] + 28, anchor="sw", fill=COLORS.muted,
-                                text="Ctrl + Z: deshacer · Ctrl + rueda: zoom · rueda: desplazar · se trabaja sobre una copia.")
-        self.canvas.configure(scrollregion=(0, 0, size[0] + 30, size[1] + 45))
+        return min(width / self.original.width, height / self.original.height, 1.0)
 
-    def image_point(self, event):
-        """Convierte la posición visible en un punto de la imagen original."""
-        x = (self.canvas.canvasx(event.x) - 10) / max(self.display_scale, .001)
-        y = (self.canvas.canvasy(event.y) - 10) / max(self.display_scale, .001)
+    def _canvas_point_to_image(self, canvas_x, canvas_y):
+        x = (self.canvas.canvasx(canvas_x) - 10) / max(self.display_scale, .001)
+        y = (self.canvas.canvasy(canvas_y) - 10) / max(self.display_scale, .001)
         if not (0 <= x < self.mask.width and 0 <= y < self.mask.height):
             return None
         return x, y
 
+    def _set_zoom(self, zoom, event=None):
+        if event is None:
+            viewport_x = self.canvas.winfo_width() / 2
+            viewport_y = self.canvas.winfo_height() / 2
+        else:
+            viewport_x, viewport_y = event.x, event.y
+        anchor = self._canvas_point_to_image(viewport_x, viewport_y)
+        self.zoom = min(6.0, max(0.35, zoom))
+        self.render()
+        if anchor is not None:
+            self.after_idle(lambda: self._anchor_zoom(anchor, viewport_x, viewport_y))
+        return "break"
+
+    def _anchor_zoom(self, point, viewport_x, viewport_y):
+        """Mantiene visible el punto que estaba bajo el cursor al cambiar el zoom."""
+        if not self.winfo_exists():
+            return
+        region = self.canvas.bbox("all")
+        if not region:
+            return
+        content_width = region[2] - region[0]
+        content_height = region[3] - region[1]
+        max_x = max(1, content_width - self.canvas.winfo_width())
+        max_y = max(1, content_height - self.canvas.winfo_height())
+        desired_x = 10 + point[0] * self.display_scale - viewport_x
+        desired_y = 10 + point[1] * self.display_scale - viewport_y
+        self.canvas.xview_moveto(min(1.0, max(0.0, desired_x / max_x)))
+        self.canvas.yview_moveto(min(1.0, max(0.0, desired_y / max_y)))
+
+    def zoom_in(self):
+        return self._set_zoom(self.zoom * 1.18)
+
+    def zoom_out(self):
+        return self._set_zoom(self.zoom / 1.18)
+
+    def fit_to_screen(self):
+        return self._set_zoom(1.0)
+
+    def actual_size(self):
+        return self._set_zoom(1.0 / max(self._fit_scale(), .001))
+
+    def zoom_with_wheel(self, event):
+        factor = 1.18 if event.delta > 0 else 1 / 1.18
+        return self._set_zoom(self.zoom * factor, event)
+
+    def _apply_preview_background(self, image):
+        """Compone una copia de la vista; nunca modifica el original ni la máscara."""
+        if self.preview_background.get() == "Cuadriculado":
+            return make_checkerboard_preview(image)
+        if self.preview_background.get() == "Blanco":
+            return make_white_background_preview(image)
+        return make_black_background_preview(image)
+
+    def _build_preview_image(self, image, mask):
+        """Construye la vista elegida a partir de las copias ya escaladas."""
+        from PIL import Image, ImageChops, ImageOps
+
+        mode = self.preview_mode.get()
+        if mode == "Máscara":
+            return mask.convert("RGB")
+        if mode == "Original":
+            return self._apply_preview_background(image)
+
+        retained = image.copy()
+        retained.putalpha(mask)
+        if mode == "Recorte":
+            return self._apply_preview_background(retained)
+
+        # Superposición: lo retenido se marca en verde y lo que se quitó del
+        # original se marca en rojo. Las zonas transparentes originales no se
+        # tiñen, para no confundir el fondo real con un borrado manual.
+        preview = self._apply_preview_background(image).convert("RGBA")
+        overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+        overlay.paste((34, 184, 91, 78), mask=mask)
+        removed = ImageChops.multiply(ImageOps.invert(mask), image.getchannel("A"))
+        overlay.paste((220, 66, 66, 145), mask=removed)
+        preview.alpha_composite(overlay)
+        return preview.convert("RGB")
+
+    def render(self):
+        from PIL import Image, ImageTk
+
+        fit_scale = self._fit_scale()
+        self.display_scale = fit_scale * self.zoom
+        size = (max(1, round(self.original.width * self.display_scale)), max(1, round(self.original.height * self.display_scale)))
+        image = self.original.resize(size, Image.Resampling.LANCZOS)
+        mask = self.mask.resize(size, Image.Resampling.NEAREST)
+        if image.mode != "RGBA":
+            image = image.convert("RGBA")
+        preview = self._build_preview_image(image, mask)
+        self.photo = ImageTk.PhotoImage(preview)
+        self.zoom_label.set(f"{round(self.display_scale * 100)} %")
+        self.canvas.delete("all")
+        self.canvas.create_image(10, 10, anchor="nw", image=self.photo)
+        if len(self._lasso_points) > 1:
+            lasso_preview = [
+                coordinate
+                for point in self._lasso_points
+                for coordinate in (10 + point[0] * self.display_scale, 10 + point[1] * self.display_scale)
+            ]
+            self.canvas.create_line(*lasso_preview, fill=COLORS.wine_active, width=2, dash=(4, 3))
+            if self.mode.get() == "polygon_lasso":
+                for x, y in self._lasso_points:
+                    px, py = 10 + x * self.display_scale, 10 + y * self.display_scale
+                    self.canvas.create_oval(px - 3, py - 3, px + 3, py + 3, fill=COLORS.wine_active, outline="")
+        self.canvas.create_text(
+            18,
+            size[1] + 28,
+            anchor="sw",
+            fill=COLORS.muted,
+            text="E quitar · R recuperar · B pincel · L/P lazo · I cuentagotas · Ctrl+Z deshacer · Ctrl+rueda: zoom",
+        )
+        self.canvas.configure(scrollregion=(0, 0, size[0] + 30, size[1] + 45))
+
+    def request_render(self, delay_ms: int = 16):
+        """Limita la vista del pincel/lazo a un repintado por cuadro."""
+        if self._render_after is None:
+            self._render_after = self.after(delay_ms, self._flush_render)
+
+    def _flush_render(self):
+        self._render_after = None
+        if self.winfo_exists():
+            self.render()
+
+    def image_point(self, event):
+        """Convierte la posición visible en un punto de la imagen original."""
+        return self._canvas_point_to_image(event.x, event.y)
+
+    def _handle_shortcut(self, event):
+        """Atajos de herramientas, sin interceptar texto de los combos."""
+        widget = event.widget
+        if isinstance(widget, (tk.Entry, ttk.Combobox)):
+            return None
+        # Dejar que los atajos con modificadores existentes sigan su propio
+        # flujo; en particular no convertir Ctrl+Z en una herramienta.
+        if event.state & 0x0004:
+            return None
+        key = event.keysym.lower()
+        modes = {
+            "e": "erase",
+            "r": "restore",
+            "b": "paint",
+            "l": "lasso",
+            "p": "polygon_lasso",
+            "i": "eyedropper",
+        }
+        if key in modes:
+            self.mode.set(modes[key])
+            return "break"
+        if key in {"plus", "kp_add"}:
+            return self.zoom_in()
+        if key in {"minus", "kp_subtract"}:
+            return self.zoom_out()
+        if key in {"0", "kp_0"}:
+            return self.fit_to_screen()
+        return None
+
     def begin_stroke(self, event):
         point = self.image_point(event)
         if point is None:
+            return
+        if self.mode.get() == "lasso":
+            self._lasso_points = [point]
+            self._active_stroke = None
+            return
+        if self.mode.get() == "polygon_lasso":
+            if not self._lasso_points or math.dist(point, self._lasso_points[-1]) > 1:
+                self._lasso_points.append(point)
+            self._active_stroke = None
+            self.render()
             return
         if self.mode.get() == "eyedropper":
             red, green, blue, _alpha = self.original.getpixel((int(point[0]), int(point[1])))
@@ -678,6 +1088,12 @@ class MaskEditor(tk.Toplevel):
         self.paint_at(*point)
 
     def continue_stroke(self, event):
+        if self.mode.get() == "lasso" and self._lasso_points:
+            point = self.image_point(event)
+            if point is not None:
+                self._lasso_points.append(point)
+                self.request_render()
+            return
         if self._active_stroke is None:
             return
         point = self.image_point(event)
@@ -685,13 +1101,66 @@ class MaskEditor(tk.Toplevel):
             self.paint_at(*point)
 
     def end_stroke(self, _event=None):
+        if self.mode.get() == "lasso" and self._lasso_points:
+            self._apply_lasso()
+            return
         if self._active_stroke is None:
             return
         if self._active_stroke["patches"]:
+            self._redo_stack = []
             self._undo_stack.append(self._active_stroke)
             # Un historial acotado evita cargar en memoria imágenes completas.
             del self._undo_stack[:-30]
         self._active_stroke = None
+
+    def finish_polygon_lasso(self, event=None):
+        """Cierra el lazo de vértices y aplica la acción elegida sobre la máscara."""
+        if self.mode.get() != "polygon_lasso":
+            return
+        point = self.image_point(event) if event is not None else None
+        if point and (not self._lasso_points or math.dist(point, self._lasso_points[-1]) > 1):
+            self._lasso_points.append(point)
+        self._apply_lasso()
+        return "break"
+
+    def remove_polygon_point(self, _event=None):
+        """Permite corregir el último vértice antes de cerrar el polígono."""
+        if self.mode.get() != "polygon_lasso" or not self._lasso_points:
+            return
+        self._lasso_points.pop()
+        self.render()
+        return "break"
+
+    def _apply_lasso(self):
+        """Cierra el lazo y actualiza la máscara dentro del área delimitada."""
+        from PIL import ImageDraw
+
+        points = self._lasso_points
+        self._lasso_points = []
+        if len(points) < 3:
+            self.render()
+            return
+        left = max(0, math.floor(min(x for x, _y in points) - 2))
+        top = max(0, math.floor(min(y for _x, y in points) - 2))
+        right = min(self.mask.width, math.ceil(max(x for x, _y in points) + 2))
+        bottom = min(self.mask.height, math.ceil(max(y for _x, y in points) + 2))
+        if right <= left or bottom <= top:
+            self.render()
+            return
+        self._redo_stack = []
+        self._undo_stack.append({
+            "patches": [{
+                "box": (left, top, right, bottom),
+                "original": self.original.crop((left, top, right, bottom)),
+                "mask": self.mask.crop((left, top, right, bottom)),
+            }],
+            "image_modified_before": self.image_modified,
+        })
+        del self._undo_stack[:-30]
+        ImageDraw.Draw(self.mask).polygon(
+            points, fill=0 if self.lasso_action.get() == "Quitar" else 255,
+        )
+        self.render()
 
     def paint_at(self, x, y):
         from PIL import ImageDraw
@@ -719,9 +1188,34 @@ class MaskEditor(tk.Toplevel):
         else:
             fill = 0 if self.mode.get() == "erase" else 255
             ImageDraw.Draw(self.mask).ellipse((x - radius, y - radius, x + radius, y + radius), fill=fill)
+        self.request_render(delay_ms=24)
+
+    def restore_opened_mask(self, _event=None, *, confirm=True):
+        """Restaura la máscara que estaba cargada al abrir este editor.
+
+        Esto no toca la imagen pintada manualmente: "Pincel" modifica el arte
+        original de trabajo y por eso se conserva de forma explícita.
+        """
+        self.end_stroke()
+        if self.mask.tobytes() == self._opened_mask.tobytes():
+            return "break"
+        if confirm and not messagebox.askyesno(
+            "Restaurar máscara",
+            "Se descartarán los cambios de máscara de esta sesión. "
+            "Los trazos de color del pincel se conservarán.",
+            parent=self,
+        ):
+            return "break"
+        self.mask = self._opened_mask.copy()
+        self._undo_stack.clear()
+        self._redo_stack = []
+        self._active_stroke = None
+        self._lasso_points = []
         if self._render_after:
             self.after_cancel(self._render_after)
-        self._render_after = self.after(24, self.render)
+            self._render_after = None
+        self.render()
+        return "break"
 
     def undo(self, _event=None):
         """Revierte de una vez la última pincelada, recuperación o borrado."""
@@ -729,22 +1223,58 @@ class MaskEditor(tk.Toplevel):
         if not self._undo_stack:
             return "break"
         stroke = self._undo_stack.pop()
+        inverse = {"patches": [], "image_modified_before": self.image_modified}
         for patch in reversed(stroke["patches"]):
+            inverse["patches"].append({
+                "box": patch["box"],
+                "original": self.original.crop(patch["box"]),
+                "mask": self.mask.crop(patch["box"]),
+            })
             left, top, _right, _bottom = patch["box"]
             self.original.paste(patch["original"], (left, top))
             self.mask.paste(patch["mask"], (left, top))
         self.image_modified = stroke["image_modified_before"]
+        if not hasattr(self, "_redo_stack"):
+            self._redo_stack = []
+        self._redo_stack.append(inverse)
         if self._render_after:
             self.after_cancel(self._render_after)
             self._render_after = None
         self.render()
         return "break"
 
+    def redo(self, _event=None):
+        self.end_stroke()
+        if not getattr(self, "_redo_stack", []):
+            return "break"
+        stroke = self._redo_stack.pop()
+        inverse = {"patches": [], "image_modified_before": self.image_modified}
+        for patch in reversed(stroke["patches"]):
+            inverse["patches"].append({
+                "box": patch["box"], "original": self.original.crop(patch["box"]),
+                "mask": self.mask.crop(patch["box"]),
+            })
+            self.original.paste(patch["original"], patch["box"][:2])
+            self.mask.paste(patch["mask"], patch["box"][:2])
+        self.image_modified = stroke["image_modified_before"]
+        self._undo_stack.append(inverse)
+        self.render()
+        return "break"
+
     def save(self):
+        # Asegurar que la máscara esté en modo L y se guarde correctamente
+        if self.mask.mode != "L":
+            self.mask = self.mask.convert("L")
+        # La automática permanece disponible para comparar/restablecer.
+        filename = "cut_manual.png" if getattr(self, "editing_target", "mask") == "cut" else "mask_manual.png"
+        self.mask_path = self.mask_path.with_name(filename)
         self.mask.save(self.mask_path, dpi=(300, 300), optimize=False)
         edited_path = ""
         if self.image_modified:
             edited = self.mask_path.with_name("edicion_manual.png")
+            # Asegurar que la imagen editada esté en modo RGBA con canal alfa correcto
+            if self.original.mode != "RGBA":
+                self.original = self.original.convert("RGBA")
             self.original.save(edited, dpi=(300, 300), optimize=False)
             edited_path = str(edited)
         self.on_saved(str(self.mask_path), edited_path)
@@ -752,16 +1282,21 @@ class MaskEditor(tk.Toplevel):
 
 
 class StickerStudio(tk.Toplevel):
-    def __init__(self, master, database, refresh_callback=None, semantic_analyzer=None):
+    def __init__(self, master, database, refresh_callback=None, semantic_analyzer=None,
+                 target_order_id=None, nominal_size_cm=None):
         super().__init__(master)
         self.database = database
         self.refresh_callback = refresh_callback or (lambda: None)
         self.semantic_analyzer = semantic_analyzer
-        self.title("Creador predictivo de stickers")
+        self.target_order_id = target_order_id  # ID del pedido al que se vincularán los stickers aprobados
+        self.nominal_size_cm = nominal_size_cm
+        self.title("Creador de stickers")
+        # El creador también puede abrirse desde accesos directos o pruebas
+        # aisladas: instala el tema aquí para no depender de la ventana padre.
+        apply_ttk_theme(self)
         _fit_window_to_screen(self, 1240, 790, 980, 650, width_ratio=0.96, height_ratio=0.88)
         self.configure(background=COLORS.background)
-        self.transient(master)
-        self.profile = ProcessingProfile()
+        self.profile = ProcessingProfile(nominal_size_cm=nominal_size_cm)
         workspace = Path(__file__).parents[2] / "work" / "stickers"
         self.processor = StickerProcessor(workspace, self.profile)
         self.inbox = workspace / "inbox"
@@ -771,28 +1306,54 @@ class StickerStudio(tk.Toplevel):
         self.worker: threading.Thread | None = None
         self.cancel_event = threading.Event()
         self.preview_images = []
+        self._candidate_jobs: set[int] = set()
         self.empty_requested = False
         self._paste_worker: threading.Thread | None = None
         self._folder_worker: threading.Thread | None = None
+        self._note_mode = False  # Estado para modo nota (solo cola)
+        self._header_frame = None  # Referencia al header para ocultar/mostrar
+        self._status_strip = None  # Referencia al status strip para ocultar/mostrar
+        self._note_mode_back_btn = None  # Botón para volver al modo completo
+        self._order_info_label = None  # Label para mostrar info del pedido vinculado
         self._build()
         self._load_saved_jobs()
         self.bind("<Control-v>", lambda _event: (self.paste_image(), "break")[1])
         self.bind("<Control-V>", lambda _event: (self.paste_image(), "break")[1])
+        self.bind("<Control-r>", lambda _event: (self.reprocess_current(), "break")[1])
+        self.bind("<Control-R>", lambda _event: (self.reprocess_current(), "break")[1])
         self.protocol("WM_DELETE_WINDOW", self.close)
 
 
     def _build(self):
-        header = tk.Frame(self, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
-        header.pack(fill="x", padx=14, pady=(14, 8))
+        self._header_frame = tk.Frame(self, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
+        self._header_frame.pack(fill="x", padx=14, pady=(14, 8))
+        header = self._header_frame
         title = tk.Frame(header, background=COLORS.panel)
         title.pack(side="left", padx=16, pady=12)
-        tk.Label(title, text="CREADOR PREDICTIVO DE STICKERS", background=COLORS.panel, foreground=COLORS.text,
+        tk.Label(title, text="CREADOR DE STICKERS", background=COLORS.panel, foreground=COLORS.text,
                  font=(IDENTITY_FONT, 18, "bold")).pack(anchor="w")
-        tk.Label(title, text="La aplicación prepara y propone; vos confirmás solamente el resultado final de 5,70 cm.",
-                 background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 9)).pack(anchor="w")
+        
+        # Mostrar información del pedido vinculado si existe
+        subtitle_text = "Procesamiento genérico legacy (maestro 5,70 cm; sin nominal comercial)."
+        if self.target_order_id is not None:
+            try:
+                order = self.database.order(self.target_order_id)
+                client_name = order.get("client") or f"Pedido #{self.target_order_id}"
+                if self.nominal_size_cm is not None:
+                    subtitle_text = (f"🎯 Vinculado a: {client_name} · Nominal: "
+                                     f"{self.nominal_size_cm:.2f} cm · asset preparado al máximo productivo.")
+                else:
+                    subtitle_text = (f"🎯 Vinculado a: {client_name} · Sin tamaño nominal único: "
+                                     "el procesamiento queda en modo legacy y no se vincula automáticamente.")
+            except Exception:
+                subtitle_text = f"🎯 Vinculado a pedido #{self.target_order_id} · Los stickers aprobados se guardarán automáticamente."
+        
+        self._order_info_label = tk.Label(title, text=subtitle_text, background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 9))
+        self._order_info_label.pack(anchor="w")
+        
         actions = tk.Frame(header, background=COLORS.panel)
         actions.pack(side="right", padx=12, pady=8)
-        # Fila superior: agregar archivos + perfil
+        # Fila superior: agregar archivos + perfil + modo nota
         row1 = tk.Frame(actions, background=COLORS.panel)
         row1.pack(anchor="e")
         for text, command, style in (
@@ -800,6 +1361,7 @@ class StickerStudio(tk.Toplevel):
             ("Elegir archivos", self.choose_files, "Secondary.TButton"),
             ("Importar carpeta", self.choose_folder, "Secondary.TButton"),
             ("Perfil", self.open_profile_editor, "Secondary.TButton"),
+            ("📝 Modo Nota", self.toggle_note_mode, "Secondary.TButton"),
         ):
             ttk.Button(row1, text=text, command=command, style=style).pack(side="left", padx=3, pady=(0, 3))
         # Fila inferior: acciones de cola
@@ -813,8 +1375,9 @@ class StickerStudio(tk.Toplevel):
             ttk.Button(row2, text=text, command=command, style=style).pack(side="left", padx=3)
 
         self.progress_value = tk.DoubleVar(value=0)
-        status_strip = tk.Frame(self, background=COLORS.panel_elevated)
-        status_strip.pack(fill="x", padx=14, pady=(0, 8))
+        self._status_strip = tk.Frame(self, background=COLORS.panel_elevated)
+        self._status_strip.pack(fill="x", padx=14, pady=(0, 8))
+        status_strip = self._status_strip
         self.status = tk.StringVar(value="Agregá imágenes para comenzar.")
         tk.Label(status_strip, textvariable=self.status, background=COLORS.panel_elevated, foreground=COLORS.text,
                  font=(UI_FONT, 9), anchor="w").pack(side="left", fill="x", expand=True, padx=12, pady=7)
@@ -835,28 +1398,35 @@ class StickerStudio(tk.Toplevel):
 
         body = tk.PanedWindow(self, orient="horizontal", sashwidth=7, background=COLORS.background, borderwidth=0)
         body.pack(fill="both", expand=True, padx=14, pady=(0, 14))
-        queue_panel = tk.Frame(body, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
-        review_panel = tk.Frame(body, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
-        body.add(queue_panel, minsize=400, width=465)
-        body.add(review_panel, minsize=550)
+        self.queue_panel = tk.Frame(body, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
+        self.review_panel = tk.Frame(body, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
+        self.main_body = body  # Guardar referencia para ocultar/mostrar
+        body.add(self.queue_panel, minsize=400, width=465)
+        body.add(self.review_panel, minsize=550)
 
-        tk.Label(queue_panel, text="COLA DE PROCESAMIENTO", background=COLORS.panel, foreground=COLORS.wine_active,
-                 font=(IDENTITY_FONT, 12, "bold")).pack(anchor="w", padx=12, pady=(12, 7))
+        queue_heading = tk.Frame(self.queue_panel, background=COLORS.panel)
+        queue_heading.pack(fill="x", padx=12, pady=(12, 7))
+        tk.Label(queue_heading, text="COLA DE PROCESAMIENTO", background=COLORS.panel, foreground=COLORS.wine_active,
+                 font=(IDENTITY_FONT, 12, "bold")).pack(side="left")
+        self.queue_summary = tk.StringVar(value="Sin archivos")
+        tk.Label(queue_heading, textvariable=self.queue_summary, background=COLORS.panel,
+                 foreground=COLORS.muted, font=(UI_FONT, 9)).pack(side="right")
         columns = ("archivo", "estado", "motor", "calidad")
-        self.queue = ttk.Treeview(queue_panel, columns=columns, show="headings", selectmode="browse")
+        self.queue = ttk.Treeview(self.queue_panel, columns=columns, show="headings", selectmode="extended")
         for column, label, width in (("archivo", "Archivo", 175), ("estado", "Estado", 105), ("motor", "Motor", 75), ("calidad", "Calidad", 80)):
             self.queue.heading(column, text=label)
             self.queue.column(column, width=width, anchor="w")
-        scrollbar = ttk.Scrollbar(queue_panel, orient="vertical", command=lambda *a, _fn=self.queue.yview: _fn(*a))
+        scrollbar = ttk.Scrollbar(self.queue_panel, orient="vertical", command=lambda *a, _fn=self.queue.yview: _fn(*a))
         self.queue.configure(yscrollcommand=scrollbar.set)
         self.queue.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=(0, 10))
         scrollbar.pack(side="right", fill="y", padx=(0, 10), pady=(0, 10))
         self.queue.bind("<<TreeviewSelect>>", self.select_job)
         self.queue.bind("<Double-Button-1>", self.open_decision_dialog)
+        self.queue.bind("<Button-3>", self._show_queue_context_menu)
         self.queue.bind("<Delete>", self._delete_selected_job)
         self.queue.bind("<BackSpace>", self._delete_selected_job)
 
-        review_header = tk.Frame(review_panel, background=COLORS.panel)
+        review_header = tk.Frame(self.review_panel, background=COLORS.panel)
         review_header.pack(fill="x", padx=12, pady=(10, 6))
         tk.Label(review_header, text="STICKER FINAL", background=COLORS.panel, foreground=COLORS.wine_active,
                  font=(IDENTITY_FONT, 12, "bold")).pack(side="left")
@@ -864,7 +1434,37 @@ class StickerStudio(tk.Toplevel):
         tk.Label(review_header, textvariable=self.review_state, background=COLORS.panel, foreground=COLORS.muted,
                  font=(UI_FONT, 9)).pack(side="right")
 
-        final_card = tk.Frame(review_panel, background=COLORS.panel_elevated, highlightthickness=1, highlightbackground=COLORS.border)
+        # Canvas con scrollbar para el contenido del panel de revisión
+        review_canvas_container = tk.Frame(self.review_panel, background=COLORS.panel)
+        review_canvas_container.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        
+        self._review_canvas = tk.Canvas(review_canvas_container, background=COLORS.panel, highlightthickness=0)
+        review_scrollbar = ttk.Scrollbar(review_canvas_container, orient="vertical", command=self._review_canvas.yview)
+        self._review_canvas.configure(yscrollcommand=review_scrollbar.set)
+        
+        self._review_canvas.pack(side="left", fill="both", expand=True)
+        review_scrollbar.pack(side="right", fill="y")
+        
+        review_content_frame = tk.Frame(self._review_canvas, background=COLORS.panel)
+        self._review_canvas.create_window(0, 0, window=review_content_frame, anchor="nw")
+        review_content_frame.bind("<Configure>", lambda e: self._review_canvas.configure(scrollregion=self._review_canvas.bbox("all")))
+        
+        # Bind mousewheel directly to canvas and all children to ensure events are captured
+        self._review_canvas.bind("<MouseWheel>", self._on_studio_mousewheel)
+        self._review_canvas.bind("<Button-4>", self._on_studio_mousewheel_linux)
+        self._review_canvas.bind("<Button-5>", self._on_studio_mousewheel_linux)
+        
+        # Recursively bind to all children
+        def bind_review_mousewheel(widget):
+            widget.bind("<MouseWheel>", self._on_studio_mousewheel, add="+")
+            widget.bind("<Button-4>", self._on_studio_mousewheel_linux, add="+")
+            widget.bind("<Button-5>", self._on_studio_mousewheel_linux, add="+")
+            for child in widget.winfo_children():
+                bind_review_mousewheel(child)
+        
+        self.after_idle(lambda: bind_review_mousewheel(review_content_frame))
+
+        final_card = tk.Frame(review_content_frame, background=COLORS.panel_elevated, highlightthickness=1, highlightbackground=COLORS.border)
         final_card.pack(fill="both", expand=True, padx=12)
 
         preview_header_bar = tk.Frame(final_card, background=COLORS.panel_elevated)
@@ -874,20 +1474,42 @@ class StickerStudio(tk.Toplevel):
                  foreground=COLORS.muted, font=(IDENTITY_FONT, 9, "bold")).pack(side="left")
 
         self.view_mode = tk.StringVar(value="Resultado final")
+        self.background_mode = tk.StringVar(value="Cuadriculado")
         mode_cb = ttk.Combobox(preview_header_bar, textvariable=self.view_mode,
                                values=("Resultado final", "Máscara cruda", "Original", "Superposición", "Contorno de corte"),
                                state="readonly", width=16)
         mode_cb.pack(side="right")
         mode_cb.bind("<<ComboboxSelected>>", lambda _: self.render_current())
+        
+        background_cb = ttk.Combobox(preview_header_bar, textvariable=self.background_mode,
+                                     values=("Cuadriculado", "Blanco", "Negro"),
+                                     state="readonly", width=12)
+        background_cb.pack(side="right", padx=(0, 8))
+        background_cb.bind("<<ComboboxSelected>>", lambda _: self.render_current())
 
-        self.final_preview = tk.Label(final_card, text="Agregá una imagen para ver el sticker final",
-                                      background="#111314", foreground=COLORS.disabled, compound="center")
+        self.final_preview = tk.Canvas(final_card, background="#111314", highlightthickness=0, width=570, height=440)
         self.final_preview.pack(fill="both", expand=True, padx=9, pady=(0, 9))
         self.final_preview.bind("<Double-Button-1>", self.open_decision_dialog)
         self.final_preview.configure(cursor="hand2")
+        
+        # Label explaining transparency visualization
+        self.transparency_label = tk.Label(final_card, text="Fondo cuadriculado = transparencia",
+                                          background=COLORS.panel_elevated, foreground=COLORS.muted,
+                                          font=(UI_FONT, 8))
+        self.transparency_label.pack(pady=(0, 6))
+        
+        # White brush mode variables
+        self.brush_mode = tk.BooleanVar(value=False)
+        self.brush_size = tk.IntVar(value=10)
+        self.brush_drawing = False
+        self.brush_last_x = None
+        self.brush_last_y = None
+        self._brush_points: list[tuple[int, int]] = []
+        self._preview_display_size: tuple[int, int] = (0, 0)
+        self._preview_offset: tuple[int, int] = (0, 0)
 
         # Panel de análisis de calidad
-        reasons_card = tk.Frame(review_panel, background=COLORS.panel_elevated, highlightthickness=1, highlightbackground=COLORS.border)
+        reasons_card = tk.Frame(review_content_frame, background=COLORS.panel_elevated, highlightthickness=1, highlightbackground=COLORS.border)
         reasons_card.pack(fill="x", padx=12, pady=(0, 10))
         
         tk.Label(reasons_card, text="ANÁLISIS DE CALIDAD", background=COLORS.panel_elevated,
@@ -898,10 +1520,17 @@ class StickerStudio(tk.Toplevel):
                                         justify="left", anchor="nw", wraplength=680, font=(UI_FONT, 9))
         self.reasons_content.pack(fill="x", padx=12, pady=(0, 8))
 
-        controls = tk.Frame(review_panel, background=COLORS.panel_elevated, highlightthickness=1, highlightbackground=COLORS.border)
+        controls = tk.Frame(review_content_frame, background=COLORS.panel_elevated, highlightthickness=1, highlightbackground=COLORS.border)
         controls.pack(fill="x", padx=12, pady=10)
         self.category = tk.StringVar()
         self.tags = tk.StringVar()
+        self.processing_mode = tk.StringVar(value="Automático")
+        # Estos controles expresan la intención del usuario. El tratamiento
+        # del fondo de la fila siguiente continúa siendo independiente.
+        self.creation_mode = tk.StringVar(value="Sticker de silueta")
+        self.full_image_shape = tk.StringVar(value="Rectangular")
+        self.visual_classification = tk.StringVar(value="Automática")
+        self.selected_components = tk.StringVar(value="")
         self.cut_inset = tk.DoubleVar(value=self.profile.cut_inset_mm)
         fields = tk.Frame(controls, background=COLORS.panel_elevated)
         fields.pack(fill="x", padx=10, pady=9)
@@ -914,6 +1543,48 @@ class StickerStudio(tk.Toplevel):
         ttk.Spinbox(fields, textvariable=self.cut_inset, from_=0, to=3, increment=.25, width=8).grid(row=1, column=2, sticky="ew", padx=4, pady=(3, 0))
         fields.grid_columnconfigure(0, weight=1)
         fields.grid_columnconfigure(1, weight=2)
+
+        mode_row = tk.Frame(controls, background=COLORS.panel_elevated)
+        mode_row.pack(fill="x", padx=14, pady=(0, 8))
+        tk.Label(mode_row, text="Tratamiento del fondo", background=COLORS.panel_elevated,
+                 foreground=COLORS.text, font=(UI_FONT, 9, "bold")).pack(side="left", padx=(0, 8))
+        ttk.Combobox(
+            mode_row, textvariable=self.processing_mode, state="readonly", width=23,
+            values=("Automático", "Fondo uniforme", "Foto / sujeto", "Sticker existente"),
+        ).pack(side="left")
+        tk.Label(mode_row, text="Se aplica al reprocesar.",
+                 background=COLORS.panel_elevated, foreground=COLORS.muted,
+                 font=(UI_FONT, 8)).pack(side="left", padx=8)
+
+        creation_row = tk.Frame(controls, background=COLORS.panel_elevated)
+        creation_row.pack(fill="x", padx=14, pady=(0, 6))
+        tk.Label(creation_row, text="Modo de creación", background=COLORS.panel_elevated,
+                 foreground=COLORS.text, font=(UI_FONT, 9, "bold")).pack(side="left", padx=(0, 8))
+        ttk.Combobox(
+            creation_row, textvariable=self.creation_mode, state="readonly", width=27,
+            values=("Sticker de silueta", "Sticker de imagen completa", "Sticker de múltiples objetos"),
+        ).pack(side="left")
+        tk.Label(creation_row, text="Forma completa", background=COLORS.panel_elevated,
+                 foreground=COLORS.text, font=(UI_FONT, 9, "bold")).pack(side="left", padx=(14, 6))
+        ttk.Combobox(
+            creation_row, textvariable=self.full_image_shape, state="readonly", width=14,
+            values=("Rectangular", "Circular", "Ovalado", "Personalizado"),
+        ).pack(side="left")
+
+        visual_row = tk.Frame(controls, background=COLORS.panel_elevated)
+        visual_row.pack(fill="x", padx=14, pady=(0, 8))
+        tk.Label(visual_row, text="Clasificación visual", background=COLORS.panel_elevated,
+                 foreground=COLORS.text, font=(UI_FONT, 9, "bold")).pack(side="left", padx=(0, 8))
+        ttk.Combobox(
+            visual_row, textvariable=self.visual_classification, state="readonly", width=40,
+            values=("Automática", *(label for _identifier, label in VISUAL_STICKER_TYPES)),
+        ).pack(side="left")
+        tk.Label(visual_row, text="Objetos (IDs)", background=COLORS.panel_elevated,
+                 foreground=COLORS.text, font=(UI_FONT, 9, "bold")).pack(side="left", padx=(14, 6))
+        ttk.Entry(visual_row, textvariable=self.selected_components, width=11).pack(side="left")
+        tk.Label(visual_row, text="Ej.: 1, 3 · vacío = todos",
+                 background=COLORS.panel_elevated, foreground=COLORS.muted,
+                 font=(UI_FONT, 8)).pack(side="left", padx=7)
         self.notes = tk.StringVar(value="")
         tk.Label(controls, textvariable=self.notes, background=COLORS.panel_elevated, foreground=COLORS.muted,
                  justify="left", anchor="w", wraplength=700, font=(UI_FONT, 9)).pack(fill="x", padx=14, pady=(0, 8))
@@ -921,18 +1592,49 @@ class StickerStudio(tk.Toplevel):
         buttons.pack(fill="x", padx=10, pady=(0, 10))
         self.review_buttons = {}
         for text, command, style in (
-            ("Confirmar sticker", self.approve_current, "Primary.TButton"),
-            ("Recalcular automáticamente", self.reprocess_current, "Secondary.TButton"),
+            ("Reprocesar", self.reprocess_current, "Secondary.TButton"),
             ("Seleccionar área", self.open_area_selection, "Secondary.TButton"),
             ("Proteger zonas", self.open_protection_editor, "Secondary.TButton"),
             ("Corregir silueta", self.open_mask, "Secondary.TButton"),
-            ("Descartar", self.discard_current, "Danger.TButton"),
+            ("Alternativa anterior", self.restore_previous_result, "Secondary.TButton"),
+            ("Separar objetos", self.create_individual_objects, "Secondary.TButton"),
+            ("Corregir corte", self.open_cut_editor, "Secondary.TButton"),
+            ("Probar alternativa", self.try_mask_alternative, "Secondary.TButton"),
         ):
             button = ttk.Button(buttons, text=text, command=command, style=style)
-            button.pack(side="left", padx=3)
+            index = len(self.review_buttons)
+            button.grid(row=index // 4, column=index % 4, padx=3, pady=3, sticky="ew")
             self.review_buttons[text] = button
+        
+        # White brush controls
+        brush_controls = tk.Frame(controls, background=COLORS.panel_elevated)
+        brush_controls.pack(fill="x", padx=10, pady=(0, 10))
+        
+        tk.Checkbutton(brush_controls, text="Pincel blanco (guarda en PNG)", variable=self.brush_mode,
+                      command=self.toggle_brush_mode, background=COLORS.panel_elevated,
+                      foreground=COLORS.text, selectcolor=COLORS.panel_elevated).pack(side="left", padx=3)
+        
+        tk.Label(brush_controls, text="Tamaño:", background=COLORS.panel_elevated, 
+                 foreground=COLORS.text, font=(UI_FONT, 9)).pack(side="left", padx=(10, 3))
+        
+        ttk.Scale(brush_controls, from_=1, to=50, variable=self.brush_size, 
+                  orient="horizontal", length=100).pack(side="left", padx=3)
+
+        review_actions = tk.Frame(controls, background=COLORS.panel_elevated)
+        review_actions.pack(fill="x", padx=10, pady=(0, 10))
+        self.reject_button = ttk.Button(
+            review_actions, text="Rechazar", command=self.discard_current,
+            style="Danger.TButton",
+        )
+        self.reject_button.pack(side="left", padx=3)
+        self.approve_button = ttk.Button(
+            review_actions, text="Enviar a Últimos Procesados", command=self.approve_current,
+            style="Primary.TButton",
+        )
+        self.approve_button.pack(side="right", padx=3)
         self._update_review_actions()
         self._register_drop()
+        self._bind_studio_mousewheel()
 
     def _register_drop(self):
         try:
@@ -945,15 +1647,6 @@ class StickerStudio(tk.Toplevel):
 
     def drop_files(self, event):
         paths = [Path(value) for value in self.tk.splitlist(event.data)]
-        if len(paths) == 1 and self._should_prompt_selection(paths[0]):
-            def add_and_prompt():
-                self.add_paths([paths[0]], run_queue=False)
-                self.current_index = len(self.jobs) - 1
-                self.refresh_queue()
-                self.queue.selection_set(str(self.current_index))
-                self.open_area_selection()
-            self.after(0, add_and_prompt)
-            return
         self.add_paths(paths)
 
     def choose_files(self):
@@ -962,13 +1655,6 @@ class StickerStudio(tk.Toplevel):
             filetypes=[("Imágenes", "*.png *.jpg *.jpeg *.webp *.bmp *.gif *.tif *.tiff")],
         )
         if not paths:
-            return
-        if len(paths) == 1 and self._should_prompt_selection(Path(paths[0])):
-            self.add_paths([Path(paths[0])], run_queue=False)
-            self.current_index = len(self.jobs) - 1
-            self.refresh_queue()
-            self.queue.selection_set(str(self.current_index))
-            self.open_area_selection()
             return
         self.add_paths([Path(path) for path in paths])
 
@@ -1088,16 +1774,9 @@ class StickerStudio(tk.Toplevel):
                 if isinstance(clipboard, Image.Image):
                     path = self.inbox / f"pegado_{time.strftime('%Y%m%d_%H%M%S')}.png"
                     clipboard.convert("RGBA").save(path)
-                    if self._should_prompt_selection(path):
-                        def add_and_prompt():
-                            self.add_paths([path], run_queue=False)
-                            self.current_index = len(self.jobs) - 1
-                            self.refresh_queue()
-                            self.queue.selection_set(str(self.current_index))
-                            self.open_area_selection()
-                        self.after(0, add_and_prompt)
-                    else:
-                        self.after(0, lambda p=path: self.add_paths([p]))
+                    # Agregar directamente a la cola sin selección de área
+                    # La selección de área está disponible como botón en el panel de modificación
+                    self.after(0, lambda p=path: self.add_paths([p]))
                     return
                 self.after(0, lambda: (
                     self.status.set("Portapapeles vacío. Copiá una imagen o archivo e intentá de nuevo."),
@@ -1204,7 +1883,7 @@ class StickerStudio(tk.Toplevel):
 
         # Confirmar solo si ya hay un resultado generado.
         has_result = job.get("result") is not None
-        if has_result and status not in {"Aprobado", "Descartado", "Error"}:
+        if has_result and status not in {"Confirmado", "Rechazado", "Error"}:
             if not messagebox.askyesno(
                 "Eliminar de la cola",
                 f"Eliminar '{Path(job['source_path']).name}' del creador?\n\n"
@@ -1215,9 +1894,9 @@ class StickerStudio(tk.Toplevel):
 
         # Un aprobado ya está en la biblioteca. Quitar su fila de la cola no
         # debe convertir ese registro aprobado en un descarte.
-        if has_result and status != "Aprobado":
+        if has_result and status != "Confirmado":
             try:
-                self.database.set_sticker_processing_status(job["result"].job_id, "Descartado")
+                self.database.discard_processed_sticker(job["result"].job_id)
             except Exception:
                 pass
 
@@ -1240,8 +1919,10 @@ class StickerStudio(tk.Toplevel):
         return "break"
 
     def _load_saved_jobs(self):
-        """Recupera revisiones pendientes sin volver a procesar los originales."""
-        recoverable = {"Procesado", "Listo", "Revisar", "Error", "Pendiente"}
+        """No restaura resultados: su revisión se hace en Últimos Procesados."""
+        # Los resultados persistidos salen del Creador al completar el pipeline.
+        # La única cola de decisiones es la galería principal.
+        recoverable: set[str] = set()
         known = {job["source_path"] for job in self.jobs}
         
         try:
@@ -1282,7 +1963,7 @@ class StickerStudio(tk.Toplevel):
                     duplicate_path=row.get("duplicate_path") or "",
                     duplicate_score=float(row.get("duplicate_score") or 0),
                 )
-                job_status = row.get("quality_status") or "Revisar"
+                job_status = row.get("status") or "Procesado"
                 self.jobs.append({
                     "source_path": source_path, "status": job_status,
                     "result": result, "force": False,
@@ -1318,7 +1999,10 @@ class StickerStudio(tk.Toplevel):
             else:
                 self.status.set(f"Se recuperaron {len(self.jobs)} trabajo(s) para revisar.")
     def _evaluate_job_candidates(self, job):
-        """Evalúa los candidatos de máscara para un trabajo y ajusta el estado de calidad."""
+        """Evalúa propuestas sin sustituir correcciones ni errores técnicos."""
+        if (job.get("mask_override") or job.get("creation_mode") == "Sticker de imagen completa"
+                or (job.get("result") and job["result"].analysis.get("quality_report", {}).get("errors"))):
+            return
         if not job.get("result"):
             return
         if "winner" in job:
@@ -1341,25 +2025,42 @@ class StickerStudio(tk.Toplevel):
             # Ajustar estado de calidad basado en la decisión
             if decision.requires_review or winner.scores.get("suspicious_component_count", 0.0) > 0.0:
                 job["result"].quality_status = "Revisar"
-                job["status"] = "Revisar"
+
             else:
                 job["result"].quality_status = "Listo"
-                job["status"] = "Listo"
                 
         except FileNotFoundError as e:
             print(f"Error: File not found when evaluating candidates: {e}")
             job["result"].quality_status = "Revisar"
-            job["status"] = "Revisar"
         except ValueError as e:
             print(f"Error: Invalid data when evaluating candidates: {e}")
             job["result"].quality_status = "Revisar"
-            job["status"] = "Revisar"
         except Exception as e:
             print(f"Error evaluating candidates for job: {e}")
             # En caso de error, marcar como revisar por seguridad
             if job.get("result"):
                 job["result"].quality_status = "Revisar"
-                job["status"] = "Revisar"
+
+    def _schedule_candidate_evaluation(self, index: int, job: dict):
+        """Calcula el diagnóstico pesado fuera del hilo de Tk."""
+        if "winner" in job or index in self._candidate_jobs:
+            return
+        self._candidate_jobs.add(index)
+
+        def evaluate():
+            try:
+                self._evaluate_job_candidates(job)
+            finally:
+                def update_ui():
+                    self._candidate_jobs.discard(index)
+                    if self.empty_requested or index >= len(self.jobs) or self.jobs[index] is not job:
+                        return
+                    self.refresh_queue()
+                    if self.current_index == index:
+                        self.render_current()
+                self.after(0, update_ui)
+
+        threading.Thread(target=evaluate, daemon=True).start()
 
     def _format_queue_filename(self, job) -> str:
         path_str = job.get("source_path")
@@ -1412,23 +2113,148 @@ class StickerStudio(tk.Toplevel):
                 calidad_val = f"{round(job['winner'].score * 100)} %"
             else:
                 calidad_val = "—"
-                
+            
             self.queue.insert("", "end", iid=str(index), values=(filename_val, status_val, engine_val, calidad_val))
+
+        self._refresh_queue_summary()
             
         if selected is not None and selected < len(self.jobs):
             self.queue.selection_set(str(selected))
         if scroll_to is not None and scroll_to < len(self.jobs):
             self.queue.see(str(scroll_to))
 
+    def _refresh_queue_summary(self):
+        """Muestra un resumen corto de la cola sin recalcular el análisis."""
+        if not hasattr(self, "queue_summary"):
+            return
+        total = len(self.jobs)
+        if not total:
+            self.queue_summary.set("Sin archivos")
+            return
+        ready = sum(job.get("status") == "Procesado" for job in self.jobs)
+        processing = sum(job.get("status") in {"Procesando", "Buscando duplicados"} for job in self.jobs)
+        pending = sum(job.get("status") in {"Pendiente", "Reprocesar"} for job in self.jobs)
+        parts = []
+        if ready:
+            parts.append(f"{ready} listo{'s' if ready != 1 else ''}")
+        if processing:
+            parts.append(f"{processing} procesando")
+        if pending:
+            parts.append(f"{pending} pendiente{'s' if pending != 1 else ''}")
+        self.queue_summary.set(" · ".join(parts) or f"{total} archivo{'s' if total != 1 else ''}")
+
     def select_job(self, _event=None):
         selection = self.queue.selection()
         if not selection:
             return
         if self.current_index is not None and self.current_index < len(self.jobs):
-            self.jobs[self.current_index]["category"] = self.category.get().strip()
-            self.jobs[self.current_index]["tags"] = [tag.strip() for tag in self.tags.get().split(",") if tag.strip()]
-        self.current_index = int(selection[0])
+            current_job = self.jobs[self.current_index]
+            current_job["category"] = self.category.get().strip()
+            current_job["tags"] = [tag.strip() for tag in self.tags.get().split(",") if tag.strip()]
+            current_job["processing_mode"] = self.processing_mode.get()
+            current_job["creation_mode"] = self.creation_mode.get()
+            current_job["full_image_shape"] = self.full_image_shape.get()
+            visual_label = self.visual_classification.get()
+            current_job["visual_type_label_override"] = visual_label
+            current_job["visual_type_override"] = (
+                VISUAL_STICKER_TYPE_IDS_BY_LABEL.get(visual_label)
+                if visual_label != "Automática" else None)
+            current_job["selected_component_ids"] = sorted({
+                int(raw_identifier.strip())
+                for raw_identifier in self.selected_components.get().split(",")
+                if raw_identifier.strip().isdigit() and int(raw_identifier.strip()) > 0
+            })
+        # En selección múltiple la fila con foco es la que se previsualiza.
+        focused = self.queue.focus()
+        self.current_index = int(focused if focused in selection else selection[-1])
         self.render_current()
+
+    def _selected_queue_indices(self) -> list[int]:
+        """Índices válidos seleccionados, en el orden visual de la cola."""
+        return sorted(
+            int(item) for item in self.queue.selection()
+            if item.isdigit() and int(item) < len(self.jobs)
+        )
+
+    def _show_queue_context_menu(self, event):
+        """Acciones de revisión disponibles con clic derecho en la cola."""
+        item = self.queue.identify_row(event.y)
+        if not item:
+            return "break"
+        if item not in self.queue.selection():
+            self.queue.selection_set(item)
+        self.queue.focus(item)
+        self.current_index = int(item)
+        self.render_current()
+
+        selected = self._selected_queue_indices()
+        can_modify = len(selected) == 1 and bool(
+            self.jobs[selected[0]].get("result"))
+        can_confirm = any(
+            self.jobs[index].get("result") and self.jobs[index].get("status") == "Procesado"
+            for index in selected
+        )
+        can_reject = any(
+            self.jobs[index].get("status") not in {"Confirmado", "Rechazado"}
+            for index in selected
+        )
+
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(
+            label="Modificar sticker",
+            command=self.open_mask,
+            state="normal" if can_modify else "disabled",
+        )
+        menu.add_separator()
+        menu.add_command(
+            label=f"Enviar a revisión seleccionado{'s' if len(selected) != 1 else ''}",
+            command=self.confirm_selected_jobs,
+            state="normal" if can_confirm else "disabled",
+        )
+        menu.add_command(
+            label=f"Rechazar seleccionado{'s' if len(selected) != 1 else ''}",
+            command=self.reject_selected_jobs,
+            state="normal" if can_reject else "disabled",
+        )
+        menu.tk_popup(event.x_root, event.y_root)
+        menu.grab_release()
+        return "break"
+
+    def confirm_selected_jobs(self):
+        """Envía los seleccionados al segundo control, uno por uno."""
+        selected_jobs = [self.jobs[index] for index in self._selected_queue_indices()]
+        ready = [job for job in selected_jobs if job.get("result") and job.get("status") == "Procesado"]
+        if not ready:
+            self.status.set("No hay stickers listos para enviar a revisión.")
+            return
+        if len(ready) > 1 and not messagebox.askyesno(
+                "Enviar stickers a revisión",
+                f"¿Enviar {len(ready)} stickers a Últimos Procesados para el segundo control?",
+                parent=self):
+            return
+        for job in ready:
+            if job not in self.jobs:
+                continue
+            self.current_index = self.jobs.index(job)
+            self.approve_current()
+
+    def reject_selected_jobs(self):
+        """Rechaza los trabajos seleccionados sin tocar los demás."""
+        selected_jobs = [self.jobs[index] for index in self._selected_queue_indices()]
+        candidates = [job for job in selected_jobs if job.get("status") not in {"Confirmado", "Rechazado"}]
+        if not candidates:
+            self.status.set("No hay stickers que se puedan rechazar.")
+            return
+        if len(candidates) > 1 and not messagebox.askyesno(
+                "Rechazar stickers",
+                f"¿Rechazar {len(candidates)} stickers seleccionados?",
+                parent=self):
+            return
+        for job in candidates:
+            if job not in self.jobs:
+                continue
+            self.current_index = self.jobs.index(job)
+            self.discard_current(confirm=False)
 
     def render_current(self):
         if self.current_index is None or self.current_index >= len(self.jobs):
@@ -1436,19 +2262,43 @@ class StickerStudio(tk.Toplevel):
             return
             
         job = self.jobs[self.current_index]
+        if self.brush_mode.get():
+            # Un cambio de archivo no debe dejar activo un pincel que escribe
+            # directamente sobre el maestro anterior.
+            self.brush_mode.set(False)
+            self.toggle_brush_mode()
         result: ProcessingResult | None = job.get("result")
         self.category.set(job.get("category", ""))
         self.tags.set(", ".join(job.get("tags", [])))
+        self.processing_mode.set(job.get("processing_mode", "Automático"))
+        self.creation_mode.set(job.get("creation_mode", "Sticker de silueta"))
+        self.full_image_shape.set(job.get("full_image_shape", "Rectangular"))
+        self.visual_classification.set(
+            job.get("visual_type_label_override", "Automática"))
+        self.selected_components.set(
+            ", ".join(str(item) for item in job.get("selected_component_ids", [])))
         
         reasons_text = ""
         if result:
-            self._evaluate_job_candidates(job)
+            self._schedule_candidate_evaluation(self.current_index, job)
             confidence_str = ""
             if "decision" in job:
                 confidence_str = f" — confianza {job['decision'].confidence} %"
-            self.review_state.set(f"{job['status']}{confidence_str} · {result.analysis.get('engine', '')}")
+            sticker_type_label = result.analysis.get("sticker_type_label", "")
+            quality_state = result.analysis.get("quality_report", {}).get("status", result.quality_status)
+            state_detail = sticker_type_label or result.analysis.get("engine", "")
+            self.review_state.set(f"{job['status']} · {quality_state} · {state_detail}")
             
             reasons = []
+            if sticker_type_label:
+                reasons.append(f"• Tipo visual: {sticker_type_label}")
+            detected_types = result.analysis.get("detected_types", [])
+            complementary = [item for item in detected_types[1:] if item]
+            if complementary:
+                labels = dict(VISUAL_STICKER_TYPES)
+                reasons.append("• Rasgos: " + ", ".join(
+                    labels.get(item, item.replace("_", " "))
+                    for item in complementary))
             if "winner" in job:
                 winner = job["winner"]
                 decision = job["decision"]
@@ -1521,6 +2371,26 @@ class StickerStudio(tk.Toplevel):
                 notes.append("Se aplicaron zonas protegidas: el pipeline no modificará esas áreas.")
             if result.analysis.get("png_holes_filled_white"):
                 notes.append("Los huecos internos del PNG se completaron automáticamente con blanco.")
+            creation_mode = result.analysis.get("creation_mode", "")
+            if creation_mode:
+                shape = result.analysis.get("full_image_shape", "Rectangular")
+                notes.append(f"Modo de creación: {creation_mode} · forma: {shape}.")
+            object_components = result.analysis.get("object_components", [])
+            if object_components:
+                selected = [str(item["id"]) for item in object_components if item.get("selected")]
+                notes.append(
+                    f"Se guardaron {len(object_components)} máscaras de objetos"
+                    f" (seleccionados: {', '.join(selected)}).")
+            if result.analysis.get("object_selection_warning"):
+                notes.append(result.analysis["object_selection_warning"])
+            recovery = result.analysis.get("automatic_recovery", {})
+            if recovery:
+                notes.append("Recuperación automática evaluada. Usá ‘Alternativa anterior’ para comparar las propuestas conservadas.")
+            if (result.analysis.get("creation_mode") == "Sticker de imagen completa"
+                    and result.analysis.get("full_image_shape") == "Personalizado"
+                    and not job.get("mask_override")):
+                notes.append(
+                    "Para una forma personalizada, usá ‘Corregir silueta’ y reprocesá.")
             notes.append("Propuesta automática lista. Confirmá únicamente si el sticker final está correcto.")
             self.notes.set("\n".join(f"- {note}" for note in notes))
         else:
@@ -1541,17 +2411,59 @@ class StickerStudio(tk.Toplevel):
         master_path = (result.artifacts.get("master") or result.artifacts.get("print") or "") if result and result.artifacts else ""
         cut_path = result.artifacts.get("cut") if result and result.artifacts else None
         
+        # Inicializar logger antes de usarlo
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Usar manifiesto si está disponible para garantizar rutas correctas de la ejecución actual
+        manifest_path = result.artifacts.get("manifest") if result and result.artifacts else None
+        if manifest_path and Path(manifest_path).exists():
+            try:
+                import json
+                with open(manifest_path, 'r', encoding='utf-8') as f:
+                    manifest = json.load(f)
+                    # Usar rutas explícitas del manifiesto
+                    if mode == "Resultado final" and manifest.get("final_path"):
+                        master_path = manifest["final_path"]
+                        logger.info("STICKER_EDITOR_USING_MANIFEST_FINAL=%s", master_path)
+            except Exception as e:
+                logger.exception("STICKER_EDITOR_MANIFEST_ERROR")
+        
         try:
             from PIL import Image, ImageTk
             import numpy as np
             
+            # Logging para diagnóstico
+            if master_path:
+                logger.info("STICKER_EDITOR_MASTER_PATH=%s", master_path)
+                logger.info("STICKER_EDITOR_MASTER_EXISTS=%s", Path(master_path).exists() if master_path else False)
+            if mask_path:
+                logger.info("STICKER_EDITOR_MASK_PATH=%s", mask_path)
+            if original_path:
+                logger.info("STICKER_EDITOR_SOURCE_PATH=%s", original_path)
+
+            
             img = None
             if mode == "Resultado final" and master_path:
+                logger.error(
+                    "UI_OPENING_PREVIEW=%s",
+                    Path(master_path).resolve(),
+                )
+
                 with Image.open(master_path) as src:
                     img = src.convert("RGBA").copy()
-                background = Image.new("RGBA", img.size, (17, 19, 20, 255))
-                background.alpha_composite(img)
-                img = background
+
+                extrema = img.getchannel("A").getextrema()
+                logger.error("UI_PREVIEW_ALPHA=%s", extrema)
+
+                # Apply selected background for preview only (not saved to file)
+                background_mode = self.background_mode.get()
+                if background_mode == "Cuadriculado":
+                    img = make_checkerboard_preview(img)
+                elif background_mode == "Blanco":
+                    img = make_white_background_preview(img)
+                else:  # Negro
+                    img = make_black_background_preview(img)
             elif mode == "Original" and original_path:
                 with Image.open(original_path) as src:
                     img = src.convert("RGBA").copy()
@@ -1582,21 +2494,45 @@ class StickerStudio(tk.Toplevel):
                 
             if img:
                 img.thumbnail((570, 440), Image.Resampling.LANCZOS)
+                self._preview_display_size = img.size
                 photo = ImageTk.PhotoImage(img)
         except Exception as e:
             print(f"Error loading preview image in mode {mode}: {e}")
             photo = None
             
         self.preview_images = [photo] if photo else []
+        self.final_preview.delete("all")
         if photo:
-            self.final_preview.configure(image=photo, text="")
+            canvas_w = max(self.final_preview.winfo_width(), 1)
+            canvas_h = max(self.final_preview.winfo_height(), 1)
+            x = max(0, (canvas_w - self._preview_display_size[0]) // 2)
+            y = max(0, (canvas_h - self._preview_display_size[1]) // 2)
+            self._preview_offset = (x, y)
+            self.final_preview.create_image(x, y, image=photo, anchor="nw", tags="preview_image")
             self.final_preview.image = photo
+            
+            # Update transparency label based on background mode
+            background_mode = self.background_mode.get()
+            if background_mode == "Cuadriculado":
+                self.transparency_label.config(text="Fondo cuadriculado = transparencia")
+            elif background_mode == "Blanco":
+                self.transparency_label.config(text="Fondo blanco = transparencia")
+            else:  # Negro
+                self.transparency_label.config(text="Fondo negro = transparencia")
         else:
-            self.final_preview.configure(image="", text=(
-                "Preparando el sticker final..."
-                if result
-                else "Agrega una imagen para ver el sticker final"
-            ))
+            self._preview_display_size = (0, 0)
+            self._preview_offset = (0, 0)
+            self.final_preview.create_text(
+                self.final_preview.winfo_width() // 2 if self.final_preview.winfo_width() > 1 else 285,
+                self.final_preview.winfo_height() // 2 if self.final_preview.winfo_height() > 1 else 220,
+                text=(
+                    "Preparando el sticker final..."
+                    if result
+                    else "Agrega una imagen para ver el sticker final"
+                ),
+                fill=COLORS.disabled,
+                font=(UI_FONT, 10)
+            )
             self.final_preview.image = None
         self._update_review_actions(job)
 
@@ -1606,18 +2542,20 @@ class StickerStudio(tk.Toplevel):
         status = job.get("status", "") if job else ""
         result = job.get("result") if job else None
         busy = status in {"Buscando duplicados", "Procesando"}
-        ready = bool(result and status in {"Listo", "Revisar"})
-        editable = bool(job and not busy and status != "Aprobado")
+        editable = bool(job and not busy and status != "Confirmado")
         enabled = {
-            "Confirmar sticker": ready,
-            "Recalcular automáticamente": editable,
+            "Reprocesar": editable,
             "Seleccionar área": editable,
             "Proteger zonas": editable,
             "Corregir silueta": bool(result and result.artifacts.get("mask") and editable),
-            "Descartar": editable,
         }
         for text, button in buttons.items():
             button.state(["!disabled"] if enabled.get(text, False) else ["disabled"])
+        can_decide = bool(job and result and status == "Procesado")
+        if hasattr(self, "approve_button"):
+            self.approve_button.state(["!disabled"] if can_decide else ["disabled"])
+        if hasattr(self, "reject_button"):
+            self.reject_button.state(["!disabled"] if editable else ["disabled"])
 
     @staticmethod
     def _thumbnail(path: str | None, maximum: tuple[int, int] = (310, 220)):
@@ -1748,11 +2686,34 @@ class StickerStudio(tk.Toplevel):
                     return
                 
                 log("Llamando a processor.process()...")
+                # Studio 2.0 conserva ajustes por trabajo. La cola es serial,
+                # por lo que aplicar el snapshot inmediatamente antes de esta
+                # corrida evita que cambiar de miniatura mezcle perfiles.
+                if job.get("v2_border_mm") is not None:
+                    self.processor.profile.final_white_px = round(
+                        float(job["v2_border_mm"]) / 25.4
+                        * self.processor.profile.dpi)
+                if job.get("v2_quality"):
+                    self.processor.profile.quality = job["v2_quality"]
                 result = self.processor.process(
                     processing_source, progress=progress, cut_inset_mm=cut_inset,
                     mask_override=mask_override,
                     preserve_full_image=job.get("selection_mode") == "selection",
+                    preserve_orientation=job.get("selection_mode") == "selection",
+                    mode_override=job.get("mode_override"),
                     protection_zones=job.get("protection_zones"),
+                    creation_mode=job.get("creation_mode"),
+                    full_image_shape=job.get("full_image_shape", "Rectangular"),
+                    selected_component_ids=job.get("selected_component_ids"),
+                    visual_type_override=job.get("visual_type_override"),
+                    previous_object_components=job.get("previous_object_components"),
+                    cut_mask_override=job.get("cut_mask_override"),
+                    border_treatment=job.get("border_treatment"),
+                    selection_contraction_mm=job.get("selection_contraction_mm", 0.0),
+                    selection_expansion_mm=job.get("selection_expansion_mm", 0.0),
+                    selection_protection_mask=job.get("selection_protection_mask"),
+                    selection_smoothing_mm=job.get("selection_smoothing_mm", 0.08),
+                    cancelled=self.cancel_event.is_set,
                 )
                 log("processor.process() completado")
                 
@@ -1760,6 +2721,8 @@ class StickerStudio(tk.Toplevel):
                     result.analysis["original_source_path"] = job["source_path"]
                 if job.get("selection_box"):
                     result.analysis["selected_area"] = list(job["selection_box"])
+                    result.analysis["selected_area_rotation_deg"] = float(
+                        job.get("selection_angle", 0.0))
                     result.analysis["source_mode"] = (
                         "Selección completa"
                         if job.get("selection_mode") == "selection"
@@ -1773,28 +2736,68 @@ class StickerStudio(tk.Toplevel):
                 if self.semantic_analyzer and not self.cancel_event.is_set():
                     log("Iniciando análisis semántico...")
                     progress(92, "Reconociendo contenido y etiquetas")
-                    semantic = self.semantic_analyzer(processing_source, lambda message: progress(94, message)) or {}
-                    result.analysis["semantic"] = semantic
-                    log("Análisis semántico completado")
+                    try:
+                        import threading
+                        import time
+                        
+                        semantic_result = [None]
+                        semantic_error = [None]
+                        
+                        def run_semantic():
+                            try:
+                                semantic_result[0] = self.semantic_analyzer(processing_source, lambda message: progress(94, message)) or {}
+                            except Exception as e:
+                                semantic_error[0] = e
+                        
+                        semantic_thread = threading.Thread(target=run_semantic, daemon=True)
+                        semantic_thread.start()
+                        semantic_thread.join(timeout=30)  # 30 second timeout
+                        
+                        if semantic_thread.is_alive():
+                            log("Análisis semántico timeout - continuando sin análisis")
+                            result.analysis["semantic"] = {}
+                            progress(94, "Análisis semántico omitido por timeout")
+                        elif semantic_error[0]:
+                            log(f"Error en análisis semántico: {semantic_error[0]}")
+                            result.analysis["semantic"] = {}
+                            progress(94, "Análisis semántico omitido por error")
+                        else:
+                            result.analysis["semantic"] = semantic_result[0]
+                            log("Análisis semántico completado")
+                    except Exception as e:
+                        log(f"Error en análisis semántico: {e}")
+                        result.analysis["semantic"] = {}
+                        progress(94, "Análisis semántico omitido por error")
                 else:
                     log("Sin análisis semántico")
                 
                 if self.cancel_event.is_set():
                     log("Cancelado después de procesar")
+                    self.after(0, lambda: self._finish_cancelled(index))
                     return
                 
                 log("Llamando a _finish_result()...")
                 self.after(0, lambda: self._finish_result(index, result))
                 log("Work completado exitosamente")
                 
+            except ProcessingCancelled:
+                self.after(0, lambda: self._finish_cancelled(index))
             except Exception as error:
                 log(f"ERROR: {type(error).__name__}: {error}")
                 import traceback
                 log(traceback.format_exc())
-                self.after(0, lambda: self._finish_error(index, str(error)))
+                error_str = str(error)
+                self.after(0, lambda e=error_str: self._finish_error(index, e))
 
         self.worker = threading.Thread(target=work, daemon=True)
         self.worker.start()
+
+    def _finish_cancelled(self, index):
+        if index < len(self.jobs):
+            self.jobs[index]["status"] = "Cancelado"
+            self.refresh_queue()
+            self.render_current()
+        self.status.set("Procesamiento cancelado. El original y las alternativas previas se conservaron.")
 
     def _finish_duplicate(self, index, candidate, score, state):
         if index >= len(self.jobs) or self.empty_requested:
@@ -1811,17 +2814,42 @@ class StickerStudio(tk.Toplevel):
         if index >= len(self.jobs) or self.empty_requested:
             return
         job = self.jobs[index]
+        # Un nuevo resultado no puede reutilizar el diagnóstico de la corrida
+        # anterior, incluso si este terminó en segundo plano un instante antes.
+        for key in ("winner", "decision", "candidates", "error", "duplicate"):
+            job.pop(key, None)
         job["result"] = result
-        job["status"] = result.quality_status
+        job["previous_object_components"] = result.analysis.get("object_components", [])
+        recovery = result.analysis.get("automatic_recovery", {})
+        for key in ("primary_metadata", "alternative_metadata"):
+            path = recovery.get(key)
+            if path and Path(path).exists():
+                other = ProcessingResult.from_metadata(path)
+                if other.job_id != result.job_id:
+                    alternatives = job.setdefault("alternatives", [])
+                    if all(item.job_id != other.job_id for item in alternatives):
+                        alternatives.append(other)
+                        del alternatives[:-5]
+        job["status"] = "Procesado"
         semantic = result.analysis.get("semantic") or {}
         job["category"] = semantic.get("category", "")
         job["tags"] = list(dict.fromkeys(semantic.get("suggestions") or []))[:10]
-        self.database.save_sticker_processing(result, job["category"], job["tags"])
+        
+        filename = Path(result.source_path).name
         self.progress_value.set(100)
-        self.status.set(f"Procesado: {Path(result.source_path).name}")
         self.refresh_queue()
+        self.current_index = index
+        self.queue.selection_set(str(index))
         self.render_current()
-        self._continue_queue()
+        self.status.set(
+            f"Procesado: {filename}. Revisalo, modificálo o rechazalo; "
+            "solo ‘Confirmar’ lo enviará a Últimos Procesados."
+        )
+        
+        try:
+            self._continue_queue()
+        except Exception as e:
+            print(f"Error en _continue_queue: {e}")
 
     def _finish_error(self, index, error):
         """Maneja errores de procesamiento y muestra un diálogo informativo al usuario."""
@@ -2024,8 +3052,8 @@ class StickerStudio(tk.Toplevel):
             return
         for job in self.jobs:
             result = job.get("result")
-            if result and job.get("status") != "Aprobado":
-                self.database.set_sticker_processing_status(result.job_id, "Descartado")
+            if result and job.get("status") != "Confirmado":
+                self.database.discard_processed_sticker(result.job_id)
         self.jobs.clear()
         self.current_index = None
         self.refresh_queue()
@@ -2034,7 +3062,14 @@ class StickerStudio(tk.Toplevel):
 
     def _reset_empty_view(self):
         self.preview_images = []
-        self.final_preview.configure(image="", text="Agregá una imagen para ver el sticker final")
+        self.final_preview.delete("all")
+        self.final_preview.create_text(
+            self.final_preview.winfo_width() // 2 if self.final_preview.winfo_width() > 1 else 285,
+            self.final_preview.winfo_height() // 2 if self.final_preview.winfo_height() > 1 else 220,
+            text="Agregá una imagen para ver el sticker final",
+            fill=COLORS.disabled,
+            font=(UI_FONT, 10)
+        )
         self.final_preview.image = None
         self.category.set("")
         self.tags.set("")
@@ -2046,42 +3081,150 @@ class StickerStudio(tk.Toplevel):
 
     def open_decision_dialog(self, _event=None):
         job = self.current_job()
-        if not job or not job.get("result") or job.get("status") not in {"Listo", "Revisar"}:
+        if not job or not job.get("result") or job.get("status") != "Procesado":
             messagebox.showinfo("Sticker final", "Esperá a que el sticker final esté listo para revisarlo.", parent=self)
             return
-        dialog = tk.Toplevel(self)
-        dialog.title("Decidir sticker")
-        dialog.configure(background=COLORS.panel)
-        dialog.transient(self)
-        dialog.grab_set()
-        dialog.resizable(False, False)
-        tk.Label(dialog, text="¿QUÉ QUERÉS HACER?", background=COLORS.panel, foreground=COLORS.text,
-                 font=(IDENTITY_FONT, 15, "bold")).pack(padx=28, pady=(24, 5))
-        tk.Label(dialog, text="La vista mostrada es el sticker final.", background=COLORS.panel,
-                 foreground=COLORS.muted, font=(UI_FONT, 10)).pack(padx=28, pady=(0, 18))
-        actions = tk.Frame(dialog, background=COLORS.panel)
-        actions.pack(padx=22, pady=(0, 22))
+        messagebox.showinfo(
+            "Primer control: Creador de stickers",
+            "Revisá el resultado aquí. Podés modificarlo, rechazarlo o confirmarlo. "
+            "Al confirmarlo se enviará a Últimos Procesados para el segundo control.",
+            parent=self,
+        )
 
-        def decide(callback):
-            dialog.grab_release()
-            dialog.destroy()
-            callback()
+    def toggle_brush_mode(self):
+        """Activa una correcci\u00f3n blanca que se guarda en el PNG maestro."""
+        if self.brush_mode.get():
+            job = self.current_job()
+            if not job or not job.get("result"):
+                self.brush_mode.set(False)
+                self.status.set("Proces\u00e1 y seleccion\u00e1 un sticker antes de usar el pincel blanco.")
+                return
+            if self.view_mode.get() != "Resultado final":
+                self.view_mode.set("Resultado final")
+                self.render_current()
+            self.status.set("Pincel blanco activo: cada trazo se guarda en el PNG maestro al soltar el mouse.")
+            self.final_preview.bind("<ButtonPress-1>", self._brush_start)
+            self.final_preview.bind("<B1-Motion>", self._brush_draw)
+            self.final_preview.bind("<ButtonRelease-1>", self._brush_end)
+            self.final_preview.configure(cursor="crosshair")
+        else:
+            self.final_preview.unbind("<ButtonPress-1>")
+            self.final_preview.unbind("<B1-Motion>")
+            self.final_preview.unbind("<ButtonRelease-1>")
+            self.final_preview.configure(cursor="hand2")
 
-        ttk.Button(actions, text="Confirmar", command=lambda: decide(self.approve_current), style="Primary.TButton").pack(side="left", padx=4)
-        ttk.Button(actions, text="Modificar", command=lambda: decide(self.open_mask), style="Secondary.TButton").pack(side="left", padx=4)
-        ttk.Button(actions, text="Rechazar", command=lambda: decide(lambda: self.discard_current(confirm=False)), style="Danger.TButton").pack(side="left", padx=4)
+    def _brush_start(self, event):
+        """Inicia un trazo sobre la vista previa del PNG maestro."""
+        offset_x, offset_y = self._preview_offset
+        display_w, display_h = self._preview_display_size
+        if not (offset_x <= event.x < offset_x + display_w and
+                offset_y <= event.y < offset_y + display_h):
+            return
+        self.brush_drawing = True
+        self.brush_last_x = event.x
+        self.brush_last_y = event.y
+        self._brush_points = [(event.x, event.y)]
+        self._brush_draw(event)
 
-    def approve_current(self):
+    def _brush_draw(self, event):
+        """Draw white brush stroke."""
+        if not self.brush_drawing:
+            return
+        
+        brush_size = self.brush_size.get()
+        x, y = event.x, event.y
+        
+        # Draw a line from last position to current position
+        if self.brush_last_x is not None and self.brush_last_y is not None:
+            self.final_preview.create_line(
+                self.brush_last_x, self.brush_last_y,
+                x, y,
+                fill="white",
+                width=brush_size,
+                capstyle=tk.ROUND,
+                smooth=True,
+                tags="brush_stroke"
+            )
+        
+        self.brush_last_x = x
+        self.brush_last_y = y
+        self._brush_points.append((x, y))
+
+    def _brush_end(self, event):
+        """Persiste el trazo en el maestro y actualiza su miniatura."""
+        self.brush_drawing = False
+        if self._brush_points:
+            self._save_white_brush_stroke(self._brush_points)
+        self._brush_points = []
+        self.brush_last_x = None
+        self.brush_last_y = None
+
+    def _save_white_brush_stroke(self, points: list[tuple[int, int]]):
+        """Traduce el trazo de pantalla a p\u00edxeles reales del PNG maestro."""
+        job = self.current_job()
+        result = job.get("result") if job else None
+        master_path = Path(result.artifacts.get("master", "")) if result else None
+        display_w, display_h = self._preview_display_size
+        if not master_path or not master_path.exists() or not display_w or not display_h:
+            self.status.set("No se pudo guardar el trazo: falta el PNG maestro.")
+            self.render_current()
+            return
+
+        try:
+            from PIL import Image, ImageDraw
+
+            with Image.open(master_path) as source:
+                master = source.convert("RGBA")
+                dpi = source.info.get("dpi", (self.profile.dpi, self.profile.dpi))
+            scale_x = master.width / display_w
+            scale_y = master.height / display_h
+            offset_x, offset_y = self._preview_offset
+            scaled_points = [
+                (round(max(0, min(display_w - 1, x - offset_x)) * scale_x),
+                 round(max(0, min(display_h - 1, y - offset_y)) * scale_y))
+                for x, y in points
+            ]
+            width = max(1, round(self.brush_size.get() * (scale_x + scale_y) / 2))
+            draw = ImageDraw.Draw(master)
+            if len(scaled_points) == 1:
+                x, y = scaled_points[0]
+                radius = width / 2
+                draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=(255, 255, 255, 255))
+            else:
+                draw.line(scaled_points, fill=(255, 255, 255, 255), width=width, joint="curve")
+                radius = width / 2
+                for x, y in (scaled_points[0], scaled_points[-1]):
+                    draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=(255, 255, 255, 255))
+            master.save(master_path, dpi=dpi, optimize=False)
+
+            thumbnail_path = Path(result.artifacts.get("thumbnail", ""))
+            if thumbnail_path:
+                thumbnail = master.copy()
+                thumbnail.thumbnail((256, 256), Image.Resampling.LANCZOS)
+                thumbnail.save(thumbnail_path, optimize=True)
+            self.status.set("Correcci\u00f3n blanca guardada en el PNG maestro.")
+        except Exception as exc:
+            self.status.set("No se pudo guardar la correcci\u00f3n blanca.")
+            print(f"Error saving white brush stroke: {exc}")
+        finally:
+            self.render_current()
+
+    def approve_current(self, keep_in_session: bool = False):
         job = self.current_job()
         if not job or not job.get("result"):
             messagebox.showwarning("Sin resultado", "Procesá el archivo antes de aprobarlo.", parent=self)
             return
         
-        # Buscar duplicados antes de aprobar
+        # Buscar duplicados antes de aprobar - OPTIMIZADO
         result = job["result"]
+        if result.analysis.get("quality_report", {}).get("errors"):
+            messagebox.showerror(
+                "Resultado inválido", "El control detectó errores técnicos. "
+                "Corregí la silueta o reprocesá antes de confirmar.", parent=self)
+            return
         processing_source = job.get("processing_source_path") or job["source_path"]
         
-        # Mostrar diálogo de búsqueda
+        # Usar indexed_visual_search_images que ya tiene filtros y es más eficiente
         self.status.set("Buscando duplicados antes de aprobar...")
         self.update_idletasks()
         
@@ -2090,20 +3233,26 @@ class StickerStudio(tk.Toplevel):
         
         try:
             from app.ai.visual_search import find_similar
-            candidates = self.database.visual_search_images()
+            # OPTIMIZACIÓN: Usar indexed_visual_search_images que filtra por índice vigente
+            candidates = self.database.indexed_visual_search_images()
             
-            # Limitar a 200 candidatos para búsqueda rápida
-            limited_candidates = candidates[:200] if len(candidates) > 200 else candidates
+            # OPTIMIZACIÓN: Limitar a 50 candidatos más recientes para búsqueda rápida
+            # Ordenar por modified descendente para obtener los más recientes
+            candidates.sort(key=lambda x: x.get("modified", 0), reverse=True)
+            limited_candidates = candidates[:50] if len(candidates) > 50 else candidates
             
+            # OPTIMIZACIÓN: Usar modo estrito y límite más bajo
             matches = find_similar(
-                processing_source, limited_candidates, limit=3, minimum_score=90,
+                processing_source, limited_candidates, limit=2, minimum_score=92,
                 cancelled=lambda: False,
                 signature_ready=lambda _: None,
+                mode="estricto",
+                search_duplicates_only=True,  # Solo buscar duplicados exactos
             )
             
             if matches and len(matches) > 0:
                 best_match, score = matches[0]
-                if score >= 90:
+                if score >= 92:  # Umbral más estricto para reducir falsos positivos
                     duplicate_found = True
                     duplicate_info = (best_match, score)
                     
@@ -2134,20 +3283,121 @@ class StickerStudio(tk.Toplevel):
         tags = [tag.strip() for tag in self.tags.get().split(",") if tag.strip()]
         job["category"], job["tags"] = category, tags
         self.database.save_sticker_processing(job["result"], category, tags)
-        image = self.database.approve_processed_sticker(job["result"], category, tags)
-        job["status"] = "Aprobado"
+        if keep_in_session:
+            job["sent_to_processed"] = True
+        else:
+            job["status"] = "Confirmado"
+        filename = Path(job["source_path"]).name
+        # Primera confirmación: se persiste como pendiente de la segunda
+        # revisión. No se publica en el banco ni se vincula a pedidos todavía.
+        if keep_in_session:
+            self.refresh_queue()
+            self.status.set(
+                f"Enviado a revisión: {filename}. El trabajo permanece abierto para exportar o corregir."
+            )
+            self.refresh_callback()
+            return True
+        self.jobs.pop(self.current_index)
+        self.current_index = 0 if self.jobs else None
         self.refresh_queue()
+        if self.current_index is None:
+            self._reset_empty_view()
+        else:
+            self.queue.selection_set("0")
+            self.render_current()
+        self.status.set(
+            f"Enviado a revisión: {filename}. Está disponible en Últimos Procesados; todavía no fue publicado en Biblioteca."
+        )
         self.refresh_callback()
-        self.status.set(f"Aprobado e indexado: {Path(image['path']).name}")
         self._select_next_review()
+        return True
+
+    def try_mask_alternative(self):
+        job = self.current_job()
+        if not job or not job.get("result") or job.get("status") == "Procesando":
+            return
+        if job.get("mask_override") or job.get("creation_mode") == "Sticker de imagen completa":
+            self.status.set("Se conserva la corrección manual o el modo de imagen completa.")
+            return
+        if job.get("recovery_attempts", 0) >= 1:
+            self.status.set("Ya se generó una alternativa. Podés comparar o corregir la silueta.")
+            return
+        winner = job.get("winner")
+        if winner is None:
+            self.status.set("Esperá a que termine la evaluación de las máscaras alternativas.")
+            return
+        from PIL import Image
+        import numpy as np
+        mask = np.asarray(winner.mask)
+        if mask.dtype == bool or mask.max() <= 1:
+            mask = mask.astype(np.uint8) * 255
+        path = Path(job["result"].output_dir) / "mask_alternative.png"
+        Image.fromarray(mask.astype(np.uint8)).save(path)
+        job["recovery_attempts"] = 1
+        self._reprocess_edited_mask(job, str(path))
+
+    def restore_previous_result(self):
+        job = self.current_job()
+        if not job or not job.get("alternatives"):
+            self.status.set("No hay alternativas anteriores para esta imagen.")
+            return
+        if job.get("status") == "Procesando":
+            return
+        previous = job["alternatives"].pop()
+        if job.get("result"):
+            job["alternatives"].insert(0, job["result"])
+        job["result"] = previous
+        job["status"] = "Procesado"
+        for key in ("winner", "decision", "candidates"):
+            job.pop(key, None)
+        self.refresh_queue()
+        self.render_current()
+        self.status.set("Alternativa anterior restaurada para revisión.")
 
     def reprocess_current(self):
         job = self.current_job()
         if not job:
+            self.status.set("Elegí un archivo de la cola para reprocesarlo.")
             return
+        if job.get("status") in {"Procesando", "Buscando duplicados"}:
+            self.status.set("Ese sticker ya se está procesando.")
+            return
+        # La evaluación anterior corresponde al resultado anterior.  Limpiarla
+        # evita mostrar una confianza o alerta vieja mientras llega la nueva.
+        for key in ("winner", "decision", "candidates", "error", "duplicate"):
+            job.pop(key, None)
+        if job.get("result"):
+            alternatives = job.setdefault("alternatives", [])
+            alternatives.append(job["result"])
+            del alternatives[:-5]
+        job["result"] = None
+        mode_overrides = {
+            "Automático": None,
+            "Fondo uniforme": "Ilustración",
+            "Foto / sujeto": "Fotografía",
+            "Sticker existente": "Sticker existente",
+        }
+        job["processing_mode"] = self.processing_mode.get()
+        job["mode_override"] = mode_overrides.get(job["processing_mode"])
+        job["creation_mode"] = self.creation_mode.get()
+        job["full_image_shape"] = self.full_image_shape.get()
+        visual_label = self.visual_classification.get()
+        job["visual_type_label_override"] = visual_label
+        job["visual_type_override"] = (
+            VISUAL_STICKER_TYPE_IDS_BY_LABEL.get(visual_label)
+            if visual_label != "Automática" else None)
+        component_ids: list[int] = []
+        for raw_identifier in self.selected_components.get().split(","):
+            raw_identifier = raw_identifier.strip()
+            if raw_identifier.isdigit() and int(raw_identifier) > 0:
+                component_ids.append(int(raw_identifier))
+        job["selected_component_ids"] = sorted(set(component_ids))
         job["force"] = True
         job["status"] = "Reprocesar"
+        self.progress_value.set(0)
         self.refresh_queue()
+        self.render_current()
+        self.status.set(f"Reprocesando: {Path(job['source_path']).name}")
         self.process_queue()
 
     def open_area_selection(self):
@@ -2157,27 +3407,39 @@ class StickerStudio(tk.Toplevel):
             return
         AreaSelectionEditor(
             self, job["source_path"],
-            lambda box, image, mode: self._apply_area_selection(job, box, image, mode),
+            lambda box, image, mode, angle: self._apply_area_selection(
+                job, box, image, mode, angle),
         )
 
-    def _apply_area_selection(self, job, box, oriented_image, mode):
+    def _apply_area_selection(self, job, box, oriented_image, mode, angle=0.0):
         job.pop("mask_override", None)
         if box is None:
             job.pop("processing_source_path", None)
             job.pop("selection_box", None)
             job.pop("selection_mode", None)
+            job.pop("selection_angle", None)
             message = "Se restauró la imagen completa. Reprocesando el sticker final."
         else:
+            from PIL import Image
             crop = oriented_image.crop(box)
+            # La selección se rota antes de entrar al pipeline. Las esquinas
+            # transparentes quedan fuera del contenido y el borde se calcula
+            # desde su alfa, por lo que acompaña la rotación exactamente.
+            if abs(float(angle)) > 0.001:
+                crop = crop.rotate(
+                    -float(angle), expand=True,
+                    resample=Image.Resampling.BICUBIC,
+                )
             selected_path = self.inbox / f"seleccion_{time.strftime('%Y%m%d_%H%M%S')}_{id(job)}.png"
             crop.save(selected_path, dpi=(300, 300), optimize=False)
             job["processing_source_path"] = str(selected_path)
             job["selection_box"] = tuple(int(value) for value in box)
             job["selection_mode"] = mode
+            job["selection_angle"] = float(angle)
             message = (
-                "Selección guardada completa, sin quitar el fondo."
-                if mode == "selection"
-                else "Área seleccionada. Extrayendo solamente la silueta."
+                "Área seleccionada y rotada: el borde se aplicará solamente alrededor de este recorte."
+                if abs(float(angle)) > 0.001
+                else "Área seleccionada: el borde se aplicará solamente alrededor de este recorte."
             )
         job["force"] = True
         job["status"] = "Reprocesar"
@@ -2210,15 +3472,55 @@ class StickerStudio(tk.Toplevel):
             self.status.set("No hay zonas protegidas. Reprocesando sin restricciones.")
         self.process_queue()
 
+    def create_individual_objects(self):
+        job = self.current_job()
+        result = job.get("result") if job else None
+        components = result.analysis.get("object_components", []) if result else []
+        if not components:
+            self.status.set("Procesá primero en modo múltiples objetos para separarlos.")
+            return
+        source = result.artifacts.get("source_editable") or job["source_path"]
+        for component in components:
+            if not component.get("selected", True):
+                continue
+            self.jobs.append({
+                "source_path": job["source_path"], "processing_source_path": source,
+                "mask_override": component["artifact"], "status": "Pendiente",
+                "creation_mode": "Sticker de silueta", "result": None,
+                "category": job.get("category", ""), "tags": job.get("tags", []),
+                "force": True, "is_png": True, "parent_object_id": component["id"],
+            })
+        self.refresh_queue()
+        self.process_queue()
+
+    def open_cut_editor(self):
+        job = self.current_job()
+        result = job.get("result") if job else None
+        if not result:
+            return
+        def saved(path, _edited):
+            job["cut_mask_override"] = path
+            job.setdefault("alternatives", []).append(result)
+            del job["alternatives"][:-5]
+            job["status"] = "Reprocesar"
+            job["force"] = True
+            self.process_queue()
+        MaskEditor(self, result.artifacts["master"],
+                   job.get("cut_mask_override") or result.artifacts["cut"], saved,
+                   editing_target="cut")
+
     def open_mask(self):
         job = self.current_job()
         result = job.get("result") if job else None
-        path = result.artifacts.get("mask") if result else ""
+        path = (result.artifacts.get("mask_editable") or result.artifacts.get("mask")) if result else ""
         if path and Path(path).exists():
-            source = job.get("processing_source_path") or job["source_path"]
+            source = result.artifacts.get("source_editable") or job.get("processing_source_path") or job["source_path"]
             MaskEditor(self, source, path, lambda saved, edited: self._reprocess_edited_mask(job, saved, edited))
 
     def _reprocess_edited_mask(self, job, path, edited_path=""):
+        if job.get("result"):
+            job.setdefault("alternatives", []).append(job["result"])
+            del job["alternatives"][:-5]
         job["mask_override"] = path
         if edited_path:
             job["processing_source_path"] = edited_path
@@ -2234,9 +3536,9 @@ class StickerStudio(tk.Toplevel):
             return
         if confirm and not messagebox.askyesno("Descartar", "¿Descartar este proceso? El original no será eliminado.", parent=self):
             return
-        job["status"] = "Descartado"
+        job["status"] = "Rechazado"
         if job.get("result"):
-            self.database.set_sticker_processing_status(job["result"].job_id, "Descartado")
+            self.database.discard_processed_sticker(job["result"].job_id)
         self.refresh_queue()
         self._select_next_review()
 
@@ -2246,7 +3548,7 @@ class StickerStudio(tk.Toplevel):
         return self.jobs[self.current_index]
 
     def _select_next_review(self):
-        next_index = next((i for i, job in enumerate(self.jobs) if job["status"] in {"Listo", "Revisar"}), None)
+        next_index = next((i for i, job in enumerate(self.jobs) if job["status"] == "Procesado"), None)
         if next_index is not None:
             self.current_index = next_index
             self.queue.selection_set(str(next_index))
@@ -2266,6 +3568,298 @@ class StickerStudio(tk.Toplevel):
 
         ProcessingProfileEditor(self, self.profile, on_save=_apply)
 
+    def _widget_is_inside(self, widget, ancestor):
+        current = widget
+        while current is not None:
+            if current == ancestor:
+                return True
+            current = getattr(current, "master", None)
+        return False
+
+    def _widget_under_pointer(self):
+        try:
+            return self.winfo_containing(
+                self.winfo_pointerx(),
+                self.winfo_pointery(),
+            )
+        except tk.TclError:
+            return None
+
+    def _is_native_wheel_widget(self, widget):
+        if widget is None:
+            return False
+
+        try:
+            widget_class = str(widget.winfo_class())
+        except tk.TclError:
+            return False
+
+        return widget_class in {
+            "TCombobox",
+            "Combobox",
+            "Listbox",
+            "Text",
+            "Entry",
+            "TEntry",
+            "Spinbox",
+            "TSpinbox",
+        }
+
+    def _scroll_queue_with_direction(self, direction):
+        if not hasattr(self, "queue"):
+            return None
+        try:
+            self.queue.yview_scroll(direction, "units")
+        except Exception:
+            return None
+        return "break"
+
+    def _on_queue_mousewheel(self, event):
+        delta = getattr(event, "delta", 0)
+        if delta == 0:
+            return None
+        direction = -1 if delta > 0 else 1
+        return self._scroll_queue_with_direction(direction)
+
+    def _on_queue_mousewheel_linux(self, event):
+        if event.num == 4:
+            return self._scroll_queue_with_direction(-1)
+        if event.num == 5:
+            return self._scroll_queue_with_direction(1)
+        return None
+
+    def _on_studio_mousewheel(self, event):
+        if not self.winfo_exists():
+            return None
+        widget = self._widget_under_pointer()
+        if widget is None:
+            return None
+
+        # PRIORIDAD 1: panel derecho STICKER FINAL
+        if self._widget_is_inside(widget, getattr(self, "review_panel", None)):
+            if self._is_native_wheel_widget(widget):
+                return None
+
+            delta = getattr(event, "delta", 0)
+
+            if delta == 0:
+                return None
+
+            if abs(delta) >= 120:
+                units = -int(delta / 120)
+            else:
+                units = -1 if delta > 0 else 1
+
+            # Scroll the review panel content
+            if hasattr(self, '_review_canvas'):
+                try:
+                    self._review_canvas.yview_scroll(units, "units")
+                except Exception:
+                    pass
+
+            return "break"
+
+        # PRIORIDAD 2: cola de procesamiento
+        if self._widget_is_inside(widget, self.queue_panel):
+            if isinstance(widget, ttk.Scrollbar):
+                return None
+            protected_types = (
+                ttk.Scale,
+                tk.Scale,
+                ttk.Combobox,
+                tk.Text,
+                tk.Listbox,
+                tk.Spinbox,
+            )
+            if hasattr(ttk, "Spinbox"):
+                protected_types = protected_types + (ttk.Spinbox,)
+            if isinstance(widget, protected_types):
+                return None
+            return self._on_queue_mousewheel(event)
+
+        # MUY IMPORTANTE:
+        # No bloquear la rueda fuera de los dos paneles.
+        return None
+
+    def _on_studio_mousewheel_linux(self, event):
+        if not self.winfo_exists():
+            return None
+        widget = self._widget_under_pointer()
+        if widget is None:
+            return None
+
+        if event.num == 4:
+            units = -1
+        elif event.num == 5:
+            units = 1
+        else:
+            return None
+
+        # PRIORIDAD 1: STICKER FINAL
+        if self._widget_is_inside(widget, getattr(self, "review_panel", None)):
+            if self._is_native_wheel_widget(widget):
+                return None
+
+            # Scroll the review panel content
+            if hasattr(self, '_review_canvas'):
+                try:
+                    self._review_canvas.yview_scroll(units, "units")
+                except Exception:
+                    pass
+
+            return "break"
+
+        # PRIORIDAD 2: COLA
+        if self._widget_is_inside(widget, self.queue_panel):
+            if widget == self.queue or self._widget_is_inside(widget, self.queue):
+                return None
+            if isinstance(widget, ttk.Scrollbar):
+                return None
+            self.queue.yview_scroll(units, "units")
+            return "break"
+
+        return None
+
+    def _bind_studio_mousewheel(self):
+        self._mousewheel_bindings = [
+            "<MouseWheel>",
+            "<Button-4>",
+            "<Button-5>",
+        ]
+        self.bind_all("<MouseWheel>", self._on_studio_mousewheel)
+        self.bind_all("<Button-4>", self._on_studio_mousewheel_linux)
+        self.bind_all("<Button-5>", self._on_studio_mousewheel_linux)
+
+        if hasattr(self, "queue"):
+            self.queue.bind("<Enter>", lambda event: self.queue.focus_set(), add="+")
+        # Los enlaces locales mantienen el desplazamiento de la cola aun
+        # cuando otro control toma el foco antes de que actúe bind_all.
+        for widget in (getattr(self, "queue_panel", None), getattr(self, "queue", None)):
+            if widget is not None:
+                widget.bind("<MouseWheel>", self._on_queue_mousewheel, add="+")
+                widget.bind("<Button-4>", self._on_queue_mousewheel_linux, add="+")
+                widget.bind("<Button-5>", self._on_queue_mousewheel_linux, add="+")
+
+    def _unbind_studio_mousewheel(self):
+        for sequence in getattr(self, "_mousewheel_bindings", []):
+            try:
+                self.unbind_all(sequence)
+            except tk.TclError:
+                pass
+        self._mousewheel_bindings = []
+
+    def toggle_note_mode(self):
+        """Alterna entre vista completa y vista simplificada de nota (solo cola)."""
+        print(f"[toggle_note_mode] Iniciando, modo actual: {self._note_mode}")
+        self._note_mode = not self._note_mode
+        
+        if self._note_mode:
+            print("[toggle_note_mode] Entrando en modo nota")
+            # Entrar en modo nota: ocultar header, status strip y panel de revisión
+            # Guardar estado actual
+            self._original_geometry = self.geometry()
+            
+            # Ocultar header y status strip
+            if hasattr(self, '_header_frame'):
+                print("[toggle_note_mode] Ocultando header")
+                self._header_frame.pack_forget()
+            if hasattr(self, '_status_strip'):
+                print("[toggle_note_mode] Ocultando status strip")
+                self._status_strip.pack_forget()
+            
+            # Ocultar panel de revisión del PanedWindow
+            if hasattr(self, 'main_body'):
+                print("[toggle_note_mode] Ocultando panel de revisión")
+                self.main_body.remove(self.review_panel)
+            
+            # Crear botón para volver al modo completo
+            print("[toggle_note_mode] Creando botón de volver")
+            self._note_mode_back_btn = tk.Frame(self, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
+            self._note_mode_back_btn.pack(fill="x", padx=5, pady=5)
+            ttk.Button(self._note_mode_back_btn, text="← Volver al Creador de Stickers", 
+                      command=self.toggle_note_mode, style="Primary.TButton").pack(pady=5)
+            
+            # Cambiar título para indicar modo nota
+            self.title("📝 Cola de Procesamiento - Modo Nota")
+            
+            # Redimensionar ventana para formato compacto de nota
+            self.geometry("450x500")
+            self.minsize(350, 300)
+            self.resizable(True, True)
+            
+            self.status.set("Modo nota: Solo cola visible para copiar/pegar fácilmente")
+            print("[toggle_note_mode] Modo nota activado")
+        else:
+            print("[toggle_note_mode] Volviendo a vista completa")
+            # Volver a vista completa
+            # Eliminar botón de volver si existe
+            if hasattr(self, '_note_mode_back_btn') and self._note_mode_back_btn:
+                print("[toggle_note_mode] Eliminando botón de volver")
+                self._note_mode_back_btn.pack_forget()
+                self._note_mode_back_btn = None
+            
+            # Restaurar header y status strip
+            if hasattr(self, '_header_frame'):
+                print("[toggle_note_mode] Restaurando header")
+                self._header_frame.pack(fill="x", padx=14, pady=(14, 8), before=self.main_body)
+            if hasattr(self, '_status_strip'):
+                print("[toggle_note_mode] Restaurando status strip")
+                self._status_strip.pack(fill="x", padx=14, pady=(0, 8), before=self.main_body)
+            
+            # Restaurar panel de revisión
+            if hasattr(self, 'main_body') and hasattr(self, 'review_panel'):
+                print("[toggle_note_mode] Restaurando panel de revisión")
+                self.main_body.add(self.review_panel, minsize=550)
+            
+            # Restaurar título original
+            self.title("Creador de stickers")
+            
+            # Restaurar geometría original
+            if hasattr(self, '_original_geometry'):
+                print("[toggle_note_mode] Restaurando geometría")
+                self.geometry(self._original_geometry)
+                _fit_window_to_screen(self, 1240, 790, 980, 650, width_ratio=0.96, height_ratio=0.88)
+            
+            self.status.set("Vista completa restaurada")
+            print("[toggle_note_mode] Vista completa restaurada")
+
+    def set_target_order(self, order_id: int | None, nominal_size_cm: float | None = None):
+        """Configura o cambia el pedido vinculado para guardar stickers automáticamente."""
+        self.target_order_id = order_id
+        self.nominal_size_cm = nominal_size_cm
+        self.profile.nominal_size_cm = nominal_size_cm
+        
+        # Actualizar el label de información si existe
+        if self._order_info_label is not None and self._order_info_label.winfo_exists():
+            if order_id is not None:
+                try:
+                    order = self.database.order(order_id)
+                    client_name = order.get("client") or f"Pedido #{order_id}"
+                    if nominal_size_cm is not None:
+                        subtitle_text = (f"🎯 Vinculado a: {client_name} · Nominal: "
+                                         f"{nominal_size_cm:.2f} cm · asset preparado al máximo productivo.")
+                    else:
+                        subtitle_text = (f"🎯 Vinculado a: {client_name} · Sin tamaño nominal único: "
+                                         "el procesamiento queda en modo legacy y no se vincula automáticamente.")
+                except Exception:
+                    subtitle_text = f"🎯 Vinculado a pedido #{order_id}."
+            else:
+                subtitle_text = "Procesamiento genérico legacy (maestro 5,70 cm; sin nominal comercial)."
+            
+            self._order_info_label.config(text=subtitle_text)
+        
+        # Actualizar el título de la ventana
+        if order_id is not None:
+            try:
+                order = self.database.order(order_id)
+                client_name = order.get("client") or f"Pedido #{order_id}"
+                self.title(f"Creador de stickers - {client_name}")
+            except Exception:
+                self.title(f"Creador de stickers - Pedido #{order_id}")
+        else:
+            self.title("Creador de stickers")
+
     def close(self):
         self.cancel_event.set()
+        self._unbind_studio_mousewheel()
         self.destroy()

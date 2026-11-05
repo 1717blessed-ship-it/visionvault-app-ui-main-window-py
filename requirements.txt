@@ -1,5 +1,6 @@
 # Pillow es opcional: permite miniaturas para más formatos de imagen.
 Pillow>=10.0
+PyMuPDF>=1.24
 # Permite arrastrar imágenes de Doccione a otras aplicaciones de Windows.
 tkinterdnd2>=0.4.3
 # Análisis local con IA: texto OCR y descripción del contenido de los stickers.
@@ -12,3 +13,5 @@ torchvision>=0.21
 sentencepiece>=0.2
 # Notificaciones push a dispositivos móviles vía Firebase Cloud Messaging.
 firebase-admin>=6.5
+# Monitoreo de cambios en el sistema de archivos
+watchdog>=3.0

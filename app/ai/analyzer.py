@@ -115,10 +115,10 @@ def analyze_image(path: str, progress=None) -> dict:
         missing.append("descripción visual")
     except Exception as error:
         errors.append(f"Descripción visual: {type(error).__name__}: {str(error)[:140]}")
-    suggestions = []
-    if caption:
-        suggestions.append(caption)
-    suggestions.extend(words)
+    from app.ai.tagging import individual_tags
+
+    # Cada propuesta debe poder aceptarse o descartarse individualmente.
+    suggestions = individual_tags(caption, *words)
     progress("Análisis completado.")
     from app.ai.cultural import cultural_references
 

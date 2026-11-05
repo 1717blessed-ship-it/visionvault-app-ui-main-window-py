@@ -6,13 +6,19 @@ import json
 import logging
 import threading
 import time
+from datetime import datetime
 
 from app.events.event_repository import EventRepository
+from app.events.event_types import PRODUCTION_ERROR
 from app.notifications.firebase_sender import SendPayload, SendResult, send_push
+from app.services.mobile_runtime_config_service import MobileRuntimeConfigService
 
 logger = logging.getLogger(__name__)
 
 _MAX_ATTEMPTS = 5
+_QUIET_FROM_KEY = "notifications.quiet_from"
+_QUIET_TO_KEY = "notifications.quiet_to"
+_QUIET_ERRORS_BYPASS_KEY = "notifications.quiet_errors_bypass"
 
 
 class NotificationService:
@@ -66,7 +72,52 @@ class NotificationService:
             return
 
         for item in pending:
+            if self._should_pause_for_quiet_hours(item):
+                logger.debug("Push retenido por horario silencioso: outbox=%s", item["id"])
+                continue
             self._send_one(item)
+
+    def _setting(self, key: str, default: str) -> str:
+        """Lee una preferencia sin romper el worker en bases antiguas o parciales."""
+        try:
+            row = self.repo.conn.execute(
+                "SELECT setting_value FROM app_settings WHERE setting_key = ?",
+                (key,),
+            ).fetchone()
+        except Exception:
+            return default
+        return str(row[0]) if row else default
+
+    @staticmethod
+    def _clock_minutes(value: str, default: int) -> int:
+        try:
+            hours, minutes = (int(part) for part in value.split(":", 1))
+            if 0 <= hours <= 23 and 0 <= minutes <= 59:
+                return hours * 60 + minutes
+        except (TypeError, ValueError):
+            pass
+        return default
+
+    def _quiet_hours_active(self, now: datetime | None = None) -> bool:
+        """Indica si la hora local cae dentro del intervalo configurado."""
+        current = now or datetime.now()
+        current_minutes = current.hour * 60 + current.minute
+        start = self._clock_minutes(self._setting(_QUIET_FROM_KEY, "23:00"), 23 * 60)
+        end = self._clock_minutes(self._setting(_QUIET_TO_KEY, "07:00"), 7 * 60)
+        if start == end:
+            return False
+        if start < end:
+            return start <= current_minutes < end
+        return current_minutes >= start or current_minutes < end
+
+    def _should_pause_for_quiet_hours(self, item: dict, now: datetime | None = None) -> bool:
+        if not self._quiet_hours_active(now):
+            return False
+        bypass_enabled = self._setting(_QUIET_ERRORS_BYPASS_KEY, "1").strip().lower() not in {
+            "0", "false", "no", "off",
+        }
+        is_production_error = item.get("event_type") == PRODUCTION_ERROR
+        return not (bypass_enabled and is_production_error)
 
     def _send_one(self, item: dict) -> None:
         """Envía un solo mensaje del outbox."""
@@ -74,8 +125,19 @@ class NotificationService:
         self.repo.mark_outbox_processing(item["id"])
 
         token = item["recipient_id"]
-        title = item["title"]
-        message = item["message"]
+        runtime_service = MobileRuntimeConfigService(self.repo.conn)
+        runtime = runtime_service.snapshot()
+        if not runtime["features"].get("push_notifications", True):
+            # Se consume deliberadamente para que el outbox no crezca mientras
+            # las notificaciones están pausadas desde Studio.
+            self.repo.mark_outbox_sent(item["id"])
+            logger.info("Push omitido por configuración: outbox=%s", item["id"])
+            return
+        title, message = runtime_service.notification_text(
+            item.get("event_type", ""),
+            item["title"],
+            item["message"],
+        )
 
         # Verificar si Firebase está inicializado
         from app.notifications.firebase_sender import _firebase_initialized

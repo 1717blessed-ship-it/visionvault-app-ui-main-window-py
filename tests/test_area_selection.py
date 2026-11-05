@@ -4,6 +4,7 @@ from pathlib import Path
 from PIL import Image
 import time
 
+
 from app.stickers.editor import AreaSelectionEditor
 
 

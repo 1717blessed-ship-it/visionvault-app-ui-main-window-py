@@ -119,9 +119,10 @@ class AttentionDashboard(tk.Toplevel):
         # Filtrar pedidos que necesitan atención
         urgent_orders = []
         for order in self.orders:
-            # Excluir archivados y entregados
+            # Excluir pedidos cerrados; la entrega se persiste como Terminado
+            # en el cierre transaccional del tablero de producción.
             status = str(order.get("status", ""))
-            if status in ("Archivado", "Entregado"):
+            if status in ("Archivado", "Finalizado", "Entregado", "Terminado", "Cancelado"):
                 continue
             
             # Calcular prioridad

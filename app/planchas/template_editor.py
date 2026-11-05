@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import copy
+import json
 import tkinter as tk
+import time
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -18,17 +20,26 @@ from app.planchas.template_model import (
 from app.ui.theme import COLORS, IDENTITY_FONT, UI_FONT, configure_menu, configure_plancha_styles
 
 
-class RegularTemplateEditor(tk.Toplevel):
+class RegularTemplateEditor(tk.Frame):
     """Editor de casillas fijas que trabaja con referencias a imágenes."""
 
     PAPER_RATIO = 21 / 29.7
+    PRINT_SCALE = 0.9727
+    PRINT_OUTLINE_PX = 4
 
     def __init__(self, master, images: list[dict] | None = None, project: RegularTemplateProject | None = None,
-                 database=None, library_images: list[dict] | None = None):
-        super().__init__(master)
-        self.title("Plancha regular · Armado de planchas")
-        self.geometry("1240x800")
-        self.minsize(980, 620)
+                 database=None, library_images: list[dict] | None = None, order_id: int | None = None,
+                 plancha_id: int | None = None, person_name: str = "", person_phone: str = "", host=None):
+        self.app = master
+        self._standalone_window = None
+        parent = host
+        if parent is None:
+            self._standalone_window = tk.Toplevel(master)
+            self._standalone_window.title("Plancha regular · Armado de planchas")
+            self._standalone_window.geometry("1240x800")
+            self._standalone_window.minsize(980, 620)
+            parent = self._standalone_window
+        super().__init__(parent)
         self.configure(background=COLORS.background)
         self.project = project or RegularTemplateProject.from_images(images or [], apply_recommendation=False)
         self._pattern_proposal = (
@@ -37,6 +48,12 @@ class RegularTemplateEditor(tk.Toplevel):
         )
         self.database = database
         self.library_images = library_images or []
+        self.order_id = order_id
+        self.plancha_id = plancha_id
+        self.person_name = person_name.strip()
+        self.person_phone = person_phone.strip()
+        self.project_path = ""
+        self.final_png_path = ""
         self.selected_cells: set[str] = set()
         self.selected_resource_id: str | None = self.project.resources[0].resource_id if self.project.resources else None
         self.history: list[dict] = []
@@ -58,6 +75,8 @@ class RegularTemplateEditor(tk.Toplevel):
         self.mode_value = tk.StringVar(value="Rellenar")
         self.status_value = tk.StringVar()
         self._build()
+        if self._standalone_window is not None:
+            self.pack(fill="both", expand=True)
         self.render()
         if self._pattern_proposal and self._pattern_proposal["pattern_id"] != self.project.pattern_id:
             self.after_idle(self.offer_recommended_pattern)
@@ -69,29 +88,35 @@ class RegularTemplateEditor(tk.Toplevel):
         toolbar.pack(fill="x")
         ttk.Button(toolbar, text="Patrones", command=lambda *a, _fn=self.choose_pattern: _fn(*a), style="Template.Primary.TButton").pack(side="left", padx=(12, 5))
         ttk.Button(toolbar, text="Nueva imagen", command=lambda *a, _fn=self.add_images: _fn(*a), style="Template.Primary.TButton").pack(side="left", padx=(12, 5))
-        ttk.Button(toolbar, text="Asignar", command=lambda *a, _fn=self.assign_selected_resource: _fn(*a), style="Template.Primary.TButton").pack(side="left", padx=5)
+        ttk.Button(toolbar, text="Pegar imagen", command=lambda *a, _fn=self.paste_image: _fn(*a), style="Template.Primary.TButton").pack(side="left", padx=5)
+        ttk.Button(toolbar, text="Asignar todos", command=lambda *a, _fn=self.assign_all_cells: _fn(*a), style="Template.Primary.TButton").pack(side="left", padx=5)
+        ttk.Button(toolbar, text="Asignar individual", command=lambda *a, _fn=self.assign_selected_resource: _fn(*a), style="Template.Secondary.TButton").pack(side="left", padx=5)
         ttk.Button(toolbar, text="Rellenar", command=lambda: self.apply_mode("Rellenar"), style="Template.Secondary.TButton").pack(side="left", padx=5)
         ttk.Button(toolbar, text="Ajustar", command=lambda: self.apply_mode("Ajustar"), style="Template.Secondary.TButton").pack(side="left", padx=5)
         ttk.Button(toolbar, text="Restablecer", command=lambda *a, _fn=self.reset_cells: _fn(*a), style="Template.Secondary.TButton").pack(side="left", padx=5)
         ttk.Button(toolbar, text="Deshacer", command=lambda *a, _fn=self.undo: _fn(*a), style="Template.Secondary.TButton").pack(side="left", padx=(22, 5))
         ttk.Button(toolbar, text="Rehacer", command=lambda *a, _fn=self.redo: _fn(*a), style="Template.Secondary.TButton").pack(side="left", padx=5)
-        ttk.Button(toolbar, text="Convertir a libre", command=lambda *a, _fn=self.convert_to_free_plancha: _fn(*a), style="Template.Primary.TButton").pack(side="right", padx=12)
 
         body = tk.Frame(self, background=COLORS.background)
         body.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        body.grid_columnconfigure(0, minsize=120, weight=0)
         body.grid_columnconfigure(1, weight=1)
         body.grid_rowconfigure(0, weight=1)
 
-        left = tk.Frame(body, background=COLORS.panel, width=250, highlightbackground=COLORS.border, highlightthickness=1)
+        # El panel de recursos acompaña al armado: la previsualización es la
+        # zona principal y necesita conservar la mayor parte del ancho.
+        left = tk.Frame(body, background=COLORS.panel, width=120, highlightbackground=COLORS.border, highlightthickness=1)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         left.grid_propagate(False)
-        tk.Label(left, text="IMÁGENES", background=COLORS.panel, foreground=COLORS.wine_active, font=(IDENTITY_FONT, 12, "bold")).pack(anchor="w", padx=12, pady=(13, 5))
-        tk.Label(left, text="Recursos del proyecto · no se duplican archivos", background=COLORS.panel, foreground=COLORS.muted, wraplength=220, justify="left", font=(UI_FONT, 10)).pack(anchor="w", padx=12, pady=(0, 8))
-        self.resources_canvas = tk.Canvas(left, background=COLORS.panel, highlightthickness=0, borderwidth=0)
+        tk.Label(left, text="IMÁGENES", background=COLORS.panel, foreground=COLORS.wine_active, font=(IDENTITY_FONT, 10, "bold")).pack(anchor="w", padx=8, pady=(10, 3))
+        tk.Label(left, text="Clic derecho para quitar.", background=COLORS.panel, foreground=COLORS.muted, wraplength=100, justify="left", font=(UI_FONT, 8)).pack(anchor="w", padx=8, pady=(0, 6))
+        # Canvas fija su solicitud de ancho; sin este valor Tk conserva el
+        # predeterminado (muy ancho) aunque el panel lateral sea angosto.
+        self.resources_canvas = tk.Canvas(left, width=105, background=COLORS.panel, highlightthickness=0, borderwidth=0)
         resource_scroll = ttk.Scrollbar(left, orient="vertical", command=lambda *a, _fn=self.resources_canvas.yview: _fn(*a))
         self.resources_canvas.configure(yscrollcommand=resource_scroll.set)
         resource_scroll.pack(side="right", fill="y", pady=(0, 8))
-        self.resources_canvas.pack(fill="both", expand=True, padx=(8, 0), pady=(0, 8))
+        self.resources_canvas.pack(fill="both", expand=True, padx=(5, 0), pady=(0, 5))
         self.resources_inner = tk.Frame(self.resources_canvas, background=COLORS.panel)
         self.resources_window = self.resources_canvas.create_window((0, 0), window=self.resources_inner, anchor="nw")
         self.resources_inner.bind("<Configure>", lambda _event: self.resources_canvas.configure(scrollregion=self.resources_canvas.bbox("all")))
@@ -138,8 +163,8 @@ class RegularTemplateEditor(tk.Toplevel):
         footer.pack(fill="x")
         tk.Label(footer, textvariable=self.status_value, background=COLORS.panel, foreground=COLORS.text, font=(UI_FONT, 10)).pack(side="left", padx=14)
         ttk.Button(footer, text="Abrir proyecto", command=lambda *a, _fn=self.open_project: _fn(*a), style="Template.Secondary.TButton").pack(side="right", padx=(4, 12))
-        ttk.Button(footer, text="Guardar proyecto", command=lambda *a, _fn=self.save_project: _fn(*a), style="Template.Primary.TButton").pack(side="right", padx=4)
-        ttk.Button(footer, text="Exportar · etapa 4", state="disabled", style="Template.Secondary.TButton").pack(side="right", padx=4)
+        ttk.Button(footer, text="Guardar proyecto", command=lambda *a, _fn=self.save_project: _fn(*a), style="Template.Secondary.TButton").pack(side="right", padx=4)
+        ttk.Button(footer, text="Guardar en Producción e impresión", command=lambda *a, _fn=self.save_to_production: _fn(*a), style="Template.Primary.TButton").pack(side="right", padx=4)
 
     def _property_scale(self, parent, label, variable, start, end, resolution, command):
         tk.Label(parent, text=label, background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 10)).pack(anchor="w", padx=13)
@@ -192,8 +217,17 @@ class RegularTemplateEditor(tk.Toplevel):
         dialog.configure(background=COLORS.background)
         dialog.transient(self)
         dialog.grab_set()
-        dialog.geometry("760x470")
-        dialog.resizable(False, False)
+        # Seven patterns require three rows.  The old 470 px dialog clipped
+        # the final row, making a valid option inaccessible.
+        dialog.resizable(True, True)
+        dialog.minsize(700, 500)
+        self.update_idletasks()
+        width = min(900, max(700, self.winfo_screenwidth() - 120))
+        height = min(650, max(500, self.winfo_screenheight() - 120))
+        x = max(0, self.winfo_rootx() + (self.winfo_width() - width) // 2)
+        y = max(0, self.winfo_rooty() + (self.winfo_height() - height) // 2)
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
         margin_text = f"{REGULAR_MARGIN_CM:.2f}".replace(".", ",")
         gap_text = f"{REGULAR_GAP_CM:.2f}".replace(".", ",")
         tk.Label(dialog, text="PATRONES REGULARES", background=COLORS.background, foreground=COLORS.text, font=(IDENTITY_FONT, 18, "bold")).pack(anchor="w", padx=22, pady=(20, 3))
@@ -207,8 +241,18 @@ class RegularTemplateEditor(tk.Toplevel):
             foreground=COLORS.muted,
             font=(UI_FONT, 10),
         ).pack(anchor="w", padx=22, pady=(0, 14))
-        grid = tk.Frame(dialog, background=COLORS.background)
-        grid.pack(fill="both", expand=True, padx=18, pady=(0, 12))
+        content = tk.Frame(dialog, background=COLORS.background)
+        content.pack(fill="both", expand=True, padx=18, pady=(0, 8))
+        pattern_canvas = tk.Canvas(content, background=COLORS.background, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(content, orient="vertical", command=pattern_canvas.yview)
+        pattern_canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        pattern_canvas.pack(side="left", fill="both", expand=True)
+        grid = tk.Frame(pattern_canvas, background=COLORS.background)
+        grid_window = pattern_canvas.create_window((0, 0), window=grid, anchor="nw")
+        grid.bind("<Configure>", lambda _event: pattern_canvas.configure(scrollregion=pattern_canvas.bbox("all")))
+        pattern_canvas.bind("<Configure>", lambda event: pattern_canvas.itemconfigure(grid_window, width=event.width))
+        pattern_canvas.bind("<MouseWheel>", lambda event: pattern_canvas.yview_scroll(-1 * (event.delta // 120), "units"))
         for column in range(3):
             grid.grid_columnconfigure(column, weight=1)
 
@@ -229,14 +273,23 @@ class RegularTemplateEditor(tk.Toplevel):
                 highlightthickness=2 if selected else 1,
                 highlightbackground=COLORS.wine_active if selected else COLORS.border,
             )
-            card.grid(row=row, column=column, sticky="nsew", padx=5, pady=5)
+            card.grid(row=row, column=column, sticky="nsew", padx=5, pady=5, ipady=2)
             tk.Label(card, text=str(pattern["title"]), background=COLORS.panel_elevated, foreground=COLORS.text, font=(IDENTITY_FONT, 11, "bold")).pack(anchor="w", padx=12, pady=(12, 3))
             tk.Label(card, text=str(pattern["detail"]), background=COLORS.panel_elevated, foreground=COLORS.muted, font=(UI_FONT, 9)).pack(anchor="w", padx=12)
             ratio = self.project.cell_ratio(pattern_id)
             tk.Label(card, text=f"Celda {ratio:.2f} de proporción", background=COLORS.panel_elevated, foreground=COLORS.muted, font=(UI_FONT, 9)).pack(anchor="w", padx=12, pady=(4, 8))
             ttk.Button(card, text="Usar patrón", command=lambda value=pattern_id: apply(value), style="Template.Primary.TButton").pack(anchor="w", padx=12, pady=(0, 12))
 
-        ttk.Button(dialog, text="Cancelar", command=dialog.destroy, style="Template.Secondary.TButton").pack(anchor="e", padx=22, pady=(0, 18))
+        actions = tk.Frame(dialog, background=COLORS.panel, pady=10)
+        actions.pack(fill="x")
+        tk.Label(
+            actions,
+            text="Selecciona el formato que mejor acompane la proporcion de tus disenos.",
+            background=COLORS.panel,
+            foreground=COLORS.muted,
+            font=(UI_FONT, 9),
+        ).pack(side="left", padx=18)
+        ttk.Button(actions, text="Cancelar", command=dialog.destroy, style="Template.Secondary.TButton").pack(side="right", padx=18)
 
     def offer_recommended_pattern(self):
         """Presenta la recomendación; nunca cambia la plancha silenciosamente."""
@@ -260,29 +313,6 @@ class RegularTemplateEditor(tk.Toplevel):
         self._preview_cache.clear()
         self.render()
 
-    def convert_to_free_plancha(self):
-        """Entrega la plancha regular al editor libre conservando cada casilla."""
-        if not any(cell.resource_id for cell in self.project.cells):
-            messagebox.showinfo("Plancha libre", "Primero agregá o asigná al menos un diseño al patrón.", parent=self)
-            return
-        if not messagebox.askyesno(
-            "Convertir a libre",
-            "Se conservará el patrón actual con sus medidas y límites. Después podrás mover los diseños manualmente.\n\n¿Continuar?",
-            parent=self,
-        ):
-            return
-        from app.planchas.editor import PlanchaEditor
-
-        project = self.project.to_free_project()
-        PlanchaEditor(
-            self.master,
-            [],
-            database=self.database,
-            library_images=self.library_images,
-            project=project,
-            preserve_layout=True,
-        )
-
     def add_images(self):
         paths = filedialog.askopenfilenames(title="Cargar imágenes para la plantilla", filetypes=[("Imágenes", "*.png *.jpg *.jpeg *.webp *.bmp *.gif"), ("Todos los archivos", "*.*")])
         if not paths:
@@ -299,6 +329,45 @@ class RegularTemplateEditor(tk.Toplevel):
         self._preview_cache.clear()
         self.render()
 
+    def paste_image(self):
+        """Agrega al banco una imagen o archivo de imagen del portapapeles."""
+        try:
+            from PIL import Image, ImageGrab
+
+            content = ImageGrab.grabclipboard()
+            if isinstance(content, Image.Image):
+                folder = Path(__file__).resolve().parents[2] / "outputs" / "imagenes_pegadas"
+                folder.mkdir(parents=True, exist_ok=True)
+                target = folder / f"plancha_regular_{time.strftime('%Y%m%d_%H%M%S')}.png"
+                counter = 1
+                while target.exists():
+                    target = folder / f"plancha_regular_{time.strftime('%Y%m%d_%H%M%S')}_{counter}.png"
+                    counter += 1
+                content.convert("RGBA").save(target)
+                paths = [target]
+            elif isinstance(content, list):
+                paths = [Path(item) for item in content if Path(item).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}]
+            else:
+                paths = []
+        except Exception as error:
+            messagebox.showerror("Pegar imagen", f"No se pudo leer el portapapeles:\n{error}", parent=self)
+            return
+
+        if not paths:
+            messagebox.showinfo("Pegar imagen", "Copiá una imagen o un archivo de imagen e intentá nuevamente.", parent=self)
+            return
+        self.snapshot()
+        for path in paths:
+            if path.is_file():
+                resource = self.project.add_resource(str(path))
+                self.selected_resource_id = resource.resource_id
+        if self.project.resources:
+            self.project.apply_pattern(self.project.recommended_pattern(self.project.resources), preserve_content=False)
+        self.selected_cells.clear()
+        self._preview_cache.clear()
+        self.render()
+        self.status_value.set(f"{len(paths)} imagen(es) pegada(s) en el banco.")
+
     def assign_selected_resource(self):
         if not self.selected_resource_id:
             messagebox.showinfo("Plancha regular", "Primero cargá o seleccioná una imagen.", parent=self)
@@ -308,6 +377,16 @@ class RegularTemplateEditor(tk.Toplevel):
             return
         self.snapshot()
         self.project.assign(self.selected_cells, self.selected_resource_id)
+        self.render()
+
+    def assign_all_cells(self):
+        """Completa el patrón con el recurso elegido, sin requerir selección."""
+        if not self.selected_resource_id:
+            messagebox.showinfo("Plancha regular", "Primero cargá o seleccioná una imagen.", parent=self)
+            return
+        self.snapshot()
+        self.project.assign({cell.cell_id for cell in self.project.cells}, self.selected_resource_id)
+        self.selected_cells.clear()
         self.render()
 
     def apply_mode(self, mode: str):
@@ -371,7 +450,19 @@ class RegularTemplateEditor(tk.Toplevel):
         return None
 
     def cell_at(self, x: int, y: int) -> str | None:
-        return next((key for key, box in self._cell_boxes.items() if box[0] <= x <= box[2] and box[1] <= y <= box[3]), None)
+        for key, box in self._cell_boxes.items():
+            if not (box[0] <= x <= box[2] and box[1] <= y <= box[3]):
+                continue
+            cell = self.project.cell(key)
+            if cell and cell.shape == "circle":
+                radius_x = max(1, (box[2] - box[0]) / 2)
+                radius_y = max(1, (box[3] - box[1]) / 2)
+                normalized_x = (x - (box[0] + radius_x)) / radius_x
+                normalized_y = (y - (box[1] + radius_y)) / radius_y
+                if normalized_x * normalized_x + normalized_y * normalized_y > 1:
+                    continue
+            return key
+        return None
 
     def show_context_menu(self, event):
         cell_id = self.cell_at(event.x, event.y)
@@ -490,12 +581,12 @@ class RegularTemplateEditor(tk.Toplevel):
         resource = self.project.resource(cell.resource_id)
         if not resource:
             return None
-        key = (cell.cell_id, resource.modified, width, height, cell.frame_mode, round(cell.zoom, 3), round(cell.offset_x, 3), round(cell.offset_y, 3), cell.rotation)
+        key = (cell.cell_id, resource.modified, width, height, cell.shape, cell.frame_mode, round(cell.zoom, 3), round(cell.offset_x, 3), round(cell.offset_y, 3), cell.rotation)
         cached = self._preview_cache.get(key)
         if cached:
             return cached
         try:
-            from PIL import Image, ImageTk
+            from PIL import Image, ImageChops, ImageTk
             image = self.resource_image(resource.resource_id)
             if image is None:
                 return None
@@ -513,6 +604,11 @@ class RegularTemplateEditor(tk.Toplevel):
             x = round((width - target.width) / 2 + cell.offset_x * width)
             y = round((height - target.height) / 2 + cell.offset_y * height)
             result.alpha_composite(target, (x, y))
+            if cell.shape == "circle":
+                from PIL import ImageDraw
+                mask = Image.new("L", (width, height), 0)
+                ImageDraw.Draw(mask).ellipse((0, 0, width - 1, height - 1), fill=255)
+                result.putalpha(ImageChops.multiply(result.getchannel("A"), mask))
             photo = ImageTk.PhotoImage(result)
             self._preview_cache[key] = photo
             return photo
@@ -539,23 +635,64 @@ class RegularTemplateEditor(tk.Toplevel):
             return
         for resource in self.project.resources:
             selected = resource.resource_id == self.selected_resource_id
-            card = tk.Frame(self.resources_inner, background="#3c1014" if selected else "#1a1d1e", highlightbackground="#d60916" if selected else "#303436", highlightthickness=1, padx=6, pady=6)
+            card = tk.Frame(self.resources_inner, background="#3c1014" if selected else "#1a1d1e", highlightbackground="#d60916" if selected else "#303436", highlightthickness=1, padx=4, pady=4)
             card.pack(fill="x", padx=3, pady=3)
             thumb = self.resource_thumbnail(resource.resource_id)
             self._resource_photos.append(thumb)
             image_label = tk.Label(card, image=thumb, text="Sin vista previa" if thumb is None else "", compound="center", width=62, height=62, background="#0c0d0e", foreground="#b9a79b")
-            image_label.pack(side="left", padx=(0, 7))
+            image_label.pack(anchor="w")
             details = tk.Frame(card, background=card.cget("background"))
-            details.pack(fill="x")
-            tk.Label(details, text=resource.name, background=card.cget("background"), foreground="#fff4ec", wraplength=142, justify="left", font=("Bahnschrift", 9, "bold")).pack(anchor="w")
-            tk.Label(details, text=f"Usado: {self.project.usage_count(resource.resource_id)} casilla(s)", background=card.cget("background"), foreground="#c7b6aa", justify="left").pack(anchor="w", pady=(4, 0))
-            tk.Label(details, text=f"{resource.width_px} × {resource.height_px} px" if resource.width_px else "Calidad sin verificar", background=card.cget("background"), foreground="#a1bca7", justify="left").pack(anchor="w")
-            for widget in (card, image_label, details):
+            details.pack(fill="x", pady=(4, 0))
+            title = tk.Label(details, text=resource.name, background=card.cget("background"), foreground="#fff4ec", wraplength=92, justify="left", font=("Bahnschrift", 8, "bold"))
+            title.pack(anchor="w")
+            usage = tk.Label(details, text=f"Usado: {self.project.usage_count(resource.resource_id)}", background=card.cget("background"), foreground="#c7b6aa", justify="left", font=(UI_FONT, 8))
+            usage.pack(anchor="w", pady=(2, 0))
+            for widget in (card, image_label, details, title, usage):
                 widget.bind("<Button-1>", lambda _event, value=resource.resource_id: self.select_resource(value))
+                widget.bind("<Button-3>", lambda event, value=resource.resource_id: self.show_resource_menu(event, value))
 
     def select_resource(self, resource_id: str):
         self.selected_resource_id = resource_id
         self.render_resources()
+
+    def remove_resource(self, resource_id: str):
+        """Quita el recurso del banco y vacía las casillas que lo usaban."""
+        resource = self.project.resource(resource_id)
+        if not resource:
+            return
+        used = self.project.usage_count(resource_id)
+        if not messagebox.askyesno(
+            "Quitar imagen",
+            f"¿Quitar «{resource.name}» de esta plancha?"
+            + (f"\n\nTambién se vaciarán {used} casilla(s)." if used else "")
+            + "\n\nEl archivo original no se elimina.",
+            parent=self,
+        ):
+            return
+        self.snapshot()
+        self.project.resources = [item for item in self.project.resources if item.resource_id != resource_id]
+        for cell in self.project.cells:
+            if cell.resource_id == resource_id:
+                cell.resource_id = None
+                cell.zoom = 1.0
+                cell.offset_x = cell.offset_y = 0.0
+        if self.selected_resource_id == resource_id:
+            self.selected_resource_id = self.project.resources[0].resource_id if self.project.resources else None
+        self._source_cache.pop(resource_id, None)
+        self._preview_cache.clear()
+        self.render()
+        self.status_value.set(f"Imagen quitada del banco. El archivo original se conserva.")
+
+    def show_resource_menu(self, event, resource_id: str):
+        self.select_resource(resource_id)
+        menu = tk.Menu(self, tearoff=False)
+        configure_menu(menu)
+        menu.add_command(label="Quitar imagen de la plancha", command=lambda: self.remove_resource(resource_id))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
 
     def render_template(self):
         canvas = self.template_canvas
@@ -575,10 +712,16 @@ class RegularTemplateEditor(tk.Toplevel):
                 self._photos.append(photo)
                 canvas.create_image(x1 + 2, y1 + 2, image=photo, anchor="nw")
             elif not cell.resource_id:
-                canvas.create_rectangle(x1 + 2, y1 + 2, x2 - 2, y2 - 2, fill="#ebe8e2", outline="", stipple="gray25")
+                if cell.shape == "circle":
+                    canvas.create_oval(x1 + 2, y1 + 2, x2 - 2, y2 - 2, fill="#ebe8e2", outline="", stipple="gray25")
+                else:
+                    canvas.create_rectangle(x1 + 2, y1 + 2, x2 - 2, y2 - 2, fill="#ebe8e2", outline="", stipple="gray25")
                 canvas.create_text((x1 + x2) // 2, (y1 + y2) // 2, text="Vacío", fill="#8a8179", font=("Bahnschrift", 9, "italic"))
             outline = "#d60916" if cell.cell_id in self.selected_cells else "#55585a"
-            canvas.create_rectangle(x1, y1, x2, y2, outline=outline, width=3 if cell.cell_id in self.selected_cells else 1)
+            if cell.shape == "circle":
+                canvas.create_oval(x1, y1, x2, y2, outline=outline, width=3 if cell.cell_id in self.selected_cells else 1)
+            else:
+                canvas.create_rectangle(x1, y1, x2, y2, outline=outline, width=3 if cell.cell_id in self.selected_cells else 1)
             canvas.create_text(x1 + 7, y1 + 7, text=str(position), fill="#d60916" if cell.cell_id in self.selected_cells else "#827d77", anchor="nw", font=("Bahnschrift", 8, "bold"))
 
     def sync_properties(self):
@@ -609,11 +752,96 @@ class RegularTemplateEditor(tk.Toplevel):
         self.sync_properties()
         self.render_status()
 
+    def render_final_sheet(self):
+        """Genera el PNG A4 a 97,27 %, con solo el borde negro externo."""
+        from PIL import Image, ImageChops, ImageDraw
+
+        dpi = 300
+        page = Image.new("RGBA", (2480, 3508), (0, 0, 0, 0))
+        for cell in self.project.cells:
+            resource = self.project.resource(cell.resource_id)
+            if not resource:
+                continue
+            try:
+                with Image.open(resource.path) as source:
+                    image = source.convert("RGBA")
+                if cell.rotation:
+                    image = image.rotate(-cell.rotation, expand=True, resample=Image.Resampling.BICUBIC)
+                width = max(1, round(cell.width * page.width))
+                height = max(1, round(cell.height * page.height))
+                scale = max(width / image.width, height / image.height) if cell.frame_mode == "Rellenar" else min(width / image.width, height / image.height)
+                target = image.resize((max(1, round(image.width * scale * cell.zoom)), max(1, round(image.height * scale * cell.zoom))), Image.Resampling.LANCZOS)
+                frame = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+                frame.alpha_composite(target, (round((width - target.width) / 2 + cell.offset_x * width), round((height - target.height) / 2 + cell.offset_y * height)))
+                if cell.shape == "circle":
+                    mask = Image.new("L", (width, height), 0)
+                    ImageDraw.Draw(mask).ellipse((0, 0, width - 1, height - 1), fill=255)
+                    frame.putalpha(ImageChops.multiply(frame.getchannel("A"), mask))
+                # El contorno se dibuja al final, por encima del diseño: no se
+                # agrega borde blanco ni una línea interior a la ilustración.
+                outline = ImageDraw.Draw(frame)
+                border = self.PRINT_OUTLINE_PX // 2
+                box = (border, border, width - 1 - border, height - 1 - border)
+                if cell.shape == "circle":
+                    outline.ellipse(box, outline="black", width=self.PRINT_OUTLINE_PX)
+                else:
+                    outline.rectangle(box, outline="black", width=self.PRINT_OUTLINE_PX)
+                page.alpha_composite(frame, (round(cell.x * page.width), round(cell.y * page.height)))
+            except Exception:
+                continue
+        # La escala se aplica una sola vez, en la capa común de impresión.
+        # Guardar el PNG a tamaño nominal evita una doble reducción al enviarlo.
+        return page
+
+    def save_to_production(self):
+        """Registra la plantilla y su PNG final para Producción e impresión."""
+        if not self.database:
+            messagebox.showinfo("Producción e impresión", "Abrí el creador desde Doccione Studio para guardar esta plancha en Producción.", parent=self)
+            return
+        if not any(cell.resource_id for cell in self.project.cells):
+            messagebox.showinfo("Producción e impresión", "Asigná al menos un diseño antes de guardar.", parent=self)
+            return
+        root = Path(__file__).resolve().parents[2]
+        folder = root / "outputs" / "planchas_regulares"
+        folder.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        base_name = f"plancha_regular_{stamp}"
+        project_path = folder / f"{base_name}.doccione-plantilla.json"
+        png_path = folder / f"{base_name}.png"
+        try:
+            self.project.save(project_path)
+            self.render_final_sheet().save(png_path, "PNG", dpi=(300, 300), compress_level=3)
+            material = ((self.database.order(self.order_id) or {}).get("material", "") if self.order_id else "")
+            self.plancha_id = self.database.save_plancha_project(
+                self.order_id, self.project.name or "Plancha regular", material,
+                json.dumps(self.project.to_dict(), ensure_ascii=False), str(project_path), self.plancha_id,
+                self.person_name, self.person_phone, "a4",
+            )
+            self.database.set_plancha_final_png(self.plancha_id, str(png_path))
+            self.database.update_plancha_production_status(self.plancha_id, "lista")
+            self.project_path = str(project_path)
+            self.final_png_path = str(png_path)
+            self.status_value.set("Guardada en Producción e impresión.")
+            messagebox.showinfo("Producción e impresión", "La plancha regular y su PNG final quedaron disponibles en Producción.", parent=self)
+            if hasattr(self.app, "show_production_planchas"):
+                self.app.show_production_planchas()
+            self.close()
+        except Exception as error:
+            messagebox.showerror("Producción e impresión", f"No se pudo guardar la plancha: {error}", parent=self)
+
+    def close(self):
+        """Cierra la ventana independiente o la ficha integrada."""
+        if self._standalone_window is not None and self._standalone_window.winfo_exists():
+            self._standalone_window.destroy()
+        else:
+            self.destroy()
+
     def save_project(self):
         path = filedialog.asksaveasfilename(title="Guardar plancha regular", defaultextension=".doccione-plantilla.json", filetypes=[("Plancha regular Doccione", "*.doccione-plantilla.json"), ("JSON", "*.json")])
         if not path:
             return
         self.project.save(path)
+        self.project_path = path
         messagebox.showinfo("Proyecto guardado", "La plantilla se guardó con referencias a las imágenes originales; no se creó ninguna copia.", parent=self)
 
     def open_project(self):
@@ -622,6 +850,7 @@ class RegularTemplateEditor(tk.Toplevel):
             return
         try:
             self.project = RegularTemplateProject.load(path)
+            self.project_path = path
             self.selected_cells.clear()
             self.selected_resource_id = self.project.resources[0].resource_id if self.project.resources else None
             self.history.clear()

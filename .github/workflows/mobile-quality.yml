@@ -1,0 +1,46 @@
+name: Mobile quality
+
+on:
+  pull_request:
+    paths:
+      - 'mobile/doccione_mobile/**'
+      - 'app/api/mobile_jobs.py'
+      - 'tests/test_mobile_*.py'
+  push:
+    branches: [main]
+    paths:
+      - 'mobile/doccione_mobile/**'
+      - 'app/api/mobile_jobs.py'
+      - 'tests/test_mobile_*.py'
+
+jobs:
+  flutter:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile/doccione_mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.7'
+          cache: true
+      - name: Verify versioned sticker-bank metadata
+        working-directory: .
+        run: python tools/mobile_sticker_bank.py verify --allow-manifest-only
+      - name: Install Python dependency for integration fixtures
+        run: python -m pip install Pillow
+      - run: flutter pub get
+      - run: dart format --set-exit-if-changed lib test
+      - run: flutter analyze --fatal-infos lib test
+      - run: flutter test
+
+  mobile-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements.txt -r requirements-test.txt
+      - run: python -m pytest tests/test_mobile_api.py tests/test_mobile_catalog_api.py tests/test_mobile_user_auth.py tests/test_mobile_access_security.py tests/test_mobile_runtime_config.py tests/test_mobile_visit_sync.py

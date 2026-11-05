@@ -1,0 +1,402 @@
+[
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<built-in method _io.open_code>",
+    "ncalls": 47,
+    "tottime_ms": 4.27,
+    "cumtime_ms": 4.27
+  },
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<built-in method _imp.create_dynamic>",
+    "ncalls": 4,
+    "tottime_ms": 4.26,
+    "cumtime_ms": 4.26
+  },
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<built-in method nt.stat>",
+    "ncalls": 276,
+    "tottime_ms": 3.23,
+    "cumtime_ms": 3.23
+  },
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<method 'execute' of 'sqlite3.Connection' objects>",
+    "ncalls": 90,
+    "tottime_ms": 3.08,
+    "cumtime_ms": 3.08
+  },
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<built-in method marshal.loads>",
+    "ncalls": 41,
+    "tottime_ms": 3.06,
+    "cumtime_ms": 3.06
+  },
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<built-in method builtins.exec>",
+    "ncalls": 52,
+    "tottime_ms": 2.71,
+    "cumtime_ms": 43.96
+  },
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<method 'read' of '_io.BufferedReader' objects>",
+    "ncalls": 44,
+    "tottime_ms": 2.7,
+    "cumtime_ms": 2.7
+  },
+  {
+    "file": "<frozen importlib._bootstrap>",
+    "line": 480,
+    "function": "_call_with_frames_removed",
+    "ncalls": 133,
+    "tottime_ms": 2.53,
+    "cumtime_ms": 45.91
+  },
+  {
+    "file": "<frozen importlib._bootstrap_external>",
+    "line": 101,
+    "function": "_path_join",
+    "ncalls": 605,
+    "tottime_ms": 2.44,
+    "cumtime_ms": 3.58
+  },
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<built-in method _imp.exec_dynamic>",
+    "ncalls": 4,
+    "tottime_ms": 1.39,
+    "cumtime_ms": 2.41
+  },
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<built-in method builtins.compile>",
+    "ncalls": 3,
+    "tottime_ms": 0.96,
+    "cumtime_ms": 0.96
+  },
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<built-in method builtins.__build_class__>",
+    "ncalls": 72,
+    "tottime_ms": 0.77,
+    "cumtime_ms": 4.5
+  },
+  {
+    "file": "<frozen importlib._bootstrap_external>",
+    "line": 1624,
+    "function": "find_spec",
+    "ncalls": 116,
+    "tottime_ms": 0.72,
+    "cumtime_ms": 8.02
+  },
+  {
+    "file": "C:\\Python313\\Lib\\re\\_parser.py",
+    "line": 511,
+    "function": "_parse",
+    "ncalls": 54,
+    "tottime_ms": 0.67,
+    "cumtime_ms": 1.72
+  },
+  {
+    "file": "<frozen importlib._bootstrap_external>",
+    "line": 145,
+    "function": "_path_stat",
+    "ncalls": 276,
+    "tottime_ms": 0.66,
+    "cumtime_ms": 3.9
+  },
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<built-in method nt.listdir>",
+    "ncalls": 9,
+    "tottime_ms": 0.53,
+    "cumtime_ms": 0.53
+  },
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<method '__exit__' of '_io._IOBase' objects>",
+    "ncalls": 44,
+    "tottime_ms": 0.51,
+    "cumtime_ms": 0.51
+  },
+  {
+    "file": "<frozen importlib._bootstrap_external>",
+    "line": 782,
+    "function": "_compile_bytecode",
+    "ncalls": 41,
+    "tottime_ms": 0.5,
+    "cumtime_ms": 3.59
+  },
+  {
+    "file": "C:\\Python313\\Lib\\re\\_compiler.py",
+    "line": 241,
+    "function": "_optimize_charset",
+    "ncalls": 40,
+    "tottime_ms": 0.39,
+    "cumtime_ms": 0.52
+  },
+  {
+    "file": "C:\\Python313\\Lib\\dataclasses.py",
+    "line": 929,
+    "function": "_process_class",
+    "ncalls": 8,
+    "tottime_ms": 0.37,
+    "cumtime_ms": 5.07
+  },
+  {
+    "file": "C:\\Python313\\Lib\\re\\_compiler.py",
+    "line": 37,
+    "function": "_compile",
+    "ncalls": 97,
+    "tottime_ms": 0.36,
+    "cumtime_ms": 1.17
+  },
+  {
+    "file": "<frozen importlib._bootstrap>",
+    "line": 1240,
+    "function": "_find_spec",
+    "ncalls": 60,
+    "tottime_ms": 0.35,
+    "cumtime_ms": 9.65
+  },
+  {
+    "file": "C:\\Python313\\Lib\\dataclasses.py",
+    "line": 1222,
+    "function": "_add_slots",
+    "ncalls": 8,
+    "tottime_ms": 0.33,
+    "cumtime_ms": 0.39
+  },
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<method 'append' of 'list' objects>",
+    "ncalls": 2312,
+    "tottime_ms": 0.33,
+    "cumtime_ms": 0.33
+  },
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<built-in method builtins.len>",
+    "ncalls": 2858,
+    "tottime_ms": 0.33,
+    "cumtime_ms": 0.35
+  },
+  {
+    "file": "<frozen importlib._bootstrap_external>",
+    "line": 1093,
+    "function": "get_code",
+    "ncalls": 44,
+    "tottime_ms": 0.32,
+    "cumtime_ms": 16.8
+  },
+  {
+    "file": "C:\\Users\\Win 10\\Documents\\Codex\\2026-07-13\\visionvault-app-ui-main-window-py\\app\\database\\database.py",
+    "line": 47,
+    "function": "__init__",
+    "ncalls": 1,
+    "tottime_ms": 0.3,
+    "cumtime_ms": 27.02
+  },
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<method 'rstrip' of 'str' objects>",
+    "ncalls": 1903,
+    "tottime_ms": 0.3,
+    "cumtime_ms": 0.3
+  },
+  {
+    "file": "C:\\Python313\\Lib\\dataclasses.py",
+    "line": 709,
+    "function": "_is_type",
+    "ncalls": 225,
+    "tottime_ms": 0.29,
+    "cumtime_ms": 0.62
+  },
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<built-in method nt.open>",
+    "ncalls": 3,
+    "tottime_ms": 0.29,
+    "cumtime_ms": 0.29
+  },
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<method 'endswith' of 'str' objects>",
+    "ncalls": 2105,
+    "tottime_ms": 0.28,
+    "cumtime_ms": 0.28
+  },
+  {
+    "file": "<frozen importlib._bootstrap>",
+    "line": 1349,
+    "function": "_find_and_load",
+    "ncalls": 63,
+    "tottime_ms": 0.27,
+    "cumtime_ms": 48.0
+  },
+  {
+    "file": "<frozen importlib._bootstrap>",
+    "line": 304,
+    "function": "acquire",
+    "ncalls": 67,
+    "tottime_ms": 0.24,
+    "cumtime_ms": 0.72
+  },
+  {
+    "file": "C:\\Python313\\Lib\\dataclasses.py",
+    "line": 768,
+    "function": "_get_field",
+    "ncalls": 75,
+    "tottime_ms": 0.23,
+    "cumtime_ms": 0.8
+  },
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<method 'startswith' of 'str' objects>",
+    "ncalls": 1490,
+    "tottime_ms": 0.23,
+    "cumtime_ms": 0.23
+  },
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<built-in method _sqlite3.connect>",
+    "ncalls": 1,
+    "tottime_ms": 0.22,
+    "cumtime_ms": 0.29
+  },
+  {
+    "file": "<frozen importlib._bootstrap_external>",
+    "line": 513,
+    "function": "cache_from_source",
+    "ncalls": 88,
+    "tottime_ms": 0.21,
+    "cumtime_ms": 1.26
+  },
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<method 'join' of 'str' objects>",
+    "ncalls": 787,
+    "tottime_ms": 0.19,
+    "cumtime_ms": 0.19
+  },
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<built-in method builtins.isinstance>",
+    "ncalls": 1703,
+    "tottime_ms": 0.19,
+    "cumtime_ms": 0.19
+  },
+  {
+    "file": "C:\\Python313\\Lib\\re\\_parser.py",
+    "line": 260,
+    "function": "get",
+    "ncalls": 886,
+    "tottime_ms": 0.18,
+    "cumtime_ms": 0.29
+  },
+  {
+    "file": "<frozen importlib._bootstrap>",
+    "line": 426,
+    "function": "_get_module_lock",
+    "ncalls": 67,
+    "tottime_ms": 0.17,
+    "cumtime_ms": 0.25
+  },
+  {
+    "file": "<frozen importlib._bootstrap>",
+    "line": 733,
+    "function": "_init_module_attrs",
+    "ncalls": 60,
+    "tottime_ms": 0.17,
+    "cumtime_ms": 1.07
+  },
+  {
+    "file": "<frozen importlib._bootstrap>",
+    "line": 911,
+    "function": "_load_unlocked",
+    "ncalls": 60,
+    "tottime_ms": 0.16,
+    "cumtime_ms": 46.24
+  },
+  {
+    "file": "<frozen importlib._bootstrap>",
+    "line": 1304,
+    "function": "_find_and_load_unlocked",
+    "ncalls": 63,
+    "tottime_ms": 0.16,
+    "cumtime_ms": 47.9
+  },
+  {
+    "file": "<frozen importlib._bootstrap_external>",
+    "line": 1522,
+    "function": "_get_spec",
+    "ncalls": 51,
+    "tottime_ms": 0.16,
+    "cumtime_ms": 8.7
+  },
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<method 'match' of 're.Pattern' objects>",
+    "ncalls": 225,
+    "tottime_ms": 0.16,
+    "cumtime_ms": 0.16
+  },
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<built-in method builtins.getattr>",
+    "ncalls": 733,
+    "tottime_ms": 0.16,
+    "cumtime_ms": 0.16
+  },
+  {
+    "file": "<frozen importlib._bootstrap_external>",
+    "line": 1020,
+    "function": "exec_module",
+    "ncalls": 44,
+    "tottime_ms": 0.15,
+    "cumtime_ms": 46.07
+  },
+  {
+    "file": "C:\\Python313\\Lib\\re\\_parser.py",
+    "line": 167,
+    "function": "__getitem__",
+    "ncalls": 539,
+    "tottime_ms": 0.15,
+    "cumtime_ms": 0.21
+  },
+  {
+    "file": "~",
+    "line": 0,
+    "function": "<built-in method __new__ of type object at 0x00007FFF800948A0>",
+    "ncalls": 101,
+    "tottime_ms": 0.15,
+    "cumtime_ms": 0.35
+  }
+]

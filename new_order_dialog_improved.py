@@ -322,11 +322,11 @@ def new_order_dialog(self):
     
     table = tk.Frame(right_panel, background=COLORS.panel)
     table.pack(fill="both", expand=True, padx=14)
-    columns = ("title", "material", "size", "quantity", "subtotal", "discount", "total", "status")
+    # Columna "discount" y "total" removidas - descuentos se aplican al pedido, no por trabajo
+    columns = ("title", "material", "size", "quantity", "subtotal", "status")
     job_tree = ttk.Treeview(table, columns=columns, show="headings", selectmode="browse", height=13)
     labels = {"title": ("Trabajo", 170), "material": ("Material", 160), "size": ("Tamaño", 75),
-              "quantity": ("Cant.", 60), "subtotal": ("Subtotal", 92), "discount": ("Desc.", 60),
-              "total": ("Total", 92), "status": ("Estado", 100)}
+              "quantity": ("Cant.", 60), "subtotal": ("Total", 110), "status": ("Estado", 100)}
     for key in columns:
         label, width = labels[key]
         job_tree.heading(key, text=label)
@@ -337,7 +337,8 @@ def new_order_dialog(self):
     job_scroll.pack(side="right", fill="y")
 
     def total_for(job):
-        return float(job.get("subtotal", 0) or 0) * (1 - float(job.get("discount_percent", 0) or 0) / 100)
+        # Los descuentos individuales ya no se usan; siempre devuelve el subtotal
+        return float(job.get("subtotal", 0) or 0)
 
     def render_jobs():
         job_tree.delete(*job_tree.get_children())
@@ -347,8 +348,7 @@ def new_order_dialog(self):
             job_tree.insert("", "end", iid=str(index), values=(
                 job.get("title") or f"Trabajo {index + 1}", job.get("material") or "Sin material",
                 job.get("size") or "-", job.get("quantity") or 1,
-                f"${float(job.get('subtotal', 0) or 0):,.0f}", f"{float(job.get('discount_percent', 0) or 0):g}%",
-                f"${total_for(job):,.0f}", job.get("status") or "Pendiente",
+                f"${float(job.get('subtotal', 0) or 0):,.0f}", job.get("status") or "Pendiente",
             ))
         jobs_summary.set(f"{len(jobs)} trabajo(s) · Total propuesto: ${total:,.0f}")
 

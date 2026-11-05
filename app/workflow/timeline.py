@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from datetime import datetime
 from typing import Final
 
 
@@ -33,7 +35,8 @@ VINYL_WORKFLOW: Final[tuple[tuple[str, int], ...]] = (
     ("Diseños confirmados", 20),
     ("Armado de plancha", 30),
     ("Impresión", 60),
-    ("Laminado", 70),
+    ("Laminado", 65),
+    ("Sublimación", 70),
     ("Corte plotter", 80),
     ("Control de calidad", 90),
     ("Empaquetado", 95),
@@ -119,7 +122,9 @@ def get_current_stage(order: dict) -> str:
             "Listo para armado de planchas": "Armado de plancha",
             "En armado de planchas": "Armado de plancha",
             "Listo para imprimir": "Impresión",
-            "Sublimado / Laminado": "Laminado",
+            "Sublimado / Laminado": "Sublimación",
+            # Los pedidos creados antes del cambio conservan su etapa válida.
+            "Laminado": "Sublimación",
             "Corte": "Corte plotter",
             "Finalizado": "Empaquetado",
         }.get(status, status)
@@ -168,6 +173,57 @@ def get_next_action(order: dict) -> tuple[str, str, int]:
     if current == "Entregado":
         return ("complete", "Pedido entregado", 0)
     return ("advance", f"Avanzar a: {stages[index + 1]}", 5)
+
+
+def timeline_stage_times(order: dict, events: list[dict]) -> dict[str, tuple[datetime, datetime | None]]:
+    """Indica cuándo se entró y salió de cada etapa del flujo."""
+    def parse_date(value: object) -> datetime | None:
+        try:
+            return datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+
+    initial_at = parse_date(order.get("created_at") or order.get("order_date") or order.get("updated_at")) or datetime.now()
+    entries: list[tuple[str, datetime]] = [("Recibido", initial_at)]
+    for event in sorted(events, key=lambda item: str(item.get("created_at") or "")):
+        raw_stage = ""
+        try:
+            raw_stage = str(json.loads(event.get("data_json") or "{}").get("new_stage") or "")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        if not raw_stage and event.get("event_type") == "Estado":
+            prefix = "Estado actualizado a: "
+            message = str(event.get("message") or "")
+            if message.startswith(prefix):
+                raw_stage = message[len(prefix):].rstrip(".")
+        if not raw_stage:
+            continue
+        stage = get_current_stage({**order, "status": raw_stage})
+        changed_at = parse_date(event.get("created_at"))
+        if changed_at and stage != entries[-1][0]:
+            entries.append((stage, changed_at))
+
+    current = get_current_stage(order)
+    if current != entries[-1][0]:
+        entries.append((current, parse_date(order.get("updated_at")) or datetime.now()))
+    result: dict[str, tuple[datetime, datetime | None]] = {}
+    for index, (stage, entered_at) in enumerate(entries):
+        result[stage] = (entered_at, entries[index + 1][1] if index + 1 < len(entries) else None)
+    return result
+
+
+def format_stage_elapsed(started_at: datetime, ended_at: datetime | None = None) -> str:
+    """Formato compacto en español para los contadores de la línea de tiempo."""
+    now = datetime.now(started_at.tzinfo) if started_at.tzinfo else datetime.now()
+    seconds = max(0, int(((ended_at or now) - started_at).total_seconds()))
+    days, seconds = divmod(seconds, 86_400)
+    hours, seconds = divmod(seconds, 3_600)
+    minutes = seconds // 60
+    if days:
+        return f"{days} d {hours} h"
+    if hours:
+        return f"{hours} h {minutes} min"
+    return f"{minutes} min"
 
 
 def format_timeline(order: dict) -> list[tuple[str, str]]:

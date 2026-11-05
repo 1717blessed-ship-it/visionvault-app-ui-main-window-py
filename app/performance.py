@@ -13,8 +13,8 @@ METRICS_PATH = ROOT / ".cache" / "performance.json"
 _LOCK = threading.Lock()
 
 
-def record_performance(name: str, elapsed_ms: float, **details) -> None:
-    """Guarda el último tiempo y un promedio acumulado sin bloquear la interfaz."""
+def _write_performance(name: str, elapsed_ms: float, details: dict) -> None:
+    """Persiste una muestra desde un hilo auxiliar."""
     try:
         with _LOCK:
             try:
@@ -39,4 +39,18 @@ def record_performance(name: str, elapsed_ms: float, **details) -> None:
             temporary.replace(METRICS_PATH)
     except OSError:
         # Medir nunca puede impedir que el usuario trabaje.
+        pass
+
+
+def record_performance(name: str, elapsed_ms: float, **details) -> None:
+    """Encola una métrica sin hacer lectura ni escritura de disco en el hilo de Tk."""
+    try:
+        threading.Thread(
+            target=_write_performance,
+            args=(str(name), float(elapsed_ms), dict(details)),
+            daemon=True,
+            name="doccione-performance-writer",
+        ).start()
+    except (RuntimeError, TypeError, ValueError):
+        # Una métrica nunca justifica interrumpir una acción del usuario.
         pass

@@ -1,17 +1,22 @@
 import re
 import tkinter as tk
 import calendar
+import logging
 import sys
 import os
 import threading
 import subprocess
 import json
+import hashlib
 import webbrowser
 import time
 import csv
 import zipfile
 import tempfile
 import traceback
+import unicodedata
+import uuid
+from decimal import Decimal
 from pathlib import Path
 from datetime import datetime
 from pathlib import Path
@@ -19,7 +24,13 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from app.database.database import ImageDatabase
 from app.indexer.scanner import scan_folder
+from app.indexer.file_watcher import StickerBankWatcher
 from app.ui.gallery import Gallery
+from app.ui.mobile_security import MobileSecurityPanel
+from app.ui.mobile_runtime_settings import MobileRuntimeSettingsPanel
+from app.ui.module_registry import ModuleRegistry
+from app.ui.product_catalog import ProductCatalog
+from app.ui.seller_center import SellerCenter
 from app.ui.search import SearchBar
 from app.ui.theme import (
     COLORS,
@@ -39,6 +50,7 @@ from app.ui.components import (
     section_heading,
     set_navigation_active,
     status_strip,
+    CustomerAutocomplete,
 )
 from app.events.event_bus import EventBus
 from app.events.event_repository import EventRepository
@@ -57,18 +69,46 @@ from app.events.event_types import (
 )
 from app.notifications.notification_service import NotificationService
 from app.notifications.firebase_sender import initialize_firebase
-from app.api.pairing_server import PairingServer
 from app.api.mobile_jobs import MobileJobsServer
-from app.stickers.editor import StickerStudio
+from app.whatsapp.repository import WhatsAppRepository
+from app.whatsapp.service import WhatsAppService
+from app.whatsapp.config import load_config
+from app.services.stock_cost_price_service import (
+    InsufficientStockError,
+    StockCostPriceService,
+)
+from app.services.order_workflow_service import OrderWorkflowService
+from app.services.productive_plancha_order_service import (
+    analysis_context,
+    snapshot_job,
+    supports_productive_plancha_a4,
+)
+from app.services.fotocopia_pricing_service import FotocopiaPricingService
+from app.fiscal import FiscalRepository
+from app.stickers.editor import StickerStudio as StickerStudioClassic
+from app.stickers.editor_v2 import StickerStudioV2
+
+
+def _sticker_studio_class():
+    """Mantiene un retorno inmediato al editor clásico para soporte/regresión."""
+    import os
+    mode = os.environ.get("DOCCIONE_STICKER_STUDIO", "2").strip().lower()
+    return StickerStudioClassic if mode in {"classic", "legacy", "1"} else StickerStudioV2
 from app.performance import record_performance
 from app.workflow.priority import calculate_priority, get_priority_color, get_priority_emoji
-from app.workflow.timeline import get_current_stage, format_timeline, get_stage_progress, order_statuses
+from app.workflow.timeline import (
+    get_current_stage, format_timeline, get_stage_progress, order_statuses,
+    timeline_stage_times, format_stage_elapsed,
+)
 from app.workflow.estimator import estimate_remaining_work, format_time_remaining, format_work_time
 from app.workflow.dashboard import show_attention_dashboard
 from costos.models.cost_component import CostComponent
 from costos.models.cost_rule import CostRule
 from costos.services.cost_calculator import CostCalculator
 from costos.validators.cost_rule_validator import CostRuleValidator
+from costos.models.calculation_mode import CalculationMode, PercentageBase, PERCENTAGE_BASE_KEYS, PERCENTAGE_BASE_LABELS
+from costos.models.variable_cost_component import VariableCostComponent
+from costos.models.variable_cost_model import VariableCostModel
 try:
     import matplotlib
     matplotlib.use("Agg")
@@ -78,8 +118,127 @@ try:
 except Exception:
     HAS_MATPLOTLIB = False
 
+logger = logging.getLogger(__name__)
+
 PRIORITY_LABELS = ("Sin prisa", "Baja", "Media", "Alta", "Urgente")
 PRIORITY_VALUES = {label: value for value, label in enumerate(PRIORITY_LABELS)}
+
+
+def order_production_route(order: dict | None, jobs=()) -> str:
+    """Elige el circuito físico sin tratar toda orden como plancha de stickers."""
+    values = list((order or {}).values())
+    for job in jobs or ():
+        if isinstance(job, dict):
+            values.extend((job.get("title"), job.get("material"), job.get("size")))
+    text = " ".join(str(value or "") for value in values).casefold()
+    text = "".join(char for char in unicodedata.normalize("NFD", text)
+                   if unicodedata.category(char) != "Mn")
+    if any(token in text for token in ("poster", "fotograf", "papel foto")):
+        return "photo_printing"
+    if "tarjeta" in text:
+        return "continuous"
+    return "plancha"
+
+
+def sticker_design_assignment_hint(order: dict | None, jobs=()) -> tuple[str, str, int | None, int | None]:
+    """Devuelve la guía comercial de diseños para un pedido de stickers.
+
+    No crea copias ni limita el armado: la capacidad final siempre la decide la
+    geometría real de cada sticker.  Esta guía evita que un pedido vacío de
+    Franja/A5/A4 parezca no tener una meta de diseños asignados.
+    """
+    values = list((order or {}).values())
+    for job in jobs or ():
+        if isinstance(job, dict):
+            values.extend((job.get("title"), job.get("material"), job.get("size")))
+    text = " ".join(str(value or "") for value in values).casefold()
+    text = "".join(char for char in unicodedata.normalize("NFD", text)
+                   if unicodedata.category(char) != "Mn")
+    quantities = []
+    for job in jobs or ():
+        if not isinstance(job, dict):
+            continue
+        try:
+            quantities.append(max(1, int(float(job.get("quantity", 1) or 1))))
+        except (TypeError, ValueError):
+            quantities.append(1)
+    if quantities:
+        product_quantity = sum(quantities)
+    else:
+        try:
+            product_quantity = max(1, int(float((order or {}).get("quantity", 1) or 1)))
+        except (TypeError, ValueError):
+            product_quantity = 1
+
+    def matching_job_quantity(*terms: str) -> int:
+        """Suma sólo los trabajos cuyo producto pertenece a esta guía."""
+        total = 0
+        for job in jobs or ():
+            if not isinstance(job, dict):
+                continue
+            job_text = " ".join(str(job.get(key) or "") for key in ("title", "material", "size"))
+            job_text = "".join(char for char in unicodedata.normalize("NFD", job_text.casefold())
+                               if unicodedata.category(char) != "Mn")
+            if all(term in job_text for term in terms):
+                try:
+                    total += max(1, int(float(job.get("quantity", 1) or 1)))
+                except (TypeError, ValueError):
+                    total += 1
+        return total
+
+    poster_slots = re.search(r"\b(1|2|4|8|16|32)\s*(?:por\s*)?(?:hoja|casillas?|dise(?:n|ñ)os?)\b", text)
+    if poster_slots and ("poster" in text or "fotograf" in text or "papel foto" in text):
+        slots_per_sheet = int(poster_slots.group(1))
+        total_slots = slots_per_sheet * product_quantity
+        return (
+            f"{product_quantity} hoja(s) de póster",
+            f"{slots_per_sheet} diseño(s) por hoja · {total_slots} diseño(s) asignados en total.",
+            total_slots,
+            total_slots,
+        )
+    if "tarjeta" in text:
+        return ("Tarjetas", "Asigná un único diseño; se repite para toda la cantidad de tarjetas del pedido.", 1, 1)
+    if "plancha doccione" in text:
+        return (f"{product_quantity} plancha(s) Doccione", "Selección Doccione: 20–24 diseños diferentes elegidos del banco por cada plancha.", 20 * product_quantity, 24 * product_quantity)
+    if "diseno unico" in text:
+        return (f"{product_quantity} plancha(s) de diseño único", "Asigná 1 diseño por plancha; se repite para completar aproximadamente 20–25 stickers.", product_quantity, product_quantity)
+    if "personalizada" in text and ("mixta" in text or "mixed" in text):
+        return (f"{product_quantity} plancha(s) personalizada(s) mixta(s)", "Cada diseño agregado representa un sticker; el packing los acomoda según sus tamaños reales.", None, None)
+    if "personalizada" in text:
+        # Un sticker individual puede convivir con una plancha personalizada.
+        # Sólo las planchas determinan su meta de 20 diseños; el individual se
+        # incorpora al total asignado, sin crear otra plancha ficticia.
+        plancha_quantity = matching_job_quantity("plancha", "personalizada") or product_quantity
+        return (f"{plancha_quantity} plancha(s) personalizada(s) 5 cm", "Asigná 20 diseños personalizados de 5 cm por cada plancha.", 20 * plancha_quantity, 20 * plancha_quantity)
+    if "mixta" in text or "mixed" in text:
+        return ("Plancha mixta", "Cada diseño agregado representa un sticker; el packing los acomoda según sus tamaños.", None, None)
+    if "individual" in text:
+        return ("Stickers individuales", "Cada diseño agregado representa un sticker individual; no se duplican diseños automáticamente.", None, None)
+    if "franja" in text:
+        return (f"{product_quantity} franja(s)", "Meta habitual: 4–5 diseños por franja. Según el ancho pueden entrar hasta 2 stickers finos más.", 4 * product_quantity, 5 * product_quantity)
+    if "a5" in text or "media a4" in text:
+        return (f"{product_quantity} plancha(s) A5", "Cada A5 tiene dos franjas completas (4–5 diseños cada una) y media franja para hasta 3 stickers finos.", 11 * product_quantity, 13 * product_quantity)
+    if "a4" in text or "plancha" in text:
+        return (f"{product_quantity} plancha(s) A4", "Meta habitual: 20–25 diseños por A4, según el ancho real de cada sticker.", 20 * product_quantity, 25 * product_quantity)
+    return ("Pedido de stickers", "Elegí Franja, A5, A4, Individuales o Plancha mixta para mostrar la capacidad orientativa.", None, None)
+
+
+def sticker_design_assignment_progress(design_count: int, target_count: int | None) -> float | None:
+    """Calcula el avance de asignación contra la meta orientativa del pedido."""
+    if target_count is None or target_count <= 0:
+        return None
+    return min(100.0, max(0, design_count) / target_count * 100)
+
+
+def sticker_design_assignment_count(designs) -> int:
+    """Cuenta cada copia solicitada de los diseños vinculados al pedido."""
+    total = 0
+    for design in designs or ():
+        try:
+            total += max(1, int(float(design.get("quantity", 1) or 1)))
+        except (AttributeError, TypeError, ValueError):
+            total += 1
+    return total
 
 
 def priority_label(value) -> str:
@@ -188,8 +347,13 @@ if str(_user_site) not in sys.path:
 
 try:
     from tkinterdnd2 import TkinterDnD
+    # Importar el paquete no garantiza que su DLL nativa pueda cargarse.
+    # Se prueba una raíz temporal para poder usar el modo normal de Tk cuando
+    # tkdnd no está disponible en esta instalación de Python.
+    _dnd_probe = TkinterDnD.Tk()
+    _dnd_probe.destroy()
     DndRoot = TkinterDnD.Tk
-except (ImportError, OSError, PermissionError):
+except (ImportError, OSError, PermissionError, RuntimeError, tk.TclError):
     DndRoot = tk.Tk
 
 
@@ -197,12 +361,17 @@ class VisionVaultApp(DndRoot):
     # Flujo inicial; cada pedido ajusta estas opciones según su material.
     ORDER_STATUSES = order_statuses()
 
-    def __init__(self):
+    def __init__(self, database_path: str | Path | None = None, isolated_database: bool = False):
         startup_started = time.perf_counter()
         super().__init__()
         self._startup_started = startup_started
         self.withdraw()
-        self.title("Doccione Studio · Sistema Inteligente de Producción de Stickers")
+        self.database_path = Path(database_path or (Path(__file__).parents[2] / "visionvault.db")).resolve()
+        self.isolated_database = bool(isolated_database)
+        title = "Doccione Studio · Sistema Inteligente de Producción de Stickers"
+        if self.isolated_database:
+            title += " · BASE DE PRUEBA"
+        self.title(title)
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
         width = min(1040, round(screen_w * 0.95))
@@ -215,40 +384,45 @@ class VisionVaultApp(DndRoot):
         self.add_pattern_background()
         self.splash = self.create_splash()
         self._configure_theme()
-        self.database = ImageDatabase(Path(__file__).parents[2] / "visionvault.db")
+        # El quick-check y el respaldo diario pueden recorrer cientos de MB.
+        # La base y sus migraciones quedan listas aquí; el mantenimiento se
+        # completa en segundo plano una vez visible la primera ventana.
+        self.database = ImageDatabase(
+            self.database_path,
+            defer_automatic_maintenance=True,
+        )
+        self.whatsapp_repository = WhatsAppRepository(self.database.connection)
+        self.whatsapp_service = WhatsAppService(self.whatsapp_repository)
+        self._chat_selected_conversation_id: int | None = None
+        self._chat_refresh_after = None
+        # La capa fiscal conserva snapshots inmutables de los comprobantes y
+        # queda preparada para la emisión ARCA sin mezclarla con la UI de pedidos.
+        self.fiscal = FiscalRepository(self.database.connection)
+        self.stock_cost_price = None
         # --- Sistema de eventos y notificaciones ---
         self._event_repo = EventRepository(self.database.connection)
         self._event_repo.create_tables()
         self._event_bus = EventBus(self._event_repo)
-        self._notification_service = NotificationService(self._event_repo)
+        self.order_workflow = None
+        self._notification_service = None
         # --- Servidor de emparejamiento de dispositivos ---
-        self._pairing_server = PairingServer(
-            port=8765,
-            repo_callback=lambda: self._event_repo,
-        )
-        self._pairing_server.start()
         # --- Servidor de API de jobs móviles ---
-        self._mobile_jobs_server = MobileJobsServer(
-            event_repo=self._event_repo,
-            event_bus=self._event_bus,
-            port=8766,
-        )
-        self._mobile_jobs_server.start()
-        # Intentar inicializar Firebase (no bloqueante si no está configurado)
-        try:
-            firebase_ok = initialize_firebase()
-            if firebase_ok:
-                self._notification_service.start_worker(interval_seconds=15)
-        except Exception:
-            pass
+        self._mobile_jobs_server = None
+        self._startup_deferred_services_ready = False
+        self._database_maintenance_started = False
+        self._database_maintenance_error = ""
+        self._connection_failures: dict[str, str] = {}
         self.initial_render_complete = False
         self.startup_window_mapped = False
         self._startup_metric_saved = False
         self._orders_refresh_after = None
+        self._timeline_counter_after = None
         self._tab_transition_after = None
         self._tab_transition_step = 0
         self._selected_order_id: int | None = None
         self.current_extension = None
+        self._ui_settings_file = Path(__file__).parents[2] / "ui_settings.json"
+        self._ui_settings = self._load_ui_settings()
         self.collection_extensions = [None]
         self.selected_tags: dict[str, tk.BooleanVar] = {}
         self.selected_categories: dict[str, tk.BooleanVar] = {}
@@ -263,6 +437,16 @@ class VisionVaultApp(DndRoot):
         saved_model = settings.get("gemini_model", "gemini-3.5-flash")
         self.gemini_model = "gemini-3.5-flash" if saved_model == "gemini-2.5-flash" else saved_model
         self._build()
+        if self.isolated_database:
+            self.status.set(f"BASE DE PRUEBA · {self.database_path}")
+        self.bind_all("<Control-f>", self.focus_sticker_search, add="+")
+        self._schedule_timeline_counter_refresh()
+        # Estos servicios no son necesarios para el primer cuadro visible.
+        # Usar temporizadores (no after_idle) impide que se adelanten a la
+        # finalización del splash por el orden de la cola Tcl.
+        self.after(750, self._deferred_init_firebase)
+        self.after(900, self._initialize_deferred_startup_services)
+        self.after(1200, self._start_deferred_database_maintenance)
         # Etiquetas y categorías pueden ser miles. Se cargan cuando la ventana
         # ya está visible para no bloquear la pantalla de inicio.
         # La biblioteca puede contener miles de imágenes. Se carga después de
@@ -272,12 +456,146 @@ class VisionVaultApp(DndRoot):
         # primera carga de la biblioteca. Usar guardas para evitar que Tk
         # resuelva nombres en Tcl si el método falta temporalmente.
         self.after(2500, lambda: getattr(self, "prepare_visual_scores", lambda: None)())
+        # La búsqueda visual debe consultar un índice ya preparado, no crear
+        # huellas de miles de archivos mientras la persona espera resultados.
+        self.after(5000, lambda: getattr(self, "prepare_visual_index", lambda **_kwargs: None)(allow_migration=False))
         self.after(450, lambda: getattr(self, "connect_gemini_on_startup", lambda: None)())
         self.initial_render_complete = True
         self.after_idle(lambda: getattr(self, "finish_startup", lambda: None)())
-        self.after(180, lambda: getattr(self, "refresh", lambda q=None: None)())
-        self.after(350, lambda: getattr(self, "refresh_collections", lambda: None)())
+        # Retrasar aún más la primera carga de la biblioteca para no mezclar una
+        # ventana recién abierta con consultas costosas y refrescos de UI.
+        self.after(700, lambda: getattr(self, "refresh", lambda q=None: None)())
+        self.after(1000, lambda: getattr(self, "refresh_collections", lambda: None)())
+        # Cargar "Últimos Procesados" solo cuando se vea el tab (diferido)
+        # self.after(800, lambda: getattr(self, "refresh_processed_gallery", lambda: None)())
         self.protocol("WM_DELETE_WINDOW", lambda: getattr(self, "close", lambda: None)())
+        
+        # Inicializar monitor de carpeta Banco Stickers. Se activa después de
+        # importar archivos externos para no competir por los mismos nombres.
+        self._sticker_bank_watcher = StickerBankWatcher(self._on_new_image_in_banco)
+        
+        # Inicializar bandera de actualización de "Últimos Procesados"
+        self._processed_gallery_needs_refresh = False
+
+    def focus_sticker_search(self, _event=None):
+        """Lleva a la biblioteca sin perder una consulta que ya esté escrita."""
+        if not hasattr(self, "search"):
+            return "break"
+        try:
+            self.tabs.select(self.designs_tab)
+        except (AttributeError, tk.TclError):
+            pass
+        self.search.entry.focus_set()
+        self.search.entry.selection_range(0, tk.END)
+        return "break"
+
+    def _initialize_deferred_startup_services(self):
+        """Inicializa servicios pesados después de que la ventana ya pudo mostrarse."""
+        if getattr(self, "_startup_deferred_services_ready", False):
+            return
+        failures = []
+        try:
+            if self.stock_cost_price is None:
+                self.stock_cost_price = StockCostPriceService(self.database.connection)
+            if self.order_workflow is None:
+                self.order_workflow = OrderWorkflowService(
+                    self.database.connection, self.stock_cost_price, self._event_bus
+                )
+            self._connection_failures.pop("Flujo comercial", None)
+        except Exception as error:
+            failures.append(("Flujo comercial", error))
+        try:
+            if self._notification_service is None:
+                self._notification_service = NotificationService(self._event_repo)
+            self._connection_failures.pop("Notificaciones", None)
+        except Exception as error:
+            failures.append(("Notificaciones", error))
+        try:
+            if self._mobile_jobs_server is None:
+                mobile_server = MobileJobsServer(
+                    event_repo=self._event_repo,
+                    event_bus=self._event_bus,
+                    port=8765,
+                )
+                mobile_server.start()
+                if not mobile_server.is_running:
+                    raise RuntimeError("El puerto 8765 no está disponible para la API móvil.")
+                self._mobile_jobs_server = mobile_server
+            elif not self._mobile_jobs_server.is_running:
+                self._mobile_jobs_server.start()
+                if not self._mobile_jobs_server.is_running:
+                    raise RuntimeError("El puerto 8765 no está disponible para la API móvil.")
+            self._connection_failures.pop("API móvil", None)
+        except Exception as error:
+            failures.append(("API móvil", error))
+        for component, error in failures:
+            self._record_connection_failure(component, error)
+        self._startup_deferred_services_ready = not failures
+
+    def _record_connection_failure(self, component: str, error: object) -> None:
+        """Conserva una conexión fallida para que pueda revisarse y reintentarse."""
+        detail = str(error).strip() or error.__class__.__name__
+        self._connection_failures[str(component)] = detail
+        logger.error(
+            "Conexión pendiente de revisión: %s: %s",
+            component,
+            detail,
+            extra={"component": "connections", "event": "review_required"},
+        )
+
+    def _start_deferred_database_maintenance(self) -> None:
+        """Ejecuta integridad, respaldo e importación sin detener el movimiento de Tk."""
+        if self._database_maintenance_started:
+            return
+        self._database_maintenance_started = True
+
+        def worker():
+            maintenance_error = ""
+            import_error = ""
+            imported = []
+            try:
+                self.database.run_automatic_maintenance()
+            except Exception as error:
+                maintenance_error = str(error).strip() or error.__class__.__name__
+            try:
+                imported = self.database.import_and_number_external_library_images()
+            except Exception as error:
+                import_error = str(error).strip() or error.__class__.__name__
+            try:
+                self.after(
+                    0,
+                    lambda: self._finish_deferred_database_maintenance(
+                        imported, maintenance_error, import_error,
+                    ),
+                )
+            except (AttributeError, RuntimeError, tk.TclError):
+                pass
+
+        threading.Thread(
+            target=worker,
+            daemon=True,
+            name="doccione-database-maintenance",
+        ).start()
+
+    def _finish_deferred_database_maintenance(
+        self,
+        imported: list[dict],
+        maintenance_error: str,
+        import_error: str,
+    ) -> None:
+        self._database_maintenance_error = maintenance_error
+        if maintenance_error:
+            self._record_connection_failure("Mantenimiento de base", maintenance_error)
+        else:
+            self._connection_failures.pop("Mantenimiento de base", None)
+        if import_error:
+            self._record_connection_failure("Importación de biblioteca", import_error)
+        else:
+            self._connection_failures.pop("Importación de biblioteca", None)
+        if imported:
+            self.status.set(f"Se incorporaron {len(imported)} diseños externos al Banco Stickers.")
+            self.queue_library_refresh(include_collections=True)
+        self._start_banco_watcher()
 
     def _configure_theme(self):
         apply_ttk_theme(self)
@@ -447,6 +765,67 @@ class VisionVaultApp(DndRoot):
         except OSError:
             pass
 
+    def _load_ui_settings(self) -> dict:
+        try:
+            return json.loads(self._ui_settings_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _save_ui_settings(self, settings: dict):
+        try:
+            self._ui_settings_file.parent.mkdir(parents=True, exist_ok=True)
+            self._ui_settings_file.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _save_plancha_pane_positions(self, event=None):
+        paned = self._production_pane
+        width = paned.winfo_width()
+
+        if width <= 1:
+            return
+
+        try:
+            first = paned.sashpos(0)
+            second = paned.sashpos(1)
+        except tk.TclError:
+            return
+
+        ratios = {
+            "first": first / width,
+            "second": second / width,
+        }
+
+        self._ui_settings["production_plancha_panes"] = ratios
+        self._save_ui_settings(self._ui_settings)
+
+    def _restore_plancha_pane_positions(self):
+        paned = self._production_pane
+        width = paned.winfo_width()
+
+        if width <= 100:
+            paned.after(100, self._restore_plancha_pane_positions)
+            return
+
+        saved = self._ui_settings.get("production_plancha_panes")
+
+        # La lista es el área principal de trabajo. Se descartan las
+        # proporciones antiguas, demasiado angostas para leer los conjuntos.
+        first_ratio = 0.52
+        second_ratio = 0.70
+        if saved:
+            saved_first = float(saved.get("first", first_ratio))
+            saved_second = float(saved.get("second", second_ratio))
+            if 0.42 <= saved_first <= 0.60 and 0.64 <= saved_second <= 0.80:
+                first_ratio, second_ratio = saved_first, saved_second
+
+        # Avoid invalid positions or panels too small
+        first_ratio = max(0.42, min(first_ratio, 0.60))
+        second_ratio = max(first_ratio + 0.14, min(second_ratio, 0.80))
+
+        paned.sashpos(0, int(width * first_ratio))
+        paned.sashpos(1, int(width * second_ratio))
+
     def connect_gemini_on_startup(self):
         """Comprueba la conexión de Gemini sin analizar ni subir stickers."""
         if self.ai_provider.get() != "Gemini" or not self.gemini_api_key:
@@ -476,7 +855,7 @@ class VisionVaultApp(DndRoot):
         if self.ai_provider.get() != "Gemini" or not self.gemini_api_key:
             messagebox.showwarning("Gemini", "Primero configurá una clave de Gemini y seleccioná Gemini como proveedor.", parent=self)
             return
-        cache_model = f"{self.gemini_model}:structured-v3"
+        cache_model = f"{self.gemini_model}:structured-v6"
         images = self.database.images_needing_ai("Gemini", cache_model)
         if not images:
             messagebox.showinfo("Escaneo completo", "Todos los diseños ya tienen un análisis actualizado para revisar.", parent=self)
@@ -514,7 +893,9 @@ class VisionVaultApp(DndRoot):
 
         def save_result(image: dict, result: dict):
             if not result.get("missing") and not result.get("errors"):
-                self.database.save_ai_result(image["path"], "Gemini", cache_model, image["modified"], result)
+                from app.ai.result import has_usable_analysis
+                if has_usable_analysis(result):
+                    self.database.save_ai_result(image["path"], "Gemini", cache_model, image["modified"], result)
 
         def finish(completed: int, successful: int, failed: int, stopped: bool):
             if dialog.winfo_exists():
@@ -556,17 +937,78 @@ class VisionVaultApp(DndRoot):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def open_ai_review_queue(self):
+        """Abre una cola manual de analisis ya generados, sin guardar automaticamente."""
+        provider = self.ai_provider.get()
+        model = f"{self.gemini_model}:structured-v6" if provider == "Gemini" else "local-v4"
+        dialog = tk.Toplevel(self)
+        dialog.title("Revisar etiquetas sugeridas")
+        dialog.configure(background=COLORS.panel)
+        dialog.geometry("620x460")
+        dialog.minsize(500, 360)
+        dialog.transient(self)
+        tk.Label(dialog, text="COLA DE REVISION DE IA", background=COLORS.panel, foreground=COLORS.text,
+                 font=(IDENTITY_FONT, 15, "bold")).pack(anchor="w", padx=18, pady=(18, 3))
+        tk.Label(dialog, text="Disenos sin etiquetas con analisis vigente. Revisalos uno por uno; nada se guarda sin confirmacion.",
+                 background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 9),
+                 wraplength=570, justify="left").pack(anchor="w", padx=18, pady=(0, 12))
+        holder = tk.Frame(dialog, background=COLORS.panel)
+        holder.pack(fill="both", expand=True, padx=18)
+        queue = tk.Listbox(holder, background=COLORS.field, foreground=COLORS.text,
+                           selectbackground=COLORS.wine, selectforeground=COLORS.text,
+                           borderwidth=0, highlightthickness=0, font=(UI_FONT, 10))
+        scrollbar = ttk.Scrollbar(holder, orient="vertical", command=queue.yview)
+        queue.configure(yscrollcommand=scrollbar.set)
+        queue.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        items: list[dict] = []
+        summary = tk.StringVar()
+
+        def refresh_queue():
+            nonlocal items
+            items = self.database.ai_review_images(provider, model)
+            queue.delete(0, tk.END)
+            for item in items:
+                queue.insert(tk.END, item.get("name") or Path(item["path"]).name)
+            summary.set(f"{len(items)} diseno(s) pendientes de revision.")
+
+        def review_selected(_event=None):
+            selected = queue.curselection()
+            if not selected:
+                return
+            item = items[selected[0]]
+            result_dialog = tk.Toplevel(dialog)
+            result_dialog.title("Revision de IA")
+            result_dialog.configure(background="#080909")
+            result_dialog.transient(dialog)
+            self.show_analysis_result(result_dialog, item, item["ai_result"])
+            result_dialog.bind("<Destroy>", lambda event: refresh_queue() if event.widget is result_dialog else None, add="+")
+
+        footer = tk.Frame(dialog, background=COLORS.panel)
+        footer.pack(fill="x", padx=18, pady=14)
+        tk.Label(footer, textvariable=summary, background=COLORS.panel, foreground=COLORS.muted,
+                 font=(UI_FONT, 9)).pack(side="left")
+        ttk.Button(footer, text="Cerrar", command=dialog.destroy, style="Secondary.TButton").pack(side="right")
+        ttk.Button(footer, text="Revisar seleccion", command=review_selected, style="Primary.TButton").pack(side="right", padx=(0, 8))
+        ttk.Button(footer, text="Actualizar", command=refresh_queue, style="Secondary.TButton").pack(side="right", padx=(0, 8))
+        queue.bind("<Double-Button-1>", review_selected)
+        refresh_queue()
+        self.center_window(dialog)
+
     def bring_to_front(self):
         self.deiconify()
         self.lift()
         self.focus_force()
 
     def create_splash(self):
+        return self._create_legacy_splash()
+
+    def _create_legacy_splash(self):
         splash = tk.Toplevel(self)
         splash.overrideredirect(True)
         splash.configure(background=COLORS.panel, highlightbackground=COLORS.wine, highlightthickness=1)
         splash.geometry("420x210")
-        tk.Label(splash, text="2CCI", background=COLORS.panel, foreground=COLORS.text, font=(IDENTITY_FONT, 34, "bold")).pack(pady=(42, 2))
+        tk.Label(splash, text="Doccione", background=COLORS.panel, foreground=COLORS.text, font=(IDENTITY_FONT, 34, "bold")).pack(pady=(42, 2))
         tk.Label(splash, text="DOCCIONE STUDIO", background=COLORS.panel, foreground=COLORS.wine_active, font=(IDENTITY_FONT, 11, "bold")).pack()
         tk.Label(splash, text="CARGANDO…", background=COLORS.panel, foreground=COLORS.muted, font=(IDENTITY_FONT, 10)).pack(pady=(4, 0))
         splash.update_idletasks()
@@ -575,6 +1017,60 @@ class VisionVaultApp(DndRoot):
         splash.geometry(f"+{x}+{y}")
         splash.update()
         return splash
+
+    def _create_animated_splash(self):
+        """Crea la pantalla inicial con la identidad animada de Doccione."""
+        splash = tk.Toplevel(self)
+        splash.overrideredirect(True)
+        splash.configure(background="#050505", highlightbackground=COLORS.wine, highlightthickness=1)
+        splash.geometry("640x384")
+
+        animation = tk.Label(splash, background="#050505", borderwidth=0)
+        animation.place(relx=0.5, rely=0.5, anchor="center")
+        brand = tk.Frame(splash, background="#111111", highlightbackground=COLORS.wine, highlightthickness=1)
+        brand.place(relx=0.5, rely=0.5, anchor="center")
+        tk.Label(brand, text="Doccione", background="#111111", foreground=COLORS.text,
+                 font=(IDENTITY_FONT, 30, "bold")).pack(padx=28, pady=(16, 0))
+        tk.Label(brand, text="SISTEMA INTELIGENTE DE PRODUCCIÓN DE STICKERS", background="#111111",
+                 foreground=COLORS.wine_active, font=(IDENTITY_FONT, 8, "bold")).pack(padx=18, pady=(2, 0))
+        tk.Label(brand, text="CARGANDO…", background="#111111", foreground=COLORS.muted,
+                 font=(IDENTITY_FONT, 9)).pack(pady=(5, 15))
+
+        self._start_splash_animation(splash, animation)
+        splash.update_idletasks()
+        x = (splash.winfo_screenwidth() - splash.winfo_width()) // 2
+        y = (splash.winfo_screenheight() - splash.winfo_height()) // 2
+        splash.geometry(f"+{x}+{y}")
+        splash.update()
+        return splash
+
+    def _start_splash_animation(self, splash, target):
+        """Reproduce en bucle la animación de gárgolas del splash."""
+        try:
+            from PIL import Image, ImageTk
+
+            asset = Path(__file__).resolve().parents[2] / "assets" / "mascots" / "doccione-original-gargoyles.gif"
+            source = Image.open(asset)
+            frame_count = source.n_frames
+        except Exception:
+            return
+
+        def show_frame(index=0):
+            if not splash.winfo_exists():
+                source.close()
+                return
+            try:
+                source.seek(index)
+                frame = source.convert("RGBA").resize((640, 384), Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(frame)
+                target.configure(image=photo)
+                target.image = photo  # Evita que Tk descarte el frame actual.
+                duration = max(80, int(source.info.get("duration", 490)))
+                splash.after(duration, show_frame, (index + 1) % frame_count)
+            except tk.TclError:
+                source.close()
+
+        show_frame()
 
     def finish_startup(self):
         # Se mapea invisible para que Tk pueda calcular la cuadrícula sin
@@ -605,36 +1101,47 @@ class VisionVaultApp(DndRoot):
                 (time.perf_counter() - self._startup_started) * 1000,
                 images=self.database.count(),
             )
+        
+        # Suscribirse a eventos de cambio de etapa para actualizar el tablero de producción
+        self._event_bus.on_event(self._on_stage_changed_event)
+
+    def _on_stage_changed_event(self, event_uuid: str, event_type: str, title: str, message: str, priority: str):
+        """Maneja eventos de cambio de etapa para sincronizar el tablero de producción."""
+        if event_type == "stage.changed":
+            self._sync_production_board()
 
     def _build(self):
-        # Barra superior: identidad a la izquierda y acciones operativas a la
-        # derecha. Las tareas no cambian; solo pasan a una jerarquía estable.
-        toolbar = tk.Frame(self, background=COLORS.background_secondary, height=88)
+        # Barra superior simplificada: identidad a la izquierda y configuración a la derecha.
+        toolbar = tk.Frame(self, background=COLORS.background_secondary, height=56)
         toolbar.pack(fill="x")
         toolbar.pack_propagate(False)
         brand = tk.Frame(toolbar, background=COLORS.background_secondary)
         brand.pack(side="left")
         tk.Label(brand, text="DOCCIONE STUDIO", background=COLORS.background_secondary, foreground=COLORS.text,
-                 font=(IDENTITY_FONT, 27, "bold")).pack(anchor="w", padx=22, pady=(13, 0))
+                 font=(IDENTITY_FONT, 24, "bold")).pack(anchor="w", padx=22, pady=(14, 0))
         tk.Label(brand, text="SISTEMA INTELIGENTE DE PRODUCCIÓN DE STICKERS", background=COLORS.background_secondary,
-                 foreground=COLORS.wine_active, font=(IDENTITY_FONT, 9, "bold")).pack(anchor="w", padx=23, pady=(0, 12))
-        # Acciones agrupadas por tarea, para evitar una fila de botones sin
-        # jerarquía y dejar claro qué pertenece a biblioteca e IA.
-        actions = tk.Frame(toolbar, background=COLORS.background_secondary)
-        actions.pack(side="right", anchor="ne", padx=18, pady=14)
-        library_actions = tk.Frame(actions, background=COLORS.background_secondary)
-        library_actions.pack(anchor="e", pady=(0, 6))
-        ttk.Button(library_actions, text="Indexar carpeta", command=lambda: self.index_folder(), style="Secondary.TButton").pack(side="right")
-        ttk.Button(library_actions, text="Escanear biblioteca", command=lambda: self.start_full_gemini_scan(), style="Secondary.TButton").pack(side="right", padx=(0, 8))
-        ai_actions = tk.Frame(actions, background=COLORS.background_secondary)
-        ai_actions.pack(anchor="e")
-        tk.Label(ai_actions, text="ANÁLISIS", background=COLORS.background_secondary, foreground=COLORS.muted,
-                 font=(IDENTITY_FONT, 9, "bold")).pack(side="left", padx=(0, 6))
-        provider = ttk.Combobox(ai_actions, textvariable=self.ai_provider, values=("Local", "Gemini"), state="readonly", width=10)
-        provider.pack(side="left")
-        ttk.Button(ai_actions, text="Configurar Gemini", command=lambda: self.configure_gemini(), style="Primary.TButton").pack(side="left", padx=(4, 0))
-        provider.bind("<<ComboboxSelected>>", lambda _event: (self.save_settings(), self.connect_gemini_on_startup()))
+                 foreground=COLORS.wine_active, font=(IDENTITY_FONT, 8, "bold")).pack(anchor="w", padx=23, pady=(0, 14))
+        # Botón de configuración a la derecha
+        config_btn = tk.Button(toolbar, text="⚙ Configuración", command=self.open_configuration_window,
+                              background=COLORS.panel, foreground=COLORS.text,
+                              activebackground=COLORS.panel_elevated, activeforeground=COLORS.text,
+                              borderwidth=1, relief="solid", highlightthickness=1,
+                              highlightbackground=COLORS.border, padx=16, pady=8,
+                              font=(UI_FONT, 10, "bold"), cursor="hand2")
+        config_btn.pack(side="right", padx=18, pady=12)
+        notif_btn = tk.Button(
+            toolbar, text="🔔", command=self.open_notification_center,
+            background=COLORS.panel, foreground=COLORS.text,
+            activebackground=COLORS.panel_elevated, activeforeground=COLORS.text,
+            borderwidth=1, relief="solid", highlightthickness=1,
+            highlightbackground=COLORS.border, padx=12, pady=8,
+            font=(UI_FONT, 12, "bold"), cursor="hand2",
+        )
+        notif_btn.pack(side="right", padx=(0, 8), pady=12)
         tk.Frame(self, height=1, background=COLORS.border).pack(fill="x")
+        
+        # Reference to configuration window
+        self._config_window = None
 
         body = tk.Frame(self, background=COLORS.background)
         body.pack(fill="both", expand=True, padx=16, pady=(14, 16))
@@ -654,24 +1161,7 @@ class VisionVaultApp(DndRoot):
                  font=(IDENTITY_FONT, 9, "bold")).pack(anchor="w", padx=16, pady=(0, 8))
         self.notifications_frame = tk.Frame(navigation, background=COLORS.background_secondary)
         self.notifications_frame.pack(fill="x", padx=10, pady=(0, 12))
-        try:
-            self.refresh_notifications()
-        except Exception as e:
-            # Evitar que un fallo en el panel de notificaciones impida el arranque
-            try:
-                self.status.set(f"Aviso: no se pudieron cargar notificaciones: {e}")
-            except Exception:
-                pass
-        
-        # Botón para abrir el Centro de Notificaciones
-        _notif_center_btn = tk.Button(
-            navigation, text="📱 Centro de notificaciones", command=self.open_notification_center,
-            background=COLORS.wine_dark, foreground=COLORS.text,
-            activebackground=COLORS.wine, activeforeground=COLORS.text,
-            borderwidth=0, relief="flat", highlightthickness=0,
-            padx=10, pady=7, font=(UI_FONT, 9, "bold"), cursor="hand2",
-        )
-        _notif_center_btn.pack(fill="x", padx=10, pady=(0, 10))
+        self.after_idle(self._deferred_refresh_notifications)
         
         tk.Frame(navigation, height=1, background=COLORS.border).pack(fill="x", padx=14, pady=(6, 12))
         tk.Label(navigation, text="BIBLIOTECA ACTIVA", background=COLORS.background_secondary, foreground=COLORS.muted,
@@ -685,21 +1175,36 @@ class VisionVaultApp(DndRoot):
         sidebar = tk.Frame(content_shell, width=238, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
         sidebar.pack(side="right", fill="y", padx=(14, 0))
         sidebar.pack_propagate(False)
-        section_heading(sidebar, "FILTROS", detail="Combiná etiquetas para mostrar solo los diseños en común.")
-        ttk.Button(sidebar, text="Desmarcar filtros", command=lambda: self.clear_all_tags(), style="Secondary.TButton").pack(fill="x", padx=14, pady=(0, 12))
+        self.untagged_only = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            sidebar, text="Solo diseños sin etiquetas", variable=self.untagged_only,
+            command=self.refresh, anchor="w", justify="left", background=COLORS.panel,
+            foreground=COLORS.text, activebackground=COLORS.panel,
+            activeforeground=COLORS.text, selectcolor=COLORS.wine, font=(UI_FONT, 10),
+            highlightthickness=0,
+        ).pack(fill="x", padx=14, pady=(14, 12))
+        tk.Label(sidebar, text="CATEGORÍAS", background=COLORS.panel, foreground=COLORS.wine_active, font=(IDENTITY_FONT, 10, "bold")).pack(anchor="w", padx=14, pady=(0, 6))
+        category_picker_row = tk.Frame(sidebar, background=COLORS.panel)
+        category_picker_row.pack(fill="x", padx=14, pady=(0, 12))
+        self.category_filter = tk.StringVar(value="Todas las categorías")
+        self.category_picker = ttk.Combobox(
+            category_picker_row, textvariable=self.category_filter, state="readonly",
+        )
+        self.category_picker.pack(side="left", fill="x", expand=True)
+        self.category_picker.bind("<<ComboboxSelected>>", lambda _event: self._on_category_filter_changed())
+        self.category_actions_btn = tk.Button(
+            category_picker_row, text="⋮", command=self.show_selected_category_actions,
+            background=COLORS.panel, foreground=COLORS.text, activebackground=COLORS.panel_elevated,
+            activeforeground=COLORS.text, borderwidth=0, relief="flat", highlightthickness=0,
+            font=(UI_FONT, 14, "bold"), cursor="hand2", padx=7,
+        )
+        self.category_actions_btn.pack(side="left", padx=(5, 0))
         tk.Label(sidebar, text="BUSCAR ETIQUETAS", background=COLORS.panel, foreground=COLORS.wine_active, font=(IDENTITY_FONT, 10, "bold")).pack(anchor="w", padx=14, pady=(0, 5))
         self.tag_filter_query = tk.StringVar()
         tag_filter_entry = ttk.Entry(sidebar, textvariable=self.tag_filter_query)
-        tag_filter_entry.pack(fill="x", padx=14, pady=(0, 7))
+        tag_filter_entry.pack(fill="x", padx=14, pady=(0, 12))
         tag_filter_entry.bind("<KeyRelease>", lambda _event: self.refresh_tags())
-        self.tag_category_filter = tk.StringVar(value="Todas las categorías")
-        self.tag_category_picker = ttk.Combobox(sidebar, textvariable=self.tag_category_filter, state="readonly")
-        self.tag_category_picker.pack(fill="x", padx=14, pady=(0, 12))
-        self.tag_category_picker.bind("<<ComboboxSelected>>", lambda _event: self.refresh_tags())
-        tk.Label(sidebar, text="CATEGORÍAS", background=COLORS.panel, foreground=COLORS.wine_active, font=(IDENTITY_FONT, 10, "bold")).pack(anchor="w", padx=14, pady=(0, 6))
-        self.categories_frame = tk.Frame(sidebar, background=COLORS.panel)
-        self.categories_frame.pack(fill="x", padx=8, pady=(0, 8))
-        tk.Label(sidebar, text="PALABRAS CLAVE", background=COLORS.panel, foreground=COLORS.wine_active, font=(IDENTITY_FONT, 10, "bold")).pack(anchor="w", padx=14, pady=(4, 6))
+        tk.Label(sidebar, text="PALABRAS CLAVE", background=COLORS.panel, foreground=COLORS.wine_active, font=(IDENTITY_FONT, 10, "bold")).pack(anchor="w", padx=14, pady=(0, 6))
         tags_area = tk.Frame(sidebar, background=COLORS.panel)
         tags_area.pack(fill="both", expand=True, padx=8, pady=(0, 10))
         self.tags_canvas = tk.Canvas(tags_area, background=COLORS.panel, highlightthickness=0)
@@ -714,43 +1219,90 @@ class VisionVaultApp(DndRoot):
         tags_scroll.pack(side="right", fill="y")
 
         workspace = ttk.Frame(content_shell)
-        workspace.pack(side="left", fill="both", expand=True)
+        workspace.pack(side="left", fill="both", expand=True, pady=(4, 0))
         self.status = tk.StringVar(value="")
+        self.module_registry = ModuleRegistry(on_loaded=self._module_loaded)
         self.status_panel = status_strip(workspace, self.status)
-        self.status_panel.pack(fill="x", pady=(0, 8))
+        # self.status_panel.pack(fill="x", pady=(0, 8))  # Removed to eliminate dark horizontal bar with green dot
         # Un barrido muy breve da continuidad al cambiar de vista sin bloquear
         # las miniaturas ni forzar una recarga completa de la aplicación.
         self.tab_transition = tk.Canvas(workspace, height=3, background=COLORS.background, highlightthickness=0)
         self.tab_transition.pack(fill="x")
         self.tabs = ttk.Notebook(workspace, style="Main.TNotebook")
         self.tabs.pack(fill="both", expand=True)
+        today_tab = ttk.Frame(self.tabs)
         orders_tab = ttk.Frame(self.tabs)
         designs_tab = ttk.Frame(self.tabs)
         selected_tab = ttk.Frame(self.tabs)
         production_tab = ttk.Frame(self.tabs)
+        products_tab = ttk.Frame(self.tabs)
+        sales_tab = ttk.Frame(self.tabs)
+        commercial_tab = ttk.Frame(self.tabs)
+        chat_tab = ttk.Frame(self.tabs)
+        processed_tab = ttk.Frame(self.tabs)
+        self.tabs.add(today_tab, text="Inicio")
         self.tabs.add(designs_tab, text="Diseños")
         self.tabs.add(selected_tab, text="Seleccionados (0)")
+        self.tabs.add(processed_tab, text="Últimos Procesados (0)")
         self.tabs.add(orders_tab, text="Pedidos")
+        self.tabs.add(sales_tab, text="Ventas")
         self.tabs.add(production_tab, text="Producción")
-        # La biblioteca es el punto de entrada operativo de Doccione Studio.
-        self.tabs.select(designs_tab)
+        self.tabs.add(products_tab, text="Productos")
+        self.tabs.add(commercial_tab, text="Gestión comercial")
+        self.tabs.add(chat_tab, text="Chat")
+        self.tabs.select(today_tab)
+        self.today_tab = today_tab
         self.designs_tab = designs_tab
         self.selected_tab = selected_tab
         self.orders_tab = orders_tab
+        self.sales_tab = sales_tab
         self.production_tab = production_tab
+        self.products_tab = products_tab
+        self.commercial_tab = commercial_tab
+        self.chat_tab = chat_tab
+        self.processed_tab = processed_tab
         self.order_tabs: dict[int, ttk.Frame] = {}
+        self.build_today_module(today_tab)
         orders_builder = getattr(type(self), "build_orders_module", None)
         if callable(orders_builder):
             orders_builder(self, orders_tab)
         production_builder = getattr(type(self), "build_production_module", None)
-        if callable(production_builder):
-            production_builder(self, production_tab)
+        self.module_registry.register(
+            "production",
+            lambda: self._load_legacy_module(production_tab, production_builder),
+        )
+        commercial_builder = getattr(type(self), "build_commercial_module", None)
+        self.module_registry.register("products", lambda: self._load_product_catalog(products_tab))
+        self.module_registry.register("sales", lambda: self._load_seller_center(sales_tab))
+        self.module_registry.register(
+            "commercial",
+            lambda: self._load_commercial_module(commercial_tab, commercial_builder),
+        )
+        self.module_registry.register("chat", lambda: self._load_legacy_module(chat_tab, self.build_chat_module))
         library_header = tk.Frame(designs_tab, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
         library_header.pack(fill="x", padx=10, pady=(10, 0))
         tk.Label(library_header, text="BIBLIOTECA", background=COLORS.panel, foreground=COLORS.text,
                  font=(IDENTITY_FONT, 15, "bold")).pack(side="left", padx=14, pady=10)
         tk.Label(library_header, text="Diseños reutilizables · Doble clic para ver · Ctrl para seleccionar",
                  background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 9)).pack(side="left", padx=(0, 14), pady=10)
+        self.sticker_bank_order_target = tk.StringVar(value="")
+        # Disponible también fuera del Banco de stickers: permite enviar la
+        # selección de la Biblioteca a cualquier pedido pendiente.
+        self.library_add_to_order_button = ttk.Button(
+            library_header,
+            text="Agregar seleccionados a pedido",
+            command=self.link_selected_to_order,
+            style="Primary.TButton",
+            state="disabled",
+        )
+        self.library_add_to_order_button.pack(side="right", padx=(0, 10), pady=7)
+        self.library_order_actions = tk.Frame(library_header, background=COLORS.panel)
+        self.library_order_actions.pack(side="right", padx=10, pady=7)
+        tk.Label(self.library_order_actions, textvariable=self.sticker_bank_order_target,
+                 background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 9)).pack(side="left", padx=(0, 8))
+        ttk.Button(self.library_order_actions, text="Agregar al pedido", style="Primary.TButton",
+                   command=self.add_selected_stickers_to_order).pack(side="left")
+        self.library_order_actions.pack_forget()
         search_panel = tk.Frame(designs_tab, background=COLORS.panel)
         search_panel.pack(fill="x", pady=(0, 8), padx=10)
         self.design_limit = tk.StringVar(value="100")
@@ -763,13 +1315,16 @@ class VisionVaultApp(DndRoot):
         self.search = SearchBar(
             search_panel,
             lambda q=None: self.refresh(q),
-            lambda q=None: self.database.suggestions(q),
+            lambda q=None: self.database.suggestions(q, typed=True),
             lambda: self.show_random_grid(),
+            lambda: self.show_recent_grid(),
             lambda q=None: self.predict_search(q),
             lambda: self.show_visual_search_dialog(),
             lambda: self.open_sticker_studio(),
         )
         self.search.pack(fill="x", padx=12, pady=3)
+        self.filter_chips_frame = tk.Frame(designs_tab, background=COLORS.background)
+        self.filter_chips_frame.pack(fill="x", padx=12, pady=(0, 5))
         self.gallery = Gallery(
             designs_tab,
             lambda img: self.preview_image(img),
@@ -785,19 +1340,36 @@ class VisionVaultApp(DndRoot):
         selected_actions = tk.Frame(selected_tab, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
         selected_actions.pack(fill="x", padx=10, pady=(10, 0))
         selected_copy = tk.Frame(selected_actions, background=COLORS.panel)
-        selected_copy.pack(side="left", padx=14, pady=10)
+        selected_copy.pack(fill="x", padx=14, pady=(10, 4))
         tk.Label(selected_copy, text="SELECCIONADOS", background=COLORS.panel, foreground=COLORS.text,
                  font=(IDENTITY_FONT, 13, "bold")).pack(anchor="w")
-        tk.Label(selected_copy, text="Arrastralos a Photoshop u otra aplicación.", background=COLORS.panel,
+        self.selected_summary = tk.StringVar(value="0 diseños seleccionados · Elegí diseños desde Biblioteca con Ctrl + clic.")
+        tk.Label(selected_copy, textvariable=self.selected_summary, background=COLORS.panel,
                  foreground=COLORS.muted, font=(UI_FONT, 9)).pack(anchor="w")
         selected_controls = tk.Frame(selected_actions, background=COLORS.panel)
-        selected_controls.pack(side="right", padx=10, pady=13)
-        ttk.Button(selected_controls, text="Deseleccionar todo", command=lambda: self.clear_selected(), style="Secondary.TButton").pack(side="right")
-        ttk.Button(selected_controls, text="Seleccionar todos", command=lambda: self.select_all_visible(), style="Secondary.TButton").pack(side="right", padx=(0, 7))
-        ttk.Button(selected_controls, text="Armado de planchas", command=lambda: self.open_plancha_constructor(), style="Primary.TButton").pack(side="right", padx=(0, 7))
-        ttk.Button(selected_controls, text="Agregar etiqueta", command=lambda: self.add_tag_to_selected(), style="Secondary.TButton").pack(side="right", padx=(0, 7))
+        selected_controls.pack(anchor="e", padx=10, pady=(2, 10))
+        self.selected_clear_button = ttk.Button(selected_controls, text="Deseleccionar todo", command=self.clear_selected, style="Secondary.TButton")
+        self.selected_clear_button.pack(side="right")
+        ttk.Button(selected_controls, text="Seleccionar visibles", command=self.select_all_visible, style="Secondary.TButton").pack(side="right", padx=(0, 7))
+        self.selected_plancha_button = ttk.Button(selected_controls, text="Armado de planchas", command=self.open_plancha_constructor, style="Primary.TButton")
+        self.selected_plancha_button.pack(side="right", padx=(0, 7))
+        self.selected_order_button = ttk.Button(selected_controls, text="Enlazar a pedido", command=self.link_selected_to_order, style="Secondary.TButton")
+        self.selected_order_button.pack(side="right", padx=(0, 7))
+        self.selected_add_tag_button = ttk.Button(selected_controls, text="Agregar etiqueta", command=self.add_tag_to_selected, style="Secondary.TButton")
+        self.selected_add_tag_button.pack(side="right", padx=(0, 7))
+        self.selected_manage_button = ttk.Menubutton(selected_controls, text="Más acciones ▾", style="Secondary.TButton")
+        self.selected_manage_button.pack(side="right", padx=(0, 7))
+        selected_manage_menu = tk.Menu(self.selected_manage_button, tearoff=0)
+        configure_menu(selected_manage_menu)
+        selected_manage_menu.add_command(label="Quitar etiqueta", command=self.remove_tag_from_selected)
+        selected_manage_menu.add_separator()
+        selected_manage_menu.add_command(label="Agregar categoría", command=self.add_category_to_selected)
+        selected_manage_menu.add_command(label="Quitar categoría", command=self.clear_category_from_selected)
+        self.selected_manage_button.configure(menu=selected_manage_menu)
+        selected_workspace = tk.Frame(selected_tab, background=COLORS.background)
+        selected_workspace.pack(fill="both", expand=True)
         self.selected_gallery = Gallery(
-            selected_tab,
+            selected_workspace,
             lambda img: self.preview_image(img),
             lambda img: self.add_tag(img),
             lambda img, name: self.remove_tag(img, name),
@@ -807,28 +1379,2225 @@ class VisionVaultApp(DndRoot):
             lambda image: self.dragged_paths(image),
             on_trash=lambda img: self.trash_sticker(img),
         )
-        self.selected_gallery.pack(fill="both", expand=True)
+        self.selected_empty_state = tk.Frame(selected_workspace, background=COLORS.background)
+        tk.Label(self.selected_empty_state, text="Tu selección está vacía", background=COLORS.background,
+                 foreground=COLORS.text, font=(IDENTITY_FONT, 18, "bold")).pack(pady=(0, 8))
+        tk.Label(self.selected_empty_state,
+                 text="Elegí diseños desde Biblioteca con Ctrl + clic para preparar una plancha,\norganizarlos por etiquetas o arrastrarlos a otra aplicación.",
+                 background=COLORS.background, foreground=COLORS.muted, font=(UI_FONT, 10), justify="center").pack()
+        ttk.Button(self.selected_empty_state, text="Ir a Biblioteca", style="Primary.TButton",
+                   command=lambda: self.tabs.select(self.designs_tab)).pack(pady=(18, 0))
+        self._update_selected_area_state()
+        
+        # ── Tab de Últimos Procesados ──────────────────────────────────────
+        # Contenedor principal para el layout de procesados
+        processed_container = tk.Frame(processed_tab, background=COLORS.panel)
+        processed_container.pack(fill="both", expand=True)
+        
+        # Encabezado compacto
+        processed_header = tk.Frame(processed_container, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
+        processed_header.pack(fill="x", padx=10, pady=(10, 0))
+        
+        # Título y subtítulo
+        header_left = tk.Frame(processed_header, background=COLORS.panel)
+        header_left.pack(side="left", padx=14, pady=10)
+        tk.Label(header_left, text="Últimos Procesados", background=COLORS.panel, foreground=COLORS.text,
+                 font=(IDENTITY_FONT, 15, "bold")).pack(anchor="w")
+        tk.Label(header_left, text="Stickers recientes de todas tus carpetas. Los de la carpeta monitoreada aparecen automáticamente aquí.",
+                 background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 9)).pack(anchor="w")
+        
+        # Controles del encabezado
+        header_right = tk.Frame(processed_header, background=COLORS.panel)
+        header_right.pack(side="right", padx=14, pady=10)
+        
+        ttk.Button(header_right, text="Actualizar", command=lambda: self.refresh_processed_gallery(),
+                   style="Secondary.TButton").pack(side="right", padx=(7, 0))
+        
+        self.processed_ready_count = tk.StringVar(value="Publicar listos (0)")
+        self.processed_confirm_all_btn = ttk.Button(header_right, textvariable=self.processed_ready_count,
+                                                    command=lambda: self.confirm_all_ready_stickers(),
+                                                    style="Primary.TButton", state="disabled")
+        self.processed_confirm_all_btn.pack(side="right", padx=(7, 0))
+        
+        self.processed_pending_count = tk.StringVar(value="0 pendientes")
+        tk.Label(header_right, textvariable=self.processed_pending_count, background=COLORS.panel, foreground=COLORS.muted,
+                 font=(UI_FONT, 9)).pack(side="right", padx=(0, 14))
+        
+        # Área principal con PanedWindow horizontal
+        processed_main = tk.Frame(processed_container, background=COLORS.panel)
+        processed_main.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        self.processed_paned = ttk.PanedWindow(processed_main, orient="horizontal")
+        self.processed_paned.pack(fill="both", expand=True)
+        
+        # Guardar posición del separador cuando se mueva
+        self.processed_paned.bind("<ButtonRelease-1>", lambda e: self.save_processed_separator())
+        
+        # Panel izquierdo: stickers pendientes (65%)
+        processed_left_frame = ttk.Frame(self.processed_paned)
+        self.processed_paned.add(processed_left_frame, weight=65)
+        
+        # Controles superiores del panel izquierdo
+        left_controls = tk.Frame(processed_left_frame, background=COLORS.panel)
+        left_controls.pack(fill="x", pady=(0, 8))
+        
+        # Selección y ordenamiento
+        controls_left = tk.Frame(left_controls, background=COLORS.panel)
+        controls_left.pack(side="left")
+        
+        ttk.Button(controls_left, text="Seleccionar todos", command=lambda: self.select_all_processed(),
+                   style="Secondary.TButton").pack(side="left", padx=(0, 7))
+        
+        self.processed_order_var = tk.StringVar(value="Más recientes")
+        order_combo = ttk.Combobox(controls_left, textvariable=self.processed_order_var, 
+                                   values=["Más recientes", "Más antiguos", "Nombre"], 
+                                   state="readonly", width=12)
+        order_combo.pack(side="left", padx=(0, 7))
+        order_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_processed_gallery())
+        
+        self.processed_selected_count = tk.StringVar(value="0 seleccionados")
+        tk.Label(controls_left, textvariable=self.processed_selected_count, background=COLORS.panel, foreground=COLORS.muted,
+                 font=(UI_FONT, 9)).pack(side="left")
+        
+        # Galería de procesados en panel izquierdo
+        self.processed_gallery = Gallery(
+            processed_left_frame,
+            lambda img: self.preview_processed_image(img),
+            lambda img: None,  # No tags for processed items
+            lambda img, name: None,
+            lambda: None,
+            lambda img: self.toggle_processed_selection(img),
+            lambda img: self.is_processed_selected(img),
+            lambda image: self.dragged_paths(image),
+            on_trash=lambda img: self.discard_processed_sticker(img),
+            responsive_columns=True,
+        )
+        self.processed_gallery.pack(fill="both", expand=True)
+        
+        # Panel derecho: detalle del sticker seleccionado (35%)
+        processed_right_frame = ttk.Frame(self.processed_paned)
+        self.processed_paned.add(processed_right_frame, weight=35)
+        
+        # Contenedor del detalle
+        self.processed_detail_container = tk.Frame(processed_right_frame, background=COLORS.panel)
+        self.processed_detail_container.pack(fill="both", expand=True, padx=8)
+        
+        # Estado inicial del panel derecho (sin selección)
+        self.processed_detail_empty_label = tk.Label(
+            self.processed_detail_container,
+            text="Seleccioná un sticker para revisar sus datos.",
+            background=COLORS.panel,
+            foreground=COLORS.muted,
+            font=(UI_FONT, 10)
+        )
+        self.processed_detail_empty_label.pack(expand=True)
+        
+        # Barra inferior fija de acciones
+        processed_bottom = tk.Frame(processed_container, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
+        processed_bottom.pack(fill="x", padx=10, pady=(0, 10))
+        
+        bottom_left = tk.Frame(processed_bottom, background=COLORS.panel)
+        bottom_left.pack(side="left", padx=14, pady=10)
+        
+        self.processed_bottom_count = tk.StringVar(value="0 seleccionados")
+        tk.Label(bottom_left, textvariable=self.processed_bottom_count, background=COLORS.panel, foreground=COLORS.text,
+                 font=(UI_FONT, 10)).pack(side="left")
+        
+        bottom_right = tk.Frame(processed_bottom, background=COLORS.panel)
+        bottom_right.pack(side="right", padx=14, pady=10)
+        
+        self.processed_discard_btn = ttk.Button(bottom_right, text="Descartar seleccionados", 
+                                                command=lambda: self.discard_selected_processed(),
+                                                style="Danger.TButton", state="disabled")
+        self.processed_discard_btn.pack(side="right", padx=(7, 0))
+
+        self.processed_tag_btn = ttk.Button(bottom_right, text="Agregar etiqueta",
+                                            command=self.add_tag_to_selected_processed,
+                                            style="Secondary.TButton", state="disabled")
+        self.processed_tag_btn.pack(side="right", padx=(7, 0))
+
+        self.processed_category_btn = ttk.Button(bottom_right, text="Asignar categoría",
+                                                 command=self.assign_category_to_selected_processed,
+                                                 style="Secondary.TButton", state="disabled")
+        self.processed_category_btn.pack(side="right", padx=(7, 0))
+
+        self.processed_order_btn = ttk.Button(bottom_right, text="Enlazar a pedido",
+                                              command=self.link_selected_processed_to_order,
+                                              style="Secondary.TButton", state="disabled")
+        self.processed_order_btn.pack(side="right", padx=(7, 0))
+        
+        self.processed_confirm_btn = ttk.Button(bottom_right, text="Publicar en Biblioteca",
+                                                 command=lambda: self.approve_selected_processed(),
+                                                 style="Primary.TButton", state="disabled")
+        self.processed_confirm_btn.pack(side="right")
+        
+        # Menú de tres puntos para acciones globales
+        processed_menu = tk.Menu(bottom_right, tearoff=0)
+        configure_menu(processed_menu)
+        processed_menu.add_command(label="Descartar todos", command=lambda: self.discard_all_processed())
+        processed_menu.add_command(label="Confirmar todos", command=lambda: self.approve_all_processed())
+        
+        menu_btn = ttk.Button(bottom_right, text="⋮", width=3, style="Secondary.TButton")
+        menu_btn.pack(side="right", padx=(7, 0))
+        menu_btn.bind("<Button-1>", lambda e: processed_menu.post(e.x_root, e.y_root))
+        
+        # Inicializar estado de selección
+        self.processed_selection = set()
+        self.processed_items = []
+        
+        # Restaurar posición del separador
+        self.restore_processed_separator()
+        
         self._build_navigation_buttons({
+            "Inicio": today_tab,
             "Biblioteca": designs_tab,
             "Seleccionados": selected_tab,
+            "Últimos Procesados": processed_tab,
             "Pedidos": orders_tab,
+            "Ventas": sales_tab,
             "Producción": production_tab,
+            "Productos": products_tab,
+            "Gestión comercial": commercial_tab,
+            "Chat en directo": chat_tab,
         })
         self.tabs.bind("<<NotebookTabChanged>>", self.on_tab_changed)
-        self._update_navigation(designs_tab)
+        
+        # Keyboard shortcut for bulk confirmation (Ctrl+Shift+Enter)
+        self.bind("<Control-Shift-Return>", lambda e: self._handle_bulk_confirmation_shortcut())
+        
+        self._update_navigation(today_tab)
 
     def _build_navigation_buttons(self, destinations: dict[str, ttk.Frame]):
         """Crea un acceso persistente para las mismas pestañas existentes."""
-        self.navigation_buttons: dict[object, tk.Button] = {}
+        self.navigation_buttons: dict[object, tk.Widget] = {}
         for label, tab in destinations.items():
-            button = navigation_button(self.navigation_items, label, lambda current=tab: self.tabs.select(current))
+            button = navigation_button(
+                self.navigation_items,
+                label,
+                lambda current=tab: self.tabs.select(current),
+                rounded=True,
+            )
             self.navigation_buttons[tab] = button
             if label == "Seleccionados":
                 self.selected_navigation_button = button
 
+    def _module_loaded(self, name: str, elapsed_ms: float) -> None:
+        """Expone el costo real de cada módulo para diagnóstico de arranque."""
+        self.status.set(f"Módulo {name} listo en {elapsed_ms:.0f} ms.")
+        logger.info(
+            "Módulo de interfaz cargado: %s",
+            name,
+            extra={"component": "ui", "event": "module_loaded", "duration_ms": round(elapsed_ms, 2)},
+        )
+
+    def _load_product_catalog(self, parent: tk.Widget):
+        self.product_catalog = ProductCatalog(
+            parent,
+            self.database,
+            on_status=lambda message: self.status.set(message),
+        )
+        self.product_catalog.pack(fill="both", expand=True)
+        return self.product_catalog
+
+    def _load_seller_center(self, parent: tk.Widget):
+        self.seller_center = SellerCenter(
+            parent,
+            self.database,
+            on_open_order=self.open_order_workspace,
+            on_register_payment=self.register_order_payment,
+            on_status=lambda message: self.status.set(message),
+        )
+        self.seller_center.pack(fill="both", expand=True)
+        return self.seller_center
+
+    def _load_legacy_module(self, parent: tk.Widget, builder):
+        if callable(builder):
+            builder(parent) if getattr(builder, "__self__", None) is self else builder(self, parent)
+        return parent
+
+    def _load_commercial_module(self, parent: tk.Widget, builder):
+        # El módulo puede abrirse antes de que el ciclo idle inicialice el
+        # resto de servicios; sólo prepara aquí las dependencias que consume.
+        if self.stock_cost_price is None:
+            self.stock_cost_price = StockCostPriceService(self.database.connection)
+        if self.order_workflow is None:
+            self.order_workflow = OrderWorkflowService(
+                self.database.connection, self.stock_cost_price, self._event_bus
+            )
+        return self._load_legacy_module(parent, builder)
+
+    def _ensure_module(self, name: str, parent: tk.Widget):
+        """Carga un módulo o deja una ficha visible para revisión y reintento."""
+        try:
+            instance = self.module_registry.ensure(name)
+        except Exception as error:
+            self._record_connection_failure(f"Módulo {name}", error)
+            self._show_module_failure(parent, name, error)
+            return None
+        self._connection_failures.pop(f"Módulo {name}", None)
+        return instance
+
+    def _show_module_failure(self, parent: tk.Widget, name: str, error: Exception) -> None:
+        for child in parent.winfo_children():
+            child.destroy()
+        panel = tk.Frame(
+            parent,
+            background=COLORS.panel,
+            highlightthickness=1,
+            highlightbackground=COLORS.wine_active,
+        )
+        panel.pack(fill="both", expand=True, padx=24, pady=24)
+        tk.Label(
+            panel,
+            text="REVISIÓN POR FALLA",
+            background=COLORS.panel,
+            foreground=COLORS.wine_active,
+            font=(IDENTITY_FONT, 15, "bold"),
+        ).pack(anchor="w", padx=18, pady=(18, 6))
+        tk.Label(
+            panel,
+            text=f"El módulo {name} no pudo conectarse. El resto de Doccione Studio sigue disponible.",
+            background=COLORS.panel,
+            foreground=COLORS.text,
+            wraplength=620,
+            justify="left",
+        ).pack(anchor="w", padx=18)
+        tk.Label(
+            panel,
+            text=str(error).strip() or error.__class__.__name__,
+            background=COLORS.panel,
+            foreground=COLORS.muted,
+            wraplength=620,
+            justify="left",
+        ).pack(anchor="w", padx=18, pady=(6, 14))
+        ttk.Button(
+            panel,
+            text="Reintentar conexión",
+            command=lambda: self._retry_module(name, parent),
+            style="Primary.TButton",
+        ).pack(anchor="w", padx=18, pady=(0, 18))
+
+    def _retry_module(self, name: str, parent: tk.Widget):
+        for child in parent.winfo_children():
+            child.destroy()
+        return self._ensure_module(name, parent)
+
+    def _ensure_production_module(self):
+        return self._ensure_module("production", self.production_tab)
+
+    def build_chat_module(self, parent: tk.Widget):
+        """Bandeja de WhatsApp que se actualiza sin interrumpir el trabajo."""
+        root = tk.Frame(parent, background=COLORS.background)
+        root.pack(fill="both", expand=True, padx=10, pady=10)
+        header = tk.Frame(root, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
+        header.pack(fill="x", pady=(0, 10))
+        tk.Label(header, text="CHAT EN DIRECTO", background=COLORS.panel, foreground=COLORS.text,
+                 font=(IDENTITY_FONT, 17, "bold")).pack(side="left", padx=14, pady=11)
+        self.chat_connection_status = tk.StringVar()
+        tk.Label(header, textvariable=self.chat_connection_status, background=COLORS.panel,
+                 foreground=COLORS.muted, font=(UI_FONT, 9)).pack(side="left", padx=(0, 12))
+        ttk.Button(header, text="Actualizar", style="Secondary.TButton",
+                   command=self.refresh_chat).pack(side="right", padx=12, pady=8)
+
+        body = tk.PanedWindow(root, orient="horizontal", background=COLORS.background,
+                              sashwidth=5, sashrelief="flat")
+        body.pack(fill="both", expand=True)
+        inbox = tk.Frame(body, width=285, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
+        conversation = tk.Frame(body, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
+        body.add(inbox, minsize=220)
+        body.add(conversation, minsize=380)
+
+        tk.Label(inbox, text="CONVERSACIONES", background=COLORS.panel, foreground=COLORS.wine_active,
+                 font=(IDENTITY_FONT, 10, "bold")).pack(anchor="w", padx=12, pady=(12, 7))
+        self.chat_conversation_tree = ttk.Treeview(inbox, columns=("name", "preview"), show="headings", selectmode="browse")
+        self.chat_conversation_tree.heading("name", text="Cliente")
+        self.chat_conversation_tree.heading("preview", text="Último mensaje")
+        self.chat_conversation_tree.column("name", width=115, stretch=False)
+        self.chat_conversation_tree.column("preview", width=155, stretch=True)
+        inbox_scroll = ttk.Scrollbar(inbox, orient="vertical", command=self.chat_conversation_tree.yview)
+        self.chat_conversation_tree.configure(yscrollcommand=inbox_scroll.set)
+        self.chat_conversation_tree.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=(0, 10))
+        inbox_scroll.pack(side="right", fill="y", padx=(4, 8), pady=(0, 10))
+        self.chat_conversation_tree.bind("<<TreeviewSelect>>", self._select_chat_conversation)
+        self._chat_rows: dict[str, dict] = {}
+
+        self.chat_title = tk.StringVar(value="Seleccioná una conversación")
+        tk.Label(conversation, textvariable=self.chat_title, background=COLORS.panel, foreground=COLORS.text,
+                 font=(IDENTITY_FONT, 14, "bold")).pack(anchor="w", padx=14, pady=(12, 2))
+        self.chat_detail = tk.StringVar(value="Los mensajes entrantes aparecerán aquí automáticamente.")
+        tk.Label(conversation, textvariable=self.chat_detail, background=COLORS.panel, foreground=COLORS.muted,
+                 font=(UI_FONT, 9)).pack(anchor="w", padx=14, pady=(0, 9))
+        self.chat_messages = tk.Text(conversation, background=COLORS.field, foreground=COLORS.text,
+                                     insertbackground=COLORS.text, relief="flat", borderwidth=0,
+                                     font=(UI_FONT, 10), wrap="word", state="disabled", padx=14, pady=12)
+        self.chat_messages.tag_configure("inbound", foreground=COLORS.text, lmargin1=8, lmargin2=8, spacing3=10)
+        self.chat_messages.tag_configure("outbound", foreground="#A9D0FF", justify="right", rmargin=12, spacing3=10)
+        self.chat_messages.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+        composer = tk.Frame(conversation, background=COLORS.panel)
+        composer.pack(fill="x", padx=12, pady=(0, 12))
+        self.chat_draft = tk.StringVar()
+        self.chat_entry = ttk.Entry(composer, textvariable=self.chat_draft)
+        self.chat_entry.pack(side="left", fill="x", expand=True)
+        self.chat_entry.bind("<Return>", self._send_chat_message)
+        ttk.Button(composer, text="Enviar", style="Primary.TButton", command=self._send_chat_message).pack(side="left", padx=(8, 0))
+        self.refresh_chat()
+
+    def refresh_chat(self):
+        if not hasattr(self, "chat_conversation_tree"):
+            return
+        if self._chat_refresh_after is not None:
+            try:
+                self.after_cancel(self._chat_refresh_after)
+            except tk.TclError:
+                pass
+            self._chat_refresh_after = None
+        config = load_config()
+        self.chat_connection_status.set("WhatsApp conectado" if config.enabled else "WhatsApp no configurado")
+        selected = str(self._chat_selected_conversation_id or "")
+        for item in self.chat_conversation_tree.get_children():
+            self.chat_conversation_tree.delete(item)
+        self._chat_rows = {}
+        try:
+            rows = self.whatsapp_repository.list_conversations()
+        except Exception:
+            rows = []
+        for row in rows:
+            item_id = str(row["id"])
+            name = row.get("display_name") or row.get("phone_number") or row.get("wa_id") or "Sin nombre"
+            preview = (row.get("last_message") or "Sin mensajes").replace("\n", " ")[:45]
+            if row.get("unread_count"):
+                name = f"• {name} ({row['unread_count']})"
+            self.chat_conversation_tree.insert("", "end", iid=item_id, values=(name, preview))
+            self._chat_rows[item_id] = row
+        if selected and selected in self._chat_rows:
+            self.chat_conversation_tree.selection_set(selected)
+            self._render_chat_messages(int(selected))
+        elif not rows:
+            self._chat_selected_conversation_id = None
+            self.chat_title.set("Aún no hay conversaciones")
+            self.chat_detail.set("Configurá WhatsApp Business para recibir y responder mensajes.")
+            self._set_chat_text("")
+        self._chat_refresh_after = self.after(3000, self.refresh_chat)
+
+    def _select_chat_conversation(self, _event=None):
+        selected = self.chat_conversation_tree.selection()
+        if selected:
+            self._chat_selected_conversation_id = int(selected[0])
+            self.whatsapp_service.mark_conversation_read(self._chat_selected_conversation_id)
+            self._render_chat_messages(self._chat_selected_conversation_id)
+
+    def _render_chat_messages(self, conversation_id: int):
+        row = self._chat_rows.get(str(conversation_id), {})
+        name = row.get("display_name") or row.get("phone_number") or row.get("wa_id") or "Conversación"
+        self.chat_title.set(name)
+        self.chat_detail.set(row.get("phone_number") or row.get("wa_id") or "")
+        try:
+            messages = self.whatsapp_service.get_conversation_messages(conversation_id)
+        except Exception:
+            messages = []
+        self.chat_messages.configure(state="normal")
+        self.chat_messages.delete("1.0", "end")
+        for message in messages:
+            stamp = (message.message_timestamp or message.created_at or "").replace("T", " ")[:16]
+            body = message.text_body or message.caption or f"[{message.message_type}]"
+            prefix = "Vos" if message.direction == "outbound" else name
+            tag = "outbound" if message.direction == "outbound" else "inbound"
+            self.chat_messages.insert("end", f"{prefix}  {stamp}\n{body}\n\n", tag)
+        self.chat_messages.configure(state="disabled")
+        self.chat_messages.see("end")
+
+    def _set_chat_text(self, value: str):
+        self.chat_messages.configure(state="normal")
+        self.chat_messages.delete("1.0", "end")
+        self.chat_messages.insert("end", value)
+        self.chat_messages.configure(state="disabled")
+
+    def _send_chat_message(self, _event=None):
+        conversation_id = self._chat_selected_conversation_id
+        body = self.chat_draft.get().strip()
+        if not conversation_id or not body:
+            return "break"
+        row = self._chat_rows.get(str(conversation_id), {})
+        recipient = row.get("wa_id")
+        if not recipient:
+            messagebox.showerror("Chat", "No se encontró el número de WhatsApp de este contacto.")
+            return "break"
+        if not load_config().enabled:
+            messagebox.showwarning("Chat", "WhatsApp Business no está configurado todavía.")
+            return "break"
+        self.whatsapp_service.queue_text_message(recipient, body, conversation_id=conversation_id)
+        self.chat_draft.set("")
+        self.chat_detail.set("Mensaje en cola para enviar…")
+        return "break"
+
+    def build_today_module(self, parent: tk.Widget):
+        root = tk.Frame(parent, background=COLORS.background)
+        root.pack(fill="both", expand=True, padx=10, pady=10)
+        tk.Label(root, text="PEDIDOS EN CURSO", background=COLORS.background, foreground=COLORS.text,
+                 font=(IDENTITY_FONT, 18, "bold")).pack(anchor="w")
+        self.today_summary = tk.StringVar(value="Información enviada por ventas y avance de cada pedido.")
+        tk.Label(root, textvariable=self.today_summary, background=COLORS.background, foreground=COLORS.muted,
+                 font=(UI_FONT, 10)).pack(anchor="w", pady=(2, 12))
+        self.today_actions = tk.Frame(root, background=COLORS.background)
+        self.today_actions.pack(fill="both", expand=True)
+        ttk.Button(root, text="Actualizar", command=self.refresh_today_module, style="Secondary.TButton").pack(anchor="e", pady=(8, 0))
+        self.refresh_today_module()
+
+    def refresh_today_module(self):
+        if not hasattr(self, "today_actions"):
+            return
+        for child in self.today_actions.winfo_children():
+            child.destroy()
+        closed_statuses = {"Finalizado", "Entregado", "Terminado", "Archivado", "Cancelado"}
+        orders = [order for order in self.database.orders() if order.get("status") not in closed_statuses]
+        self.today_summary.set(
+            "Información enviada por ventas y avance de cada pedido."
+            if orders else "No hay pedidos activos para mostrar."
+        )
+        for order in orders[:12]:
+            self._build_today_order_card(self.today_actions, order)
+        if not orders:
+            tk.Label(self.today_actions,
+                     text="Cuando ventas cargue un pedido, su ficha aparecerá aquí.",
+                     background=COLORS.panel, foreground=COLORS.muted,
+                     font=(UI_FONT, 10)).pack(fill="x", padx=2, pady=12, ipady=20)
+
+    def _build_today_order_card(self, parent: tk.Widget, order: dict) -> None:
+        """Muestra en Inicio la información comercial y el avance de un pedido."""
+        card = tk.Frame(parent, background=COLORS.panel, highlightthickness=1,
+                        highlightbackground=COLORS.border)
+        card.pack(fill="x", pady=(0, 9))
+        content = tk.Frame(card, background=COLORS.panel)
+        content.pack(fill="x", padx=14, pady=12)
+        header = tk.Frame(content, background=COLORS.panel)
+        header.pack(fill="x")
+        client = order.get("client_name") or order.get("client") or "Sin cliente"
+        tk.Label(header, text=f"Pedido #{order['id']} · {client}", background=COLORS.panel,
+                 foreground=COLORS.text, font=(UI_FONT, 12, "bold")).pack(side="left")
+        ttk.Button(header, text="Abrir pedido", style="Secondary.TButton",
+                   command=lambda oid=order["id"]: self.open_order_workspace(oid)).pack(side="right")
+
+        seller = str(order.get("assigned_to") or "Sin asignar")
+        delivery = str(order.get("delivery_date") or "A confirmar")[:10]
+        details = tk.Frame(content, background=COLORS.panel)
+        details.pack(fill="x", pady=(8, 7))
+        tk.Label(details, text=f"Vendedor: {seller}", background=COLORS.panel,
+                 foreground=COLORS.muted, font=(UI_FONT, 9)).pack(side="left")
+        tk.Label(details, text=f"Entrega: {delivery}", background=COLORS.panel,
+                 foreground=COLORS.muted, font=(UI_FONT, 9)).pack(side="right")
+
+        jobs = self.database.order_jobs(order["id"])
+        job_titles = ", ".join(str(job.get("title") or "Trabajo") for job in jobs[:3])
+        if len(jobs) > 3:
+            job_titles += f" + {len(jobs) - 3} más"
+        description = job_titles or str(order.get("order_description") or order.get("order_concept") or order.get("material") or "Sin detalle")
+        quantity = sum(max(1, int(job.get("quantity") or 1)) for job in jobs)
+        if not jobs:
+            quantity = int(order.get("quantity") or 0)
+        tk.Label(content, text=f"{description} · {quantity} unidad{'es' if quantity != 1 else ''}",
+                 background=COLORS.panel, foreground=COLORS.text, font=(UI_FONT, 10),
+                 anchor="w", wraplength=700).pack(fill="x")
+
+        stage = get_current_stage(order)
+        progress = round(get_stage_progress(order) * 100)
+        status_line = tk.Frame(content, background=COLORS.panel)
+        status_line.pack(fill="x", pady=(10, 3))
+        tk.Label(status_line, text="ESTADO DEL PEDIDO", background=COLORS.panel,
+                 foreground=COLORS.wine_active, font=(IDENTITY_FONT, 8, "bold")).pack(side="left")
+        tk.Label(status_line, text=f"{stage} · {progress}%", background=COLORS.panel,
+                 foreground=COLORS.muted, font=(UI_FONT, 9)).pack(side="right")
+        ttk.Progressbar(content, orient="horizontal", mode="determinate", maximum=100,
+                        value=progress).pack(fill="x")
+
     def _update_navigation(self, active_tab) -> None:
         for tab, button in getattr(self, "navigation_buttons", {}).items():
             set_navigation_active(button, tab is active_tab)
+
+    def _handle_bulk_confirmation_shortcut(self):
+        """Maneja el atajo Ctrl+Shift+Enter para confirmación masiva."""
+        # Solo activar si estamos en la pestaña de Últimos Procesados
+        current_tab = self.tabs.select()
+        if not current_tab:
+            return
+        
+        tab_text = self.tabs.tab(current_tab, "text")
+        if "Últimos Procesados" not in tab_text:
+            return
+        
+        # Verificar que haya stickers listos
+        ready_count = sum(1 for img in self.processed_items if img.get("status") == "Procesado")
+        if ready_count > 0:
+            self.confirm_all_ready_stickers()
+
+    def build_commercial_module(self, parent: tk.Widget):
+        """Construye el módulo de Gestión Comercial."""
+        container = tk.Frame(parent, background=COLORS.panel)
+        container.pack(fill="both", expand=True)
+
+        # Notebook para las tres secciones
+        self.commercial_notebook = ttk.Notebook(container)
+        self.commercial_notebook.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Pestaña Stock
+        stock_tab = ttk.Frame(self.commercial_notebook)
+        self.commercial_notebook.add(stock_tab, text="  Stock  ")
+        self._build_stock_tab_in_commercial(stock_tab)
+
+        # Pestaña Costos
+        costs_tab = ttk.Frame(self.commercial_notebook)
+        self.commercial_notebook.add(costs_tab, text="  Costos  ")
+        self._build_costs_tab_in_commercial(costs_tab)
+
+        # Pestaña Precios
+        prices_tab = ttk.Frame(self.commercial_notebook)
+        self.commercial_notebook.add(prices_tab, text="  Precios  ")
+        self._build_prices_tab_in_commercial(prices_tab)
+
+        # Presupuestador de consulta: no crea ni modifica pedidos.
+        quote_tab = ttk.Frame(self.commercial_notebook)
+        self.commercial_notebook.add(quote_tab, text="  Presupuestador  ")
+        self._build_commercial_quote_tab(quote_tab)
+
+        clients_tab = ttk.Frame(self.commercial_notebook)
+        self.commercial_notebook.add(clients_tab, text="  Clientes  ")
+        self._build_commercial_clients_tab(clients_tab)
+
+        fiscal_tab = ttk.Frame(self.commercial_notebook)
+        self.commercial_notebook.add(fiscal_tab, text="  Facturación / ARCA  ")
+        self._build_fiscal_tab(fiscal_tab)
+
+        # Seleccionar Stock por defecto
+        self.commercial_notebook.select(0)
+
+    def _build_fiscal_tab(self, parent: tk.Widget):
+        """Panel de preparación fiscal; no realiza emisiones ante ARCA."""
+        header = tk.Frame(parent, background=COLORS.panel)
+        header.pack(fill="x", padx=16, pady=(16, 8))
+        tk.Label(header, text="FACTURACIÓN Y ARCA", background=COLORS.panel,
+                 foreground=COLORS.text, font=(IDENTITY_FONT, 20, "bold")).pack(anchor="w")
+        tk.Label(header, text="Guardá los datos de Factura C y prepará comprobantes para cargarlos o emitirlos luego en ARCA.",
+                 background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 10)).pack(anchor="w", pady=(2, 0))
+
+        actions = tk.Frame(parent, background=COLORS.panel)
+        actions.pack(fill="x", padx=16, pady=(0, 8))
+        self.fiscal_profile_summary = tk.StringVar(value="Perfil fiscal sin configurar")
+        tk.Label(actions, textvariable=self.fiscal_profile_summary, background=COLORS.panel,
+                 foreground=COLORS.muted, font=(UI_FONT, 9)).pack(side="left")
+        ttk.Button(actions, text="Configurar perfil", command=self.show_fiscal_profile_dialog).pack(side="right")
+        ttk.Button(actions, text="Exportar CSV", command=self.export_fiscal_csv).pack(side="right", padx=(0, 7))
+
+        columns = ("order", "date", "client", "type", "total", "status", "voucher", "cae")
+        tree = ttk.Treeview(parent, columns=columns, show="headings", selectmode="browse")
+        headings = (("order", "Pedido", 70), ("date", "Fecha", 150), ("client", "Receptor", 230),
+                    ("type", "Comp.", 70), ("total", "Total", 110), ("status", "Estado", 150),
+                    ("voucher", "Número", 100), ("cae", "CAE", 150))
+        for key, label, width in headings:
+            tree.heading(key, text=label)
+            tree.column(key, width=width, anchor="center" if key not in {"client"} else "w")
+        tree.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        self.fiscal_invoices_tree = tree
+        footer = tk.Frame(parent, background=COLORS.panel)
+        footer.pack(fill="x", padx=16, pady=(0, 16))
+        ttk.Button(footer, text="Abrir pedido", command=self.open_selected_fiscal_order).pack(side="left")
+        ttk.Button(footer, text="Actualizar", command=self.refresh_fiscal_tab).pack(side="right")
+        self.refresh_fiscal_tab()
+
+    def refresh_fiscal_tab(self):
+        profile = self.fiscal.active_profile()
+        if hasattr(self, "fiscal_profile_summary"):
+            self.fiscal_profile_summary.set(
+                f"{profile['legal_name']} · CUIT {profile['cuit']} · Punto de venta {profile['point_of_sale'] or 'sin definir'}"
+                if profile else "Perfil fiscal sin configurar · Configuralo antes de crear comprobantes"
+            )
+        tree = getattr(self, "fiscal_invoices_tree", None)
+        if not tree:
+            return
+        tree.delete(*tree.get_children())
+        rows = self.database.connection.execute(
+            """SELECT fi.*, o.order_date, COALESCE(c.name, o.client) AS client_name
+               FROM fiscal_invoices fi JOIN orders o ON o.id = fi.order_id
+               LEFT JOIN clients c ON c.id = o.client_id ORDER BY fi.id DESC"""
+        ).fetchall()
+        for row in rows:
+            data = dict(row)
+            tree.insert("", "end", iid=str(data["id"]), values=(
+                data["order_id"], str(data["created_at"])[:16], data["client_name"],
+                f"Factura {data['invoice_type']}", format_currency(float(data["total"] or 0)),
+                data["status"], data["voucher_number"] or "—", data["cae"] or "—",
+            ))
+
+    def open_selected_fiscal_order(self):
+        tree = getattr(self, "fiscal_invoices_tree", None)
+        selected = tree.selection() if tree else ()
+        if not selected:
+            messagebox.showinfo("Facturación", "Seleccioná un comprobante para abrir su pedido.", parent=self)
+            return
+        row = self.database.connection.execute("SELECT order_id FROM fiscal_invoices WHERE id = ?", (int(selected[0]),)).fetchone()
+        if row:
+            self.open_order_workspace(int(row[0]))
+
+    def show_fiscal_profile_dialog(self):
+        profile = self.fiscal.active_profile() or {}
+        dialog = tk.Toplevel(self)
+        dialog.title("Perfil fiscal")
+        dialog.configure(background=COLORS.background)
+        dialog.transient(self); dialog.grab_set(); dialog.resizable(False, False)
+        form = ttk.Frame(dialog, padding=18); form.pack(fill="both", expand=True)
+        values = {
+            "legal_name": tk.StringVar(value=profile.get("legal_name", "")),
+            "cuit": tk.StringVar(value=profile.get("cuit", "")),
+            "iva_condition": tk.StringVar(value=profile.get("iva_condition", "Monotributo")),
+            "point_of_sale": tk.StringVar(value=str(profile.get("point_of_sale") or "")),
+        }
+        for row, (label, key) in enumerate((("Razón social *", "legal_name"), ("CUIT *", "cuit"),
+                                             ("Condición fiscal *", "iva_condition"), ("Punto de venta", "point_of_sale"))):
+            ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", pady=5, padx=(0, 10))
+            widget = ttk.Combobox(form, textvariable=values[key], values=("Monotributo", "Responsable Inscripto"), state="readonly", width=30) if key == "iva_condition" else ttk.Entry(form, textvariable=values[key], width=33)
+            widget.grid(row=row, column=1, sticky="ew", pady=5)
+        ttk.Label(form, text="Este perfil prepara comprobantes; no conecta ni autoriza en ARCA.", style="Muted.TLabel", wraplength=360).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 12))
+        def save():
+            try:
+                point = int(values["point_of_sale"].get()) if values["point_of_sale"].get().strip() else None
+                self.fiscal.save_profile(legal_name=values["legal_name"].get(), cuit=values["cuit"].get(), iva_condition=values["iva_condition"].get(), point_of_sale=point, environment="produccion")
+            except (ValueError, TypeError) as error:
+                messagebox.showwarning("Perfil fiscal", str(error), parent=dialog); return
+            dialog.destroy(); self.refresh_fiscal_tab(); self.status.set("Perfil fiscal guardado.")
+        ttk.Button(form, text="Cancelar", command=dialog.destroy).grid(row=5, column=0, sticky="w")
+        ttk.Button(form, text="Guardar perfil", style="Primary.TButton", command=save).grid(row=5, column=1, sticky="e")
+        self.center_window(dialog)
+
+    def export_fiscal_csv(self):
+        path = filedialog.asksaveasfilename(parent=self, title="Exportar comprobantes para ARCA", defaultextension=".csv", filetypes=[("CSV", "*.csv")], initialfile=f"comprobantes_arca_{datetime.now():%Y%m}.csv")
+        if not path:
+            return
+        rows = self.database.connection.execute("""SELECT fi.*, o.order_date, COALESCE(c.name, o.client) AS client_name
+            FROM fiscal_invoices fi JOIN orders o ON o.id = fi.order_id LEFT JOIN clients c ON c.id = o.client_id ORDER BY fi.created_at""").fetchall()
+        with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.writer(handle, delimiter=";")
+            writer.writerow(("pedido", "fecha", "tipo_comprobante", "punto_venta", "numero", "estado", "total_ars", "receptor", "cae", "vencimiento_cae"))
+            for row in rows:
+                item = dict(row)
+                writer.writerow((item["order_id"], item["created_at"], f"Factura {item['invoice_type']}", item["point_of_sale"], item["voucher_number"], item["status"], item["total"], item["client_name"], item["cae"], item["cae_expires_at"]))
+        self.status.set(f"Exportación fiscal creada: {Path(path).name}")
+
+    def show_order_fiscal_dialog(self, order_id: int):
+        """Guarda el receptor y crea un borrador de Factura C del pedido."""
+        order = self.database.order(order_id)
+        if not order:
+            return
+        if not self.fiscal.active_profile():
+            messagebox.showinfo("Facturación", "Primero configurá tu perfil fiscal en Gestión comercial > Facturación / ARCA.", parent=self)
+            return
+        client_id = order.get("client_id")
+        if not client_id:
+            messagebox.showwarning("Facturación", "El pedido no tiene una ficha de cliente asociada.", parent=self)
+            return
+        saved = self.database.connection.execute("SELECT * FROM client_tax_profiles WHERE client_id = ?", (client_id,)).fetchone()
+        tax = dict(saved) if saved else {}
+        dialog = tk.Toplevel(self)
+        dialog.title(f"Factura C · Pedido #{order_id}")
+        dialog.configure(background=COLORS.background)
+        dialog.transient(self); dialog.grab_set(); dialog.resizable(False, False)
+        form = ttk.Frame(dialog, padding=18); form.pack(fill="both", expand=True)
+        total = float(order.get("budget_total") or order.get("price") or 0)
+        ttk.Label(form, text="DATOS DEL RECEPTOR", style="Tag.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(form, text=f"Factura C · Total del pedido: {format_currency(total)}", style="Muted.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", pady=(3, 10))
+        data = {
+            "document_type": tk.StringVar(value=tax.get("document_type") or "Consumidor final"),
+            "document_number": tk.StringVar(value=tax.get("document_number") or ""),
+            "legal_name": tk.StringVar(value=tax.get("legal_name") or order.get("client_name") or order.get("client") or ""),
+            "iva_condition": tk.StringVar(value=tax.get("iva_condition") or "Consumidor final"),
+            "address": tk.StringVar(value=tax.get("address") or ""),
+        }
+        fields = (("Tipo de receptor", "document_type"), ("CUIT / DNI", "document_number"),
+                  ("Razón social o nombre", "legal_name"), ("Condición IVA", "iva_condition"), ("Domicilio", "address"))
+        for row, (label, key) in enumerate(fields, start=2):
+            ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=5)
+            if key == "document_type":
+                widget = ttk.Combobox(form, textvariable=data[key], values=("Consumidor final", "CUIT", "DNI"), state="readonly", width=32)
+            elif key == "iva_condition":
+                widget = ttk.Combobox(form, textvariable=data[key], values=("Consumidor final", "Monotributo", "Responsable Inscripto", "Exento"), state="readonly", width=32)
+            else:
+                widget = ttk.Entry(form, textvariable=data[key], width=35)
+            widget.grid(row=row, column=1, sticky="ew", pady=5)
+        ttk.Label(form, text="El borrador conserva una copia de estos datos. Luego podés cargarlo o emitirlo desde ARCA.", style="Muted.TLabel", wraplength=390).grid(row=7, column=0, columnspan=2, sticky="w", pady=(9, 12))
+        def save_draft():
+            receiver = data["document_type"].get()
+            if receiver != "Consumidor final" and (not data["document_number"].get().strip() or not data["legal_name"].get().strip()):
+                messagebox.showwarning("Factura C", "Para una empresa o persona identificada ingresá CUIT/DNI y nombre o razón social.", parent=dialog)
+                return
+            existing = [i for i in self.fiscal.invoices_for_order(order_id) if i["status"] in (FiscalRepository.DRAFT, FiscalRepository.PENDING)]
+            if existing:
+                messagebox.showinfo("Factura C", "Este pedido ya tiene un comprobante pendiente. Revisalo en Facturación / ARCA.", parent=dialog)
+                return
+            self.fiscal.upsert_client_profile(int(client_id), **{key: value.get() for key, value in data.items()})
+            self.fiscal.create_invoice_draft(order_id, "C")
+            dialog.destroy(); self.refresh_fiscal_tab(); self.status.set(f"Borrador de Factura C creado para el pedido #{order_id}.")
+        ttk.Button(form, text="Cancelar", command=dialog.destroy).grid(row=8, column=0, sticky="w")
+        ttk.Button(form, text="Guardar y crear borrador", style="Primary.TButton", command=save_draft).grid(row=8, column=1, sticky="e")
+        self.center_window(dialog)
+
+    def _build_commercial_clients_tab(self, parent: tk.Widget):
+        """Construye el padrón de clientes y su historial comercial."""
+        header = tk.Frame(parent, background=COLORS.panel)
+        header.pack(fill="x", padx=16, pady=(16, 8))
+        tk.Label(header, text="CLIENTES", background=COLORS.panel, foreground=COLORS.text,
+                 font=(IDENTITY_FONT, 20, "bold")).pack(anchor="w")
+        tk.Label(header, text="Consultá datos, historial de pedidos y administrá fichas de clientes.",
+                 background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 10)).pack(anchor="w", pady=(2, 0))
+
+        toolbar = tk.Frame(parent, background=COLORS.panel)
+        toolbar.pack(fill="x", padx=16, pady=(0, 8))
+        self.commercial_client_query = tk.StringVar()
+        search = ttk.Entry(toolbar, textvariable=self.commercial_client_query, width=38)
+        search.pack(side="left")
+        ttk.Button(toolbar, text="Buscar", command=self._refresh_commercial_clients).pack(side="left", padx=6)
+        ttk.Button(toolbar, text="Actualizar", command=self._refresh_commercial_clients,
+                   style="Secondary.TButton").pack(side="left")
+
+        body = tk.Frame(parent, background=COLORS.panel)
+        body.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+        body.grid_columnconfigure(0, weight=3)
+        body.grid_columnconfigure(1, weight=4)
+        body.grid_rowconfigure(0, weight=1)
+
+        left = tk.Frame(body, background=COLORS.panel_elevated, highlightthickness=1, highlightbackground=COLORS.border)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        cols = ("id", "name", "whatsapp", "orders")
+        self.commercial_clients_tree = ttk.Treeview(left, columns=cols, show="headings", selectmode="browse", height=15)
+        for key, label, width, anchor in (("id", "Cliente #", 70, "center"), ("name", "Cliente", 180, "w"),
+                                          ("whatsapp", "WhatsApp", 120, "w"), ("orders", "Pedidos", 65, "center")):
+            self.commercial_clients_tree.heading(key, text=label)
+            self.commercial_clients_tree.column(key, width=width, anchor=anchor, stretch=key == "name")
+        scrollbar = ttk.Scrollbar(left, orient="vertical", command=self.commercial_clients_tree.yview)
+        horizontal_scrollbar = ttk.Scrollbar(left, orient="horizontal", command=self.commercial_clients_tree.xview)
+        self.commercial_clients_tree.configure(
+            yscrollcommand=scrollbar.set,
+            xscrollcommand=horizontal_scrollbar.set,
+        )
+        left.grid_rowconfigure(0, weight=1)
+        left.grid_columnconfigure(0, weight=1)
+        self.commercial_clients_tree.grid(row=0, column=0, sticky="nsew", padx=(1, 0), pady=(1, 0))
+        scrollbar.grid(row=0, column=1, sticky="ns", pady=(1, 0))
+        horizontal_scrollbar.grid(row=1, column=0, sticky="ew", padx=(1, 0), pady=(0, 1))
+        self.commercial_clients_tree.bind("<<TreeviewSelect>>", self._show_commercial_client_detail)
+        self.commercial_clients_tree.bind("<Button-1>", self._activate_commercial_client_link, add="+")
+        self.commercial_clients_tree.bind("<Motion>", self._update_commercial_client_link_cursor)
+        self.commercial_clients_tree.bind("<Leave>", lambda _event: self.commercial_clients_tree.configure(cursor=""))
+        self.commercial_clients_tree.bind("<Button-3>", self._show_commercial_client_context_menu)
+        self.commercial_clients_tree.bind("<Double-1>", lambda _event: self._edit_commercial_client())
+        self.commercial_clients_tree.bind("<F2>", lambda _event: self._edit_commercial_client())
+        self.commercial_clients_tree.bind("<Delete>", lambda _event: self._delete_commercial_client())
+        self.commercial_clients_tree.bind(
+            "<Shift-MouseWheel>",
+            lambda event: self._scroll_tree_horizontally(self.commercial_clients_tree, event),
+        )
+        search.bind("<Return>", lambda _event: self._refresh_commercial_clients())
+
+        right = tk.Frame(body, background=COLORS.panel_elevated, highlightthickness=1, highlightbackground=COLORS.border)
+        right.grid(row=0, column=1, sticky="nsew")
+        self.commercial_client_detail = tk.StringVar(value="Seleccioná un cliente para ver su ficha e historial.")
+        tk.Label(right, textvariable=self.commercial_client_detail, justify="left", anchor="nw",
+                 wraplength=460, background=COLORS.panel_elevated, foreground=COLORS.text,
+                 font=(UI_FONT, 10)).pack(fill="x", padx=14, pady=14)
+        order_cols = ("id", "date", "status", "quantity", "total")
+        history_table = tk.Frame(right, background=COLORS.panel_elevated)
+        history_table.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+        self.commercial_client_orders_tree = ttk.Treeview(
+            history_table, columns=order_cols, show="headings", selectmode="browse", height=11
+        )
+        for key, label, width in (("id", "N.º", 55), ("date", "Fecha", 125), ("status", "Estado", 105),
+                                  ("quantity", "Cant.", 60), ("total", "Total", 100)):
+            self.commercial_client_orders_tree.heading(key, text=label)
+            self.commercial_client_orders_tree.column(key, width=width, anchor="center")
+        history_table.grid_rowconfigure(0, weight=1)
+        history_table.grid_columnconfigure(0, weight=1)
+        orders_scrollbar = ttk.Scrollbar(
+            history_table, orient="vertical", command=self.commercial_client_orders_tree.yview
+        )
+        orders_horizontal_scrollbar = ttk.Scrollbar(
+            history_table, orient="horizontal", command=self.commercial_client_orders_tree.xview
+        )
+        self.commercial_client_orders_tree.configure(
+            yscrollcommand=orders_scrollbar.set,
+            xscrollcommand=orders_horizontal_scrollbar.set,
+        )
+        self.commercial_client_orders_tree.grid(row=0, column=0, sticky="nsew")
+        orders_scrollbar.grid(row=0, column=1, sticky="ns")
+        orders_horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
+        self.commercial_client_orders_tree.bind("<Double-1>", self._open_commercial_client_order)
+        self.commercial_client_orders_tree.bind("<Return>", self._open_commercial_client_order)
+        self.commercial_client_orders_tree.bind(
+            "<Shift-MouseWheel>",
+            lambda event: self._scroll_tree_horizontally(self.commercial_client_orders_tree, event),
+        )
+        actions = tk.Frame(right, background=COLORS.panel_elevated)
+        actions.pack(fill="x", padx=14, pady=(0, 14))
+        ttk.Button(actions, text="Abrir pedido", command=self._open_commercial_client_order).pack(side="left")
+        ttk.Button(actions, text="Editar ficha", command=self._edit_commercial_client,
+                   style="Secondary.TButton").pack(side="right", padx=(8, 0))
+        ttk.Button(actions, text="Eliminar ficha", command=self._delete_commercial_client,
+                   style="Danger.TButton").pack(side="right")
+        self._refresh_commercial_clients()
+
+    def _refresh_commercial_clients(self):
+        if not hasattr(self, "commercial_clients_tree"):
+            return
+        tree = self.commercial_clients_tree
+        selected = tree.selection()
+        selected_id = self._commercial_client_id_from_values(tree.item(selected[0], "values")) if selected else None
+        tree.delete(*tree.get_children())
+        for client in self.database.clients_with_order_summary(self.commercial_client_query.get()):
+            tree.insert("", "end", values=(f"#{client['id']}", client["name"], client.get("whatsapp", ""), client["order_count"]))
+        if selected_id:
+            for item in tree.get_children():
+                if self._commercial_client_id_from_values(tree.item(item, "values")) == selected_id:
+                    tree.selection_set(item)
+                    tree.focus(item)
+                    break
+
+    @staticmethod
+    def _commercial_client_id_from_values(values):
+        """Convierte el identificador enlazable ``#123`` al ID usado por la base."""
+        if not values:
+            return None
+        try:
+            return int(str(values[0]).removeprefix("#"))
+        except (TypeError, ValueError):
+            return None
+
+    def _selected_commercial_client_id(self):
+        selected = self.commercial_clients_tree.selection() if hasattr(self, "commercial_clients_tree") else ()
+        values = self.commercial_clients_tree.item(selected[0], "values") if selected else ()
+        return self._commercial_client_id_from_values(values)
+
+    def _activate_commercial_client_link(self, event):
+        """Activa la ficha al hacer clic en el identificador # del cliente."""
+        tree = self.commercial_clients_tree
+        item = tree.identify_row(event.y)
+        if item and tree.identify_column(event.x) == "#1":
+            tree.selection_set(item)
+            tree.focus(item)
+            tree.after_idle(self._show_commercial_client_detail)
+
+    def _update_commercial_client_link_cursor(self, event):
+        """Señala visualmente que los identificadores # son enlaces."""
+        is_link = bool(
+            self.commercial_clients_tree.identify_row(event.y)
+            and self.commercial_clients_tree.identify_column(event.x) == "#1"
+        )
+        self.commercial_clients_tree.configure(cursor="hand2" if is_link else "")
+
+    @staticmethod
+    def _scroll_tree_horizontally(tree, event):
+        """Permite recorrer columnas con Shift + rueda sin capturar la rueda vertical."""
+        delta = getattr(event, "delta", 0)
+        if delta:
+            tree.xview_scroll(-1 if delta > 0 else 1, "units")
+        return "break"
+
+    def _show_commercial_client_context_menu(self, event):
+        """Selecciona la fila bajo el puntero y muestra sus acciones principales."""
+        item = self.commercial_clients_tree.identify_row(event.y)
+        if not item:
+            return "break"
+        self.commercial_clients_tree.selection_set(item)
+        self.commercial_clients_tree.focus(item)
+        self.commercial_clients_tree.focus_set()
+
+        menu = tk.Menu(self.commercial_clients_tree, tearoff=0)
+        configure_menu(menu)
+        menu.add_command(label="Editar cliente", command=self._edit_commercial_client)
+        menu.add_separator()
+        menu.add_command(label="Eliminar cliente", command=self._delete_commercial_client)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def _show_commercial_client_detail(self, _event=None):
+        client_id = self._selected_commercial_client_id()
+        if not client_id:
+            return
+        client = self.database.client_detail(client_id)
+        if not client:
+            return
+        last_order = str(client.get("last_order_at") or "—").replace("T", " ")
+        self.commercial_client_detail.set(
+            f"{client['name']}\nWhatsApp: {client.get('whatsapp') or '—'}\n"
+            f"Tipo: {client.get('client_type') or 'Particular'}\n"
+            f"Pedidos: {client['order_count']} · Facturación: ${float(client['total_billed'] or 0):,.2f}\n"
+            f"Último pedido: {last_order}"
+        )
+        orders_tree = self.commercial_client_orders_tree
+        orders_tree.delete(*orders_tree.get_children())
+        for order in self.database.client_orders(client_id):
+            date = str(order.get("order_date") or order.get("created_at") or "").replace("T", " ")
+            orders_tree.insert("", "end", values=(order["id"], date, order.get("status", ""), order.get("quantity", 0),
+                                                       f"${float(order.get('total') or 0):,.2f}"))
+
+    def _open_commercial_client_order(self, _event=None):
+        selected = self.commercial_client_orders_tree.selection() if hasattr(self, "commercial_client_orders_tree") else ()
+        if not selected:
+            messagebox.showinfo("Pedidos", "Seleccioná un pedido del historial.", parent=self)
+            return
+        order_id = int(self.commercial_client_orders_tree.item(selected[0], "values")[0])
+        self.open_order_workspace(order_id)
+
+    def _edit_commercial_client(self):
+        client_id = self._selected_commercial_client_id()
+        if not client_id:
+            messagebox.showinfo("Editar ficha", "Seleccioná un cliente.", parent=self)
+            return
+        client = self.database.client_detail(client_id)
+        if not client:
+            self._refresh_commercial_clients()
+            return
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Editar ficha de cliente")
+        dialog.configure(background=COLORS.panel)
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        content = tk.Frame(dialog, background=COLORS.panel)
+        content.pack(fill="both", expand=True, padx=20, pady=18)
+        tk.Label(content, text="EDITAR CLIENTE", background=COLORS.panel, foreground=COLORS.text,
+                 font=(IDENTITY_FONT, 16, "bold")).pack(anchor="w", pady=(0, 12))
+        name_var = tk.StringVar(value=client.get("name") or "")
+        whatsapp_var = tk.StringVar(value=client.get("whatsapp") or "")
+        type_var = tk.StringVar(value=client.get("client_type") or "Particular")
+        tk.Label(content, text="Nombre", background=COLORS.panel, foreground=COLORS.muted,
+                 font=(UI_FONT, 9, "bold")).pack(anchor="w")
+        name_entry = ttk.Entry(content, textvariable=name_var, width=42)
+        name_entry.pack(fill="x", pady=(3, 10))
+        tk.Label(content, text="WhatsApp", background=COLORS.panel, foreground=COLORS.muted,
+                 font=(UI_FONT, 9, "bold")).pack(anchor="w")
+        ttk.Entry(content, textvariable=whatsapp_var, width=42).pack(fill="x", pady=(3, 10))
+        tk.Label(content, text="Tipo de cliente", background=COLORS.panel, foreground=COLORS.muted,
+                 font=(UI_FONT, 9, "bold")).pack(anchor="w")
+        ttk.Combobox(content, textvariable=type_var,
+                     values=("Particular", "Empresa", "Revendedor", "VIP"), state="readonly", width=39).pack(fill="x", pady=(3, 16))
+
+        def save():
+            try:
+                self.database.update_client(client_id, name_var.get(), whatsapp_var.get(), type_var.get())
+            except ValueError as error:
+                messagebox.showerror("No se pudo guardar", str(error), parent=dialog)
+                return
+            dialog.destroy()
+            self._refresh_commercial_clients()
+            self._show_commercial_client_detail()
+
+        buttons = tk.Frame(content, background=COLORS.panel)
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Cancelar", command=dialog.destroy, style="Secondary.TButton").pack(side="right")
+        ttk.Button(buttons, text="Guardar cambios", command=save).pack(side="right", padx=(0, 8))
+        dialog.bind("<Return>", lambda _event: save())
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.after_idle(lambda: (dialog.focus_force(), name_entry.focus_set()))
+
+    def _delete_commercial_client(self):
+        client_id = self._selected_commercial_client_id()
+        if not client_id:
+            messagebox.showinfo("Eliminar ficha", "Seleccioná un cliente.", parent=self)
+            return
+        client = self.database.client_detail(client_id)
+        if not client:
+            self._refresh_commercial_clients()
+            return
+        count = int(client.get("order_count") or 0)
+        message = f"¿Eliminar la ficha de {client['name']}?"
+        if count:
+            message += f"\n\nSe conservarán sus {count} pedido(s), pero quedarán desvinculados de esta ficha."
+        message += "\n\nEsta acción no se puede deshacer."
+        if not messagebox.askyesno("Eliminar ficha de cliente", message, icon="warning", parent=self):
+            return
+        self.database.delete_client(client_id)
+        self.commercial_client_detail.set("Ficha eliminada. Los pedidos históricos se conservaron.")
+        self.commercial_client_orders_tree.delete(*self.commercial_client_orders_tree.get_children())
+        self._refresh_commercial_clients()
+
+    def _build_commercial_quote_tab(self, parent: tk.Widget):
+        """Presupuesta desde las reglas comerciales sin crear un pedido."""
+        header = tk.Frame(parent, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
+        header.pack(fill="x", padx=16, pady=(16, 10))
+        tk.Label(header, text="PRESUPUESTADOR", background=COLORS.panel, foreground=COLORS.text,
+                 font=(IDENTITY_FONT, 20, "bold")).pack(anchor="w", padx=16, pady=(13, 2))
+        tk.Label(header, text="Calculá una cotización para una consulta, sin crear un pedido ni guardar datos del cliente.",
+                 background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 10)).pack(anchor="w", padx=16, pady=(0, 13))
+
+        body = tk.Frame(parent, background=COLORS.panel_elevated, highlightthickness=1, highlightbackground=COLORS.border)
+        body.pack(fill="x", padx=16, pady=(0, 10))
+        products = self.database.active_catalog_products()
+        product_by_name = {str(product["name"]): product for product in products}
+        product_var = tk.StringVar(value=next(iter(product_by_name), ""))
+        material_var = tk.StringVar()
+        size_var = tk.StringVar()
+        quantity_var = tk.StringVar(value="1")
+        status_var = tk.StringVar(value="Agregá uno o más productos para generar la cotización.")
+        quote_items: list[dict] = []
+        material_values: dict[str, str] = {}
+
+        for column in range(4):
+            body.grid_columnconfigure(column, weight=1 if column in (1, 3) else 0)
+        tk.Label(body, text="Producto", background=COLORS.panel_elevated, foreground=COLORS.muted, font=(UI_FONT, 10, "bold")).grid(row=0, column=0, sticky="w", padx=(14, 7), pady=(14, 6))
+        product_combo = ttk.Combobox(body, textvariable=product_var, values=list(product_by_name), state="readonly", width=28)
+        product_combo.grid(row=0, column=1, sticky="ew", padx=(0, 14), pady=(14, 6))
+        tk.Label(body, text="Material", background=COLORS.panel_elevated, foreground=COLORS.muted, font=(UI_FONT, 10, "bold")).grid(row=0, column=2, sticky="w", padx=(0, 7), pady=(14, 6))
+        material_combo = ttk.Combobox(body, textvariable=material_var, state="readonly", width=28)
+        material_combo.grid(row=0, column=3, sticky="ew", padx=(0, 14), pady=(14, 6))
+        tk.Label(body, text="Tamaño", background=COLORS.panel_elevated, foreground=COLORS.muted, font=(UI_FONT, 10, "bold")).grid(row=1, column=0, sticky="w", padx=(14, 7), pady=6)
+        size_combo = ttk.Combobox(body, textvariable=size_var, state="readonly", width=28)
+        size_combo.grid(row=1, column=1, sticky="ew", padx=(0, 14), pady=6)
+        tk.Label(body, text="Cantidad", background=COLORS.panel_elevated, foreground=COLORS.muted, font=(UI_FONT, 10, "bold")).grid(row=1, column=2, sticky="w", padx=(0, 7), pady=6)
+        ttk.Entry(body, textvariable=quantity_var, width=12).grid(row=1, column=3, sticky="w", padx=(0, 14), pady=6)
+
+        def refresh_variants(*_args):
+            product = product_by_name.get(product_var.get())
+            rules = self.database.catalog_product_prices(int(product["id"])) if product else []
+            material_values.clear()
+            for rule in rules:
+                raw_material = str(rule.get("material") or "").strip()
+                display_material = raw_material.split(" - ", 1)[-1].strip() if " - " in raw_material else raw_material
+                if display_material:
+                    material_values.setdefault(display_material, raw_material)
+            materials = list(material_values)
+            material_combo.configure(values=materials)
+            material_var.set(materials[0] if materials else "")
+            refresh_sizes()
+
+        def refresh_sizes(*_args):
+            product = product_by_name.get(product_var.get())
+            rules = self.database.catalog_product_prices(int(product["id"])) if product else []
+            sizes = []
+            for rule in rules:
+                rule_material = str(rule.get("material") or "").split(" - ", 1)[-1].strip()
+                size = str(rule.get("size") or "").strip()
+                if size and (not material_var.get() or rule_material == material_var.get()) and size not in sizes:
+                    sizes.append(size)
+            size_combo.configure(values=sizes)
+            size_var.set(sizes[0] if sizes else "")
+
+        def money(value: float) -> str:
+            amount = round(float(value or 0), 2)
+            if abs(amount - round(amount)) < 0.005:
+                return f"${round(amount):,}".replace(",", ".")
+            return f"${amount:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+        tree_holder = tk.Frame(parent, background=COLORS.panel_elevated, highlightthickness=1, highlightbackground=COLORS.border)
+        tree_holder.pack(fill="both", expand=True, padx=16, pady=(0, 10))
+        columns = ("product", "material", "size", "quantity")
+        items_tree = ttk.Treeview(tree_holder, columns=columns, show="headings", height=7, selectmode="browse")
+        for key, title, width in (("product", "Producto", 260), ("material", "Material", 260), ("size", "Tamaño", 150), ("quantity", "Cantidad", 100)):
+            items_tree.heading(key, text=title)
+            items_tree.column(key, width=width, anchor="w" if key != "quantity" else "center")
+        items_tree.pack(fill="both", expand=True, padx=1, pady=1)
+
+        def refresh_items():
+            items_tree.delete(*items_tree.get_children())
+            for index, item in enumerate(quote_items):
+                items_tree.insert("", "end", iid=str(index), values=(
+                    item["product"]["name"], item["material"], item["size"] or "—", item["quantity"],
+                ))
+
+        def add_item():
+            product = product_by_name.get(product_var.get())
+            try:
+                quantity = max(1, int(quantity_var.get()))
+            except (TypeError, ValueError):
+                messagebox.showwarning("Presupuestador", "Ingresá una cantidad entera mayor a cero.", parent=self)
+                return
+            if not product:
+                messagebox.showwarning("Presupuestador", "Seleccioná un producto.", parent=self)
+                return
+            quote_items.append({
+                "product": product, "material": material_var.get().strip(),
+                "material_key": material_values.get(material_var.get(), material_var.get()).strip(),
+                "size": size_var.get().strip(), "quantity": quantity,
+            })
+            refresh_items()
+            status_var.set(f"{len(quote_items)} producto(s) agregado(s) a la cotización.")
+
+        def remove_item():
+            selected = items_tree.selection()
+            if not selected:
+                return
+            del quote_items[int(selected[0])]
+            refresh_items()
+            status_var.set("Producto quitado de la cotización.")
+
+        def generate_quote():
+            if not quote_items:
+                messagebox.showinfo("Presupuestador", "Agregá al menos un producto antes de generar el presupuesto.", parent=self)
+                return
+            details = ["📋 *PRESUPUESTO DOCCIONE*", ""]
+            total = 0.0
+            for number, item in enumerate(quote_items, start=1):
+                product = item["product"]
+                calculation = self.database.resolve_commercial_price(
+                    product_id=int(product["id"]), material=item["material_key"], size=item["size"], quantity=item["quantity"],
+                )
+                if not calculation.get("matched"):
+                    messagebox.showwarning("Presupuestador", f"{product['name']}: {calculation.get('warning') or 'no tiene una regla de precio aplicable.'}", parent=self)
+                    return
+                subtotal = float(calculation.get("subtotal") or 0)
+                total += subtotal
+                unit_price = float(calculation.get("unit_price") or (subtotal / item["quantity"]))
+                unit_label = "unidad" if item["quantity"] == 1 else "unidades"
+                details.append(f"{number}. {product['name']}")
+                if item["material"]:
+                    details.append(f"   Material: {item['material']}")
+                if item["size"]:
+                    details.append(f"   Tamaño: {item['size']}")
+                details.extend([
+                    f"   Cantidad: {item['quantity']} {unit_label}",
+                    f"   Precio unitario: {money(unit_price)}",
+                    f"   Subtotal: {money(subtotal)}", "",
+                ])
+            details.extend([
+                "────────────────────", f"*TOTAL: {money(total)}*", "", "────────────────────", "",
+                "⏳ Plazo de producción: se confirma al aprobar el pedido.", "", "Doccione",
+                "Producción gráfica personalizada",
+            ])
+            content = "\n".join(details)
+            modal = tk.Toplevel(self)
+            modal.title("Presupuesto de consulta")
+            modal.configure(background=COLORS.background)
+            modal.transient(self)
+            modal.geometry("640x560")
+            frame = tk.Frame(modal, background=COLORS.panel_elevated, highlightthickness=1, highlightbackground=COLORS.border)
+            frame.pack(fill="both", expand=True, padx=18, pady=18)
+            text_box = tk.Text(frame, wrap="word", background=COLORS.field, foreground=COLORS.text, relief="flat", font=(UI_FONT, 10))
+            text_box.pack(fill="both", expand=True, padx=16, pady=(16, 10))
+            text_box.insert("1.0", content)
+            text_box.configure(state="disabled")
+            def copy_quote():
+                self.clipboard_clear()
+                self.clipboard_append(content)
+                self.status.set("Presupuesto de consulta copiado al portapapeles.")
+            ttk.Button(frame, text="Copiar para WhatsApp", command=copy_quote, style="Primary.TButton").pack(anchor="e", padx=16, pady=(0, 16))
+            status_var.set(f"Cotización de {len(quote_items)} producto(s) calculada: {money(total)}.")
+
+        product_combo.bind("<<ComboboxSelected>>", refresh_variants)
+        material_combo.bind("<<ComboboxSelected>>", refresh_sizes)
+        actions = tk.Frame(body, background=COLORS.panel_elevated)
+        actions.grid(row=2, column=0, columnspan=4, sticky="e", padx=14, pady=(8, 14))
+        ttk.Button(actions, text="Agregar producto", command=add_item, style="Secondary.TButton").pack(side="left", padx=(0, 7))
+        ttk.Button(actions, text="Quitar seleccionado", command=remove_item, style="Secondary.TButton").pack(side="left", padx=(0, 7))
+        ttk.Button(actions, text="Generar presupuesto", command=generate_quote, style="Primary.TButton").pack(side="left")
+        tk.Label(parent, textvariable=status_var, background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 10)).pack(anchor="w", padx=18)
+        refresh_variants()
+
+    def _build_stock_tab_in_commercial(self, parent: tk.Widget):
+        """Construye la pestaña de Stock dentro de Gestión Comercial."""
+        header = ttk.Frame(parent, padding=(10, 10, 10, 6))
+        header.pack(fill="x")
+        header_copy = ttk.Frame(header)
+        header_copy.pack(side="left", fill="x", expand=True)
+        ttk.Label(header_copy, text="STOCK Y MATERIALES", style="CommercialTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            header_copy,
+            text="Controlá existencias, reservas y costos de tus materiales.",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(1, 0))
+        actions = ttk.Frame(header)
+        actions.pack(side="right")
+        ttk.Button(actions, text="↻", width=3, command=self.refresh_stock_module, style="Secondary.TButton").pack(side="right")
+        ttk.Button(actions, text="Registrar compra", command=self.register_stock_purchase, style="Secondary.TButton").pack(side="right", padx=(0, 8))
+        ttk.Button(actions, text="Ajustar stock", command=self.adjust_selected_stock, style="Secondary.TButton").pack(side="right", padx=(0, 8))
+        ttk.Button(actions, text="＋ Crear material", command=self.create_stock_material, style="Primary.TButton").pack(side="right", padx=(0, 8))
+
+        overview = tk.Frame(parent, background=COLORS.panel)
+        overview.pack(fill="x", padx=10, pady=(0, 8))
+        self.stock_metric_vars = {
+            "inventory": tk.StringVar(value="$0.00"),
+            "reserved": tk.StringVar(value="$0.00"),
+            "profit": tk.StringVar(value="$0.00"),
+            "margin": tk.StringVar(value="0.0%"),
+        }
+        self.stock_profit_title = tk.StringVar(value="GANANCIA BRUTA")
+        metric_specs = (
+            ("VALOR EN INVENTARIO", "inventory", COLORS.info),
+            ("COMPROMETIDO EN PRODUCCIÓN", "reserved", COLORS.warning),
+            ("GANANCIA BRUTA", "profit", COLORS.success),
+            ("MARGEN PROMEDIO", "margin", COLORS.info),
+        )
+        for index, (label, key, color) in enumerate(metric_specs):
+            overview.grid_columnconfigure(index, weight=1)
+            card = tk.Frame(overview, background=COLORS.panel_elevated, highlightthickness=1, highlightbackground=COLORS.border)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 5, 0 if index == len(metric_specs) - 1 else 5))
+            title = tk.Label(card, textvariable=self.stock_profit_title if key == "profit" else None,
+                             text=None if key == "profit" else label, background=COLORS.panel_elevated,
+                             foreground=COLORS.muted, font=(UI_FONT, 9, "bold"))
+            title.pack(anchor="w", padx=12, pady=(10, 1))
+            value_label = tk.Label(card, textvariable=self.stock_metric_vars[key], background=COLORS.panel_elevated,
+                                   foreground=color, font=(IDENTITY_FONT, 18, "bold"))
+            value_label.pack(anchor="w", padx=12, pady=(0, 10))
+            if key == "profit":
+                self.stock_profit_value_label = value_label
+
+        stock_info = tk.Frame(parent, background=COLORS.panel)
+        stock_info.pack(fill="x", padx=12, pady=(0, 6))
+        self.stock_summary = tk.StringVar(value="Cargando stock…")
+        ttk.Label(stock_info, textvariable=self.stock_summary, style="Muted.TLabel").pack(side="left")
+        self.stock_operations_summary = tk.StringVar(value="")
+        ttk.Label(stock_info, textvariable=self.stock_operations_summary, style="Muted.TLabel").pack(side="right")
+
+        tree_holder = tk.Frame(parent, background=COLORS.panel_elevated, highlightthickness=1, highlightbackground=COLORS.border)
+        tree_holder.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        columns = ("id", "name", "stock", "reserved", "available", "unit_cost", "sale", "supplier", "min_stock", "status")
+        self.stock_tree = ttk.Treeview(tree_holder, columns=columns, show="headings", height=14)
+        self.stock_tree.column("id", width=0, stretch=False)
+        self.stock_tree.heading("id", text="")
+        self.stock_tree.heading("name", text="Material")
+        self.stock_tree.column("name", width=220, anchor="w")
+        self.stock_tree.heading("stock", text="Stock físico")
+        self.stock_tree.column("stock", width=95, anchor="center")
+        self.stock_tree.heading("reserved", text="Reservado")
+        self.stock_tree.column("reserved", width=90, anchor="center")
+        self.stock_tree.heading("available", text="Disponible")
+        self.stock_tree.column("available", width=95, anchor="center")
+        self.stock_tree.heading("unit_cost", text="Costo unitario")
+        self.stock_tree.column("unit_cost", width=110, anchor="center")
+        self.stock_tree.heading("sale", text="Venta")
+        self.stock_tree.column("sale", width=115, anchor="center")
+        self.stock_tree.heading("supplier", text="Lugar de compra")
+        self.stock_tree.column("supplier", width=150, anchor="w")
+        self.stock_tree.heading("min_stock", text="Mínimo")
+        self.stock_tree.column("min_stock", width=80, anchor="center")
+        self.stock_tree.heading("status", text="Estado")
+        self.stock_tree.column("status", width=90, anchor="center")
+        self.stock_tree.pack(fill="both", expand=True, padx=1, pady=1)
+        self.stock_empty_state = tk.Frame(tree_holder, background=COLORS.panel_elevated)
+        tk.Label(
+            self.stock_empty_state,
+            text="📦",
+            background=COLORS.panel_elevated,
+            foreground=COLORS.info,
+            font=(UI_FONT, 24),
+        ).pack(pady=(20, 4))
+        tk.Label(
+            self.stock_empty_state,
+            text="Todavía no hay materiales",
+            background=COLORS.panel_elevated,
+            foreground=COLORS.text,
+            font=(IDENTITY_FONT, 16, "bold"),
+        ).pack()
+        tk.Label(
+            self.stock_empty_state,
+            text="Creá el primero para registrar compras, reservas y alertas de stock.",
+            background=COLORS.panel_elevated,
+            foreground=COLORS.muted,
+            font=(UI_FONT, 10),
+        ).pack(pady=(5, 12))
+        ttk.Button(
+            self.stock_empty_state,
+            text="＋ Crear primer material",
+            command=self.create_stock_material,
+            style="Primary.TButton",
+        ).pack()
+        self.stock_material_ids: dict[str, int] = {}
+        self.stock_tree.bind("<Button-3>", self.show_stock_context_menu)
+        self.refresh_stock_module()
+
+    def _build_costs_tab_in_commercial(self, parent: tk.Widget):
+        """Construye la pestaña de Costos dentro de Gestión Comercial."""
+        header = tk.Frame(parent, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
+        header.pack(fill="x", padx=16, pady=(16, 10))
+        tk.Label(header, text="COSTOS", background=COLORS.panel, foreground=COLORS.text,
+                font=(IDENTITY_FONT, 20, "bold")).pack(anchor="w", padx=16, pady=(13, 2))
+        tk.Label(header, text="Administrá los costos fijos globales y los costos variables por producto.",
+                background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 10)).pack(anchor="w", padx=16, pady=(0, 13))
+
+        notebook = ttk.Notebook(parent)
+        notebook.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+
+        fixed_tab = ttk.Frame(notebook)
+        variable_tab = ttk.Frame(notebook)
+        notebook.add(fixed_tab, text="  Costos Fijos  ")
+        notebook.add(variable_tab, text="  Costos Variables  ")
+
+        # ── Pestaña: Costos Fijos ──────────────────────────────────────────
+        fixed_holder = tk.Frame(fixed_tab, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
+        fixed_holder.pack(fill="both", expand=True)
+
+        _COLS = ("name", "condition", "model", "summary")
+        fixed_tree = ttk.Treeview(fixed_holder, columns=_COLS, show="headings", selectmode="browse")
+
+        _COL_DEFS = (
+            ("name",      "Nombre",              180, "w"),
+            ("condition", "Condición",           150, "w"),
+            ("model",     "Modelo",              180, "w"),
+            ("summary",   "Resumen",             260, "w"),
+        )
+
+        for key, title, width, anchor in _COL_DEFS:
+            fixed_tree.heading(key, text=title)
+            fixed_tree.column(key, width=width, minwidth=max(40, width - 20), anchor=anchor)
+
+        scroll = ttk.Scrollbar(fixed_holder, orient="vertical", command=fixed_tree.yview)
+        fixed_tree.configure(yscrollcommand=scroll.set)
+        fixed_tree.pack(side="left", fill="both", expand=True, padx=(1, 0), pady=1)
+        scroll.pack(side="right", fill="y", padx=(0, 1), pady=1)
+
+        def refresh_fixed_rules():
+            fixed_tree.delete(*fixed_tree.get_children())
+            for rule in self.database.all_cost_rules():
+                model = self.database.cost_model(rule["id"]) if rule.get("id") else None
+                summary = "Sin modelo asociado" if not model else (model.get("description") or "Modelo de costos")
+                fixed_tree.insert("", "end", iid=str(rule["id"]), values=(
+                    rule.get("name") or "Sin nombre",
+                    rule.get("condition") or "Siempre",
+                    model.get("name") if model else "—",
+                    summary,
+                ))
+
+        def add_fixed_rule():
+            self._open_cost_rule_editor(self, fixed_tree, None)
+
+        def modify_fixed_rule(*_):
+            selected = fixed_tree.selection()
+            if not selected:
+                messagebox.showinfo("Costos", "Elegí una regla para modificar.", parent=self)
+                return
+            rule = self.database.cost_rule(int(selected[0]))
+            if not rule:
+                refresh_fixed_rules()
+                return
+            self._open_cost_rule_editor(self, fixed_tree, rule)
+
+        def remove_fixed_rule():
+            selected = fixed_tree.selection()
+            if not selected:
+                return
+            if messagebox.askyesno("Eliminar regla", "¿Eliminar esta regla de costos?", parent=self):
+                self.database.remove_cost_rule(int(selected[0]))
+                refresh_fixed_rules()
+
+        fixed_tree.bind("<Double-1>", modify_fixed_rule)
+
+        fixed_actions = tk.Frame(fixed_tab, background=COLORS.background)
+        fixed_actions.pack(fill="x", pady=(8, 0))
+        ttk.Button(fixed_actions, text="Nueva regla", command=add_fixed_rule, style="Primary.TButton").pack(side="left")
+        ttk.Button(fixed_actions, text="Modificar", command=modify_fixed_rule, style="Secondary.TButton").pack(side="left", padx=7)
+        ttk.Button(fixed_actions, text="Eliminar", command=remove_fixed_rule, style="Danger.TButton").pack(side="left")
+
+        refresh_fixed_rules()
+
+        # ── Pestaña: Costos Variables ──────────────────────────────────────────
+        variable_holder = tk.Frame(variable_tab, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
+        variable_holder.pack(fill="both", expand=True)
+
+        _VAR_COLS = ("name", "product", "category", "components", "summary")
+        variable_tree = ttk.Treeview(variable_holder, columns=_VAR_COLS, show="headings", selectmode="browse")
+
+        _VAR_COL_DEFS = (
+            ("name",       "Nombre",              160, "w"),
+            ("product",    "Producto/Categoría",  180, "w"),
+            ("category",   "Categoría",           140, "w"),
+            ("components", "Componentes",         200, "w"),
+            ("summary",    "Resumen",             220, "w"),
+        )
+
+        for key, title, width, anchor in _VAR_COL_DEFS:
+            variable_tree.heading(key, text=title)
+            variable_tree.column(key, width=width, minwidth=max(40, width - 20), anchor=anchor)
+
+        var_scroll = ttk.Scrollbar(variable_holder, orient="vertical", command=variable_tree.yview)
+        variable_tree.configure(yscrollcommand=var_scroll.set)
+        variable_tree.pack(side="left", fill="both", expand=True, padx=(1, 0), pady=1)
+        var_scroll.pack(side="right", fill="y", padx=(0, 1), pady=1)
+
+        def refresh_variable_rules():
+            variable_tree.delete(*variable_tree.get_children())
+            for rule in self.database.all_variable_cost_models():
+                # Obtener componentes del modelo
+                model_id = rule.get("id")
+                components = self.database.variable_cost_model_components(model_id) if model_id else []
+                variable_tree.insert("", "end", iid=str(rule["id"]), values=(
+                    rule.get("name") or "Sin nombre",
+                    rule.get("product_name") or "—",
+                    rule.get("category") or "—",
+                    f"{len(components)} componentes",
+                    f"{len(components)} componentes",
+                ))
+
+        def add_variable_rule():
+            self._open_variable_cost_editor(self, variable_tree, None)
+
+        def modify_variable_rule(*_):
+            selected = variable_tree.selection()
+            if not selected:
+                messagebox.showinfo("Costos Variables", "Elegí una regla para modificar.", parent=self)
+                return
+            rule = self.database.variable_cost_model(int(selected[0]))
+            if not rule:
+                refresh_variable_rules()
+                return
+            self._open_variable_cost_editor(self, variable_tree, rule)
+
+        def remove_variable_rule():
+            selected = variable_tree.selection()
+            if not selected:
+                return
+            if messagebox.askyesno("Eliminar regla", "¿Eliminar esta regla de costos variables?", parent=self):
+                self.database.remove_variable_cost_model(int(selected[0]))
+                refresh_variable_rules()
+
+        variable_tree.bind("<Double-1>", modify_variable_rule)
+
+        variable_actions = tk.Frame(variable_tab, background=COLORS.background)
+        variable_actions.pack(fill="x", pady=(8, 0))
+        ttk.Button(variable_actions, text="Nueva regla", command=add_variable_rule, style="Primary.TButton").pack(side="left")
+        ttk.Button(variable_actions, text="Modificar", command=modify_variable_rule, style="Secondary.TButton").pack(side="left", padx=7)
+        ttk.Button(variable_actions, text="Eliminar", command=remove_variable_rule, style="Danger.TButton").pack(side="left")
+
+        refresh_variable_rules()
+
+    def _build_prices_tab_in_commercial(self, parent: tk.Widget):
+        """Construye la pestaña de Precios dentro de Gestión Comercial."""
+        price_style = ttk.Style(parent)
+        price_style.configure(
+            "Price.Treeview",
+            background=COLORS.panel,
+            fieldbackground=COLORS.panel,
+            foreground=COLORS.text,
+            rowheight=30,
+            borderwidth=0,
+            font=(UI_FONT, 10),
+        )
+        price_style.configure(
+            "Price.Treeview.Heading",
+            background=COLORS.panel_elevated,
+            foreground=COLORS.text,
+            relief="flat",
+            font=(UI_FONT, 10, "bold"),
+            padding=(8, 7),
+        )
+        price_style.map(
+            "Price.Treeview",
+            background=[("selected", COLORS.wine)],
+            foreground=[("selected", COLORS.text)],
+        )
+        header = tk.Frame(parent, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
+        header.pack(fill="x", padx=16, pady=(16, 10))
+        tk.Label(header, text="PRECIOS CONFIGURABLES", background=COLORS.panel, foreground=COLORS.text,
+                 font=(IDENTITY_FONT, 20, "bold")).pack(anchor="w", padx=16, pady=(13, 2))
+        tk.Label(header, text="Las reglas proponen el subtotal; nunca modifican un pedido sin tu confirmación.",
+                 background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 10)).pack(anchor="w", padx=16, pady=(0, 13))
+        holder = tk.Frame(parent, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
+        holder.pack(fill="both", expand=True, padx=16, pady=(0, 10))
+        _COLS = ("list", "product", "material", "size", "quantity", "mode", "price",
+                 "model", "cost_total", "margin", "status", "detail", "discount", "extra")
+        tree = ttk.Treeview(holder, columns=_COLS, show="headings", selectmode="browse")
+        _COL_DEFS = (
+            ("list",       "Lista",       140, "w"),
+            ("product",    "Producto",    160, "w"),
+            ("material",   "Material",    140, "w"),
+            ("size",       "Tamaño",       70, "center"),
+            ("quantity",   "Desde",        55, "center"),
+            ("mode",       "Cálculo",      90, "center"),
+            ("price",      "Precio venta", 100, "center"),
+            ("model",      "Modelo de costos", 160, "w"),
+            ("cost_total", "Costo total",  90, "center"),
+            ("margin",     "Margen",       120, "center"),
+            ("status",     "Estado",       100, "center"),
+            ("detail",     "Desglose",     260, "w"),
+            ("discount",   "Desc.",        55, "center"),
+            ("extra",      "Servicio",    130, "w"),
+        )
+        for key, title, width, anchor in _COL_DEFS:
+            tree.heading(key, text=title)
+            tree.column(key, width=width, minwidth=max(40, width - 20), anchor=anchor)
+        tree.configure(style="Price.Treeview")
+        scroll = ttk.Scrollbar(holder, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.pack(side="left", fill="both", expand=True, padx=(1, 0), pady=1)
+        scroll.pack(side="right", fill="y", padx=(0, 1), pady=1)
+
+        def refresh_rules():
+            tree.delete(*tree.get_children())
+            for rule in self.database.price_rule_presentations():
+                mode = {"unitario": "Por unidad", "pack": "Por pack", "fijo": "Precio fijo"}.get(
+                    str(rule.get("price_mode") or "fijo").casefold(), "Precio fijo")
+                material_value = str(rule.get("material") or "Cualquiera")
+                if " - " in material_value:
+                    product_value, material_display = material_value.split(" - ", 1)
+                else:
+                    product_value, material_display = material_value, material_value
+                qty = int(rule.get("min_quantity") or 1)
+                price = float(rule.get("price") or 0)
+                cost_total = float(rule.get("cost_total") or 0)
+                margin_value = float(rule.get("margin") or 0)
+                margin_pct = f"{float(rule.get('margin_pct') or 0):.1f}%"
+                margin_str = f"${margin_value:,.2f} ({margin_pct})"
+                warning = rule.get("warning")
+                detail = rule.get("detail") or "Sin detalle"
+                tree.insert("", "end", iid=str(rule["id"]), values=(
+                    rule.get("price_list_name") or "Precios generales",
+                    rule.get("product_name") or product_value,
+                    material_display or "Cualquiera",
+                    rule.get("size") or "Cualquiera",
+                    qty,
+                    mode,
+                    f"${price:,.2f}",
+                    str(rule.get("model_name") or "—"),
+                    f"${cost_total:,.2f}",
+                    margin_str,
+                    str(rule.get("status") or "Sin datos"),
+                    detail,
+                    f"{float(rule.get('discount_percent') or 0):g}%",
+                    rule.get("extra_service") or "—",
+                ))
+
+        def _open_rule_editor(rule: dict | None = None):
+            self._open_price_rule_editor(self, tree, rule)
+
+        def add_rule():
+            _open_rule_editor(None)
+
+        def modify_rule(*_):
+            selected = tree.selection()
+            if not selected:
+                messagebox.showinfo("Precios", "Elegí una regla para modificar.", parent=self)
+                return
+            rule = self.database.price_rule(int(selected[0]))
+            if not rule:
+                refresh_rules()
+                return
+            _open_rule_editor(rule)
+
+        def remove_rule():
+            selected = tree.selection()
+            if not selected:
+                return
+            if messagebox.askyesno("Eliminar regla", "¿Eliminar esta regla de precios?", parent=self):
+                self.database.remove_price_rule(int(selected[0]))
+                refresh_rules()
+
+        tree.bind("<Double-1>", modify_rule)
+
+        actions = tk.Frame(parent, background=COLORS.background)
+        actions.pack(fill="x", pady=(8, 0))
+        ttk.Button(actions, text="Nueva regla", command=add_rule, style="Primary.TButton").pack(side="left")
+        ttk.Button(actions, text="Modificar", command=modify_rule, style="Secondary.TButton").pack(side="left", padx=7)
+        ttk.Button(actions, text="Eliminar", command=remove_rule, style="Danger.TButton").pack(side="left")
+        # La tabla se construye vacía; cargar las reglas activas al abrir la pestaña.
+        refresh_rules()
+
+
+    def _open_price_rule_editor(self, parent_window, tree, rule: dict | None = None):
+        """Abre el editor de reglas de precio."""
+        # La creación no recibe una regla existente. Usar un diccionario vacío
+        # evita una excepción que dejaría el Toplevel vacío en pantalla.
+        rule_data = rule or {}
+        # Evitar abrir múltiples formularios
+        if hasattr(self, '_price_rule_editor_window') and self._price_rule_editor_window and tk.Toplevel.winfo_exists(self._price_rule_editor_window):
+            self._price_rule_editor_window.lift()
+            self._price_rule_editor_window.focus_force()
+            return
+        
+        # Crear ventana del editor
+        editor = tk.Toplevel(self)
+        editor.title("Nueva regla de precio" if rule is None else "Modificar regla de precio")
+        editor.geometry("680x610")
+        editor.configure(background="#080909")
+        editor.transient(self)
+        editor.grab_set()
+        
+        # Centrar ventana
+        editor.update_idletasks()
+        x = (editor.winfo_screenwidth() // 2) - (editor.winfo_width() // 2)
+        y = (editor.winfo_screenheight() // 2) - (editor.winfo_height() // 2)
+        editor.geometry(f"+{x}+{y}")
+        
+        self._price_rule_editor_window = editor
+        
+        # Productos y listas se guardan como vínculos, no como texto libre.
+        products = self.database.active_catalog_products()
+        product_options = [("— Sin producto vinculado —", "")] + [(p["name"], p["id"]) for p in products]
+        product_names = {str(identifier): name for name, identifier in product_options}
+        product_var = tk.StringVar(value=product_names.get(str(rule_data.get("product_id") or ""), "— Sin producto vinculado —"))
+        price_lists = self.database.active_price_lists()
+        list_options = [(item["name"], item["id"]) for item in price_lists]
+        list_names = {str(identifier): name for name, identifier in list_options}
+        default_list = next((name for name, _ in list_options if name == "Precios generales"), list_options[0][0] if list_options else "Precios generales")
+        price_list_var = tk.StringVar(value=list_names.get(str(rule_data.get("price_list_id") or ""), default_list))
+        # Variables del formulario
+        material_var = tk.StringVar(value=rule.get("material", "").split(" - ")[1] if rule and " - " in rule.get("material", "") else (rule.get("material", "") if rule else ""))
+        size_var = tk.StringVar(value=rule.get("size", "") if rule else "")
+        quantity_var = tk.StringVar(value=str(rule.get("min_quantity", 1)) if rule else "1")
+        mode_var = tk.StringVar(value=rule.get("price_mode", "fijo") if rule else "fijo")
+        price_var = tk.StringVar(value=str(rule.get("price", "")) if rule else "")
+        discount_var = tk.StringVar(value=str(rule.get("discount_percent", 0)) if rule else "0")
+        extra_var = tk.StringVar(value=rule.get("extra_service", "") if rule else "")
+        image_var = tk.StringVar(value=rule.get("image_path", "") if rule else "")
+        active_var = tk.BooleanVar(value=rule.get("active", 1) if rule else True)
+        
+        # Cargar modelos de costos
+        cost_models = self.database.active_variable_cost_models()
+        model_options = [("— Sin modelo —", "")] + [(m["name"], m["id"]) for m in cost_models]
+        model_var = tk.StringVar(value=str(rule.get("variable_cost_model_id", "")) if rule else "")
+        
+        # UI del formulario
+        container = tk.Frame(editor, background="#080909")
+        container.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        # Producto y lista
+        tk.Label(container, text="Producto:", background="#080909", foreground="#ffffff").grid(row=0, column=0, sticky="w", pady=5)
+        ttk.Combobox(container, textvariable=product_var, values=[name for name, _ in product_options], state="readonly", width=37).grid(row=0, column=1, sticky="ew", pady=5)
+        tk.Label(container, text="Lista de precios:", background="#080909", foreground="#ffffff").grid(row=1, column=0, sticky="w", pady=5)
+        ttk.Combobox(container, textvariable=price_list_var, values=[name for name, _ in list_options], state="readonly", width=37).grid(row=1, column=1, sticky="ew", pady=5)
+        
+        # Material
+        tk.Label(container, text="Material:", background="#080909", foreground="#ffffff").grid(row=2, column=0, sticky="w", pady=5)
+        material_entry = ttk.Entry(container, textvariable=material_var, width=40)
+        material_entry.grid(row=2, column=1, sticky="ew", pady=5)
+        
+        # Tamaño
+        tk.Label(container, text="Tamaño:", background="#080909", foreground="#ffffff").grid(row=3, column=0, sticky="w", pady=5)
+        size_entry = ttk.Entry(container, textvariable=size_var, width=40)
+        size_entry.grid(row=3, column=1, sticky="ew", pady=5)
+        
+        # Cantidad desde
+        tk.Label(container, text="Cantidad desde:", background="#080909", foreground="#ffffff").grid(row=4, column=0, sticky="w", pady=5)
+        quantity_entry = ttk.Entry(container, textvariable=quantity_var, width=40)
+        quantity_entry.grid(row=4, column=1, sticky="ew", pady=5)
+        
+        # Tipo de cálculo
+        tk.Label(container, text="Tipo de cálculo:", background="#080909", foreground="#ffffff").grid(row=5, column=0, sticky="w", pady=5)
+        mode_combo = ttk.Combobox(container, textvariable=mode_var, values=["fijo", "unitario", "pack"], state="readonly", width=37)
+        mode_combo.grid(row=5, column=1, sticky="ew", pady=5)
+        
+        # Precio de venta
+        tk.Label(container, text="Precio de venta:", background="#080909", foreground="#ffffff").grid(row=6, column=0, sticky="w", pady=5)
+        price_entry = ttk.Entry(container, textvariable=price_var, width=40)
+        price_entry.grid(row=6, column=1, sticky="ew", pady=5)
+        
+        # Descuento
+        tk.Label(container, text="Descuento (%):", background="#080909", foreground="#ffffff").grid(row=7, column=0, sticky="w", pady=5)
+        discount_entry = ttk.Entry(container, textvariable=discount_var, width=40)
+        discount_entry.grid(row=7, column=1, sticky="ew", pady=5)
+        
+        # Servicio extra
+        tk.Label(container, text="Servicio extra:", background="#080909", foreground="#ffffff").grid(row=8, column=0, sticky="w", pady=5)
+        extra_entry = ttk.Entry(container, textvariable=extra_var, width=40)
+        extra_entry.grid(row=8, column=1, sticky="ew", pady=5)
+
+        tk.Label(container, text="Imagen guía:", background="#080909", foreground="#ffffff").grid(row=9, column=0, sticky="w", pady=5)
+        image_frame = tk.Frame(container, background="#080909")
+        image_frame.grid(row=9, column=1, sticky="ew", pady=5)
+        ttk.Entry(image_frame, textvariable=image_var, width=30).pack(side="left", fill="x", expand=True)
+        ttk.Button(image_frame, text="Elegir", command=lambda: image_var.set(filedialog.askopenfilename(parent=editor, filetypes=[("Imágenes", "*.png *.jpg *.jpeg *.webp *.gif"), ("Todos", "*.*")]) or image_var.get())).pack(side="left", padx=(6, 0))
+        
+        # Modelo de costos
+        tk.Label(container, text="Modelo de costos:", background="#080909", foreground="#ffffff").grid(row=10, column=0, sticky="w", pady=5)
+        model_combo = ttk.Combobox(container, textvariable=model_var, values=[name for name, _ in model_options], state="readonly", width=37)
+        model_combo.grid(row=10, column=1, sticky="ew", pady=5)
+        
+        # Estado activo
+        active_check = ttk.Checkbutton(container, text="Regla activa", variable=active_var)
+        active_check.grid(row=11, column=0, columnspan=2, sticky="w", pady=10)
+        
+        # Botones
+        button_frame = tk.Frame(container, background="#080909")
+        button_frame.grid(row=12, column=0, columnspan=2, pady=20)
+        
+        def save_rule():
+            try:
+                # Validar campos obligatorios
+                if not material_var.get().strip():
+                    messagebox.showerror("Error", "El material es obligatorio", parent=editor)
+                    return
+                
+                try:
+                    quantity = int(quantity_var.get())
+                    if quantity < 1:
+                        raise ValueError()
+                except ValueError:
+                    messagebox.showerror("Error", "La cantidad debe ser un número entero mayor a 0", parent=editor)
+                    return
+                
+                try:
+                    price = float(price_var.get())
+                    if price < 0:
+                        raise ValueError()
+                except ValueError:
+                    messagebox.showerror("Error", "El precio debe ser un número válido", parent=editor)
+                    return
+                
+                try:
+                    discount = float(discount_var.get())
+                    if not 0 <= discount <= 100:
+                        raise ValueError()
+                except ValueError:
+                    messagebox.showerror("Error", "El descuento debe estar entre 0 y 100", parent=editor)
+                    return
+                
+                # El producto y la lista quedan vinculados mediante sus IDs.
+                material = material_var.get().strip()
+                product_id = next((identifier for name, identifier in product_options if name == product_var.get()), None)
+                price_list_id = next((identifier for name, identifier in list_options if name == price_list_var.get()), None)
+                
+                # Obtener ID del modelo de costos
+                model_id = None
+                model_name = model_var.get()
+                for name, mid in model_options:
+                    if name == model_name:
+                        model_id = mid
+                        break
+                
+                # Guardar o actualizar
+                if rule is None:
+                    # Nueva regla
+                    rule_id = self.database.save_price_rule(
+                        material=material,
+                        size=size_var.get().strip(),
+                        min_quantity=quantity,
+                        price=price,
+                        extra_service=extra_var.get().strip(),
+                        discount_percent=discount,
+                        price_mode=mode_var.get(),
+                        variable_cost_model_id=model_id, image_path=image_var.get(),
+                        product_id=product_id, price_list_id=price_list_id,
+                    )
+                    messagebox.showinfo("Éxito", f"Regla creada con ID {rule_id}", parent=editor)
+                else:
+                    # Actualizar regla existente
+                    success = self.database.update_price_rule(
+                        rule_id=rule["id"],
+                        material=material,
+                        size=size_var.get().strip(),
+                        min_quantity=quantity,
+                        price=price,
+                        extra_service=extra_var.get().strip(),
+                        discount_percent=discount,
+                        price_mode=mode_var.get(),
+                        variable_cost_model_id=model_id, image_path=image_var.get(),
+                        product_id=product_id, price_list_id=price_list_id,
+                    )
+                    if success:
+                        messagebox.showinfo("Éxito", "Regla actualizada", parent=editor)
+                    else:
+                        messagebox.showerror("Error", "No se pudo actualizar la regla", parent=editor)
+                        return
+                
+                # Recargar tabla
+                if hasattr(tree, 'delete'):
+                    tree.delete(*tree.get_children())
+                    for r in self.database.price_rule_presentations():
+                        mode = {"unitario": "Por unidad", "pack": "Por pack", "fijo": "Precio fijo"}.get(
+                            str(r.get("price_mode") or "fijo").casefold(), "Precio fijo")
+                        material_value = str(r.get("material") or "Cualquiera")
+                        if " - " in material_value:
+                            product_value, material_display = material_value.split(" - ", 1)
+                        else:
+                            product_value, material_display = material_value, material_value
+                        qty = int(r.get("min_quantity") or 1)
+                        price_val = float(r.get("price") or 0)
+                        cost_total = float(r.get("cost_total") or 0)
+                        margin_value = float(r.get("margin") or 0)
+                        margin_pct = f"{float(r.get('margin_pct') or 0):.1f}%"
+                        margin_str = f"${margin_value:,.2f} ({margin_pct})"
+                        detail = r.get("detail") or "Sin detalle"
+                        tree.insert("", "end", iid=str(r["id"]), values=(
+                            r.get("price_list_name") or "Precios generales",
+                            r.get("product_name") or product_value,
+                            material_display or "Cualquiera",
+                            r.get("size") or "Cualquiera",
+                            qty,
+                            mode,
+                            f"${price_val:,.2f}",
+                            str(r.get("model_name") or "—"),
+                            f"${cost_total:,.2f}",
+                            margin_str,
+                            str(r.get("status") or "Sin datos"),
+                            detail,
+                            f"{float(r.get('discount_percent') or 0):g}%",
+                            r.get("extra_service") or "—",
+                        ))
+                
+                # Seleccionar la regla creada/actualizada
+                if rule is None:
+                    tree.selection_set(str(rule_id))
+                    tree.see(str(rule_id))
+                else:
+                    tree.selection_set(str(rule["id"]))
+                    tree.see(str(rule["id"]))
+                
+                editor.destroy()
+                self._price_rule_editor_window = None
+                
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                messagebox.showerror("Error", f"Error al guardar: {str(e)}", parent=editor)
+        
+        def cancel():
+            editor.destroy()
+            self._price_rule_editor_window = None
+        
+        ttk.Button(button_frame, text="Guardar", command=save_rule, style="Primary.TButton").pack(side="left", padx=5)
+        ttk.Button(button_frame, text="Cancelar", command=cancel, style="Secondary.TButton").pack(side="left", padx=5)
+        
+        # Limpiar referencia al cerrar
+        editor.bind("<Destroy>", lambda e: setattr(self, '_price_rule_editor_window', None))
+        
+        # Mostrar y enfocar
+        editor.lift()
+        editor.focus_force()
+
+        refresh_rules()
+
+    def show_commercial_management(self, initial_section="stock"):
+        """Muestra el módulo de Gestión comercial y selecciona la sección solicitada.
+
+        Args:
+            initial_section: "stock", "costs", "prices" o "clients"
+        """
+        # Seleccionar la pestaña Gestión comercial en el notebook principal
+        if hasattr(self, "commercial_tab"):
+            self.tabs.select(self.commercial_tab)
+            self._ensure_module("commercial", self.commercial_tab)
+
+        # Seleccionar la sección solicitada dentro del notebook de Gestión comercial
+        if hasattr(self, "commercial_notebook"):
+            section_map = {"stock": 0, "costs": 1, "prices": 2, "clients": 4}
+            section_index = section_map.get(initial_section.lower(), 0)
+            self.commercial_notebook.select(section_index)
+
+    def open_sticker_bank_for_order(self, order_id: int):
+        """Open the reusable sticker bank while keeping the source order linked."""
+        if order_id not in self.order_tabs:
+            self.open_order_workspace(order_id)
+        self._sticker_bank_order_id = order_id
+        self.sticker_bank_order_target.set(f"Para pedido #{order_id}")
+        self.library_order_actions.pack(side="right", padx=10, pady=7)
+        self.tabs.select(self.designs_tab)
+        self.status.set("Seleccioná stickers del banco y usá «Agregar al pedido» para vincularlos.")
+
+    def open_sticker_creator_for_order(self, order_id: int):
+        """Abre el creador de stickers vinculado a un pedido específico."""
+        if order_id not in self.order_tabs:
+            self.open_order_workspace(order_id)
+        
+        # Un pedido sólo provee contexto nominal si sus diseños ya tienen una
+        # medida comercial única. No se infiere nunca desde el PNG ni 5,70.
+        sizes = {
+            round(float(design["size_cm"]), 6)
+            for design in self.database.order_designs(order_id)
+            if design.get("size_cm") is not None and float(design["size_cm"]) > 0
+        }
+        nominal_size_cm = sizes.pop() if len(sizes) == 1 else None
+        success = self.open_sticker_studio(
+            initial_paths=None, target_order_id=order_id,
+            nominal_size_cm=nominal_size_cm,
+        )
+        
+        if success:
+            order = self.database.order(order_id)
+            client_name = order.get("client") or f"Pedido #{order_id}"
+            if nominal_size_cm is None:
+                self.status.set(
+                    f"Creador de stickers abierto para {client_name} en modo legacy: "
+                    "el pedido no tiene un tamaño nominal único.")
+            else:
+                self.status.set(
+                    f"Creador de stickers abierto para {client_name} "
+                    f"(nominal {nominal_size_cm:.2f} cm).")
+        else:
+            self.status.set(f"No se pudo abrir el creador de stickers para el pedido #{order_id}.")
+
+    def add_selected_stickers_to_order(self):
+        """Add the current library selection to the order that opened the bank."""
+        order_id = getattr(self, "_sticker_bank_order_id", None)
+        if order_id is None or order_id not in self.order_tabs:
+            messagebox.showinfo("Banco de stickers", "Abrí el banco desde un pedido para agregar diseños directamente.", parent=self)
+            return
+        if not self.selected_images:
+            messagebox.showinfo("Banco de stickers", "Seleccioná uno o más stickers del banco.", parent=self)
+            return
+        self.link_selection_to_order(order_id)
+        self.tabs.select(self.order_tabs[order_id])
+        self.library_order_actions.pack_forget()
+        self.sticker_bank_order_target.set("")
+        self._sticker_bank_order_id = None
+
+    def build_stock_module(self, parent: tk.Widget):
+        """Construye un panel simple de stock y materiales para el flujo real."""
+        container = tk.Frame(parent, background=COLORS.panel)
+        container.pack(fill="both", expand=True)
+
+        header = ttk.Frame(container, padding=(10, 10, 10, 6))
+        header.pack(fill="x")
+        ttk.Label(header, text="STOCK Y MATERIALES", style="CommercialTitle.TLabel").pack(side="left")
+        actions = ttk.Frame(header)
+        actions.pack(side="right")
+        ttk.Button(actions, text="Actualizar", command=self.refresh_stock_module, style="Secondary.TButton").pack(side="right")
+        ttk.Button(actions, text="Ajustar stock", command=self.adjust_selected_stock, style="Primary.TButton").pack(side="right", padx=(0, 8))
+        ttk.Button(actions, text="Crear material", command=self.create_stock_material, style="Secondary.TButton").pack(side="right", padx=(0, 8))
+
+        self.stock_summary = tk.StringVar(value="Cargando stock…")
+        ttk.Label(container, textvariable=self.stock_summary, style="Muted.TLabel").pack(anchor="w", padx=12, pady=(0, 6))
+
+        tree_holder = tk.Frame(container, background=COLORS.panel_elevated, highlightthickness=1, highlightbackground=COLORS.border)
+        tree_holder.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        columns = ("id", "name", "stock", "reserved", "available", "unit_cost", "sale", "supplier", "min_stock", "status")
+        self.stock_tree = ttk.Treeview(tree_holder, columns=columns, show="headings", height=14)
+        self.stock_tree.column("id", width=0, stretch=False)
+        self.stock_tree.heading("id", text="")
+        self.stock_tree.heading("name", text="Material")
+        self.stock_tree.column("name", width=220, anchor="w")
+        self.stock_tree.heading("stock", text="Stock físico")
+        self.stock_tree.column("stock", width=95, anchor="center")
+        self.stock_tree.heading("reserved", text="Reservado")
+        self.stock_tree.column("reserved", width=90, anchor="center")
+        self.stock_tree.heading("available", text="Disponible")
+        self.stock_tree.column("available", width=95, anchor="center")
+        self.stock_tree.heading("unit_cost", text="Costo unitario")
+        self.stock_tree.column("unit_cost", width=110, anchor="center")
+        self.stock_tree.heading("sale", text="Venta")
+        self.stock_tree.column("sale", width=115, anchor="center")
+        self.stock_tree.heading("supplier", text="Lugar de compra")
+        self.stock_tree.column("supplier", width=150, anchor="w")
+        self.stock_tree.heading("min_stock", text="Mínimo")
+        self.stock_tree.column("min_stock", width=80, anchor="center")
+        self.stock_tree.heading("status", text="Estado")
+        self.stock_tree.column("status", width=90, anchor="center")
+        self.stock_tree.pack(fill="both", expand=True, padx=1, pady=1)
+        self.stock_material_ids: dict[str, int] = {}
+        self.stock_tree.bind("<Button-3>", self.show_stock_context_menu)
+        self.refresh_stock_module()
+
+    def refresh_stock_module(self):
+        if not hasattr(self, "stock_tree"):
+            return
+        self.stock_tree.delete(*self.stock_tree.get_children())
+        self.stock_material_ids.clear()
+        metrics = self.stock_cost_price.dashboard_metrics()
+        if hasattr(self, "stock_metric_vars"):
+            self.stock_metric_vars["inventory"].set(f"${metrics['inventory_value']:,.2f}")
+            self.stock_metric_vars["reserved"].set(f"${metrics['reserved_value']:,.2f}")
+            self.stock_metric_vars["profit"].set(f"${metrics['gross_profit']:,.2f}")
+            self.stock_metric_vars["margin"].set(f"{metrics['margin_pct']:.1f}%")
+            is_loss = metrics["gross_profit"] < 0
+            self.stock_profit_title.set("PÉRDIDA BRUTA" if is_loss else "GANANCIA BRUTA")
+            self.stock_profit_value_label.configure(foreground=COLORS.error if is_loss else COLORS.success)
+        if hasattr(self, "stock_operations_summary"):
+            self.stock_operations_summary.set(
+                f"{metrics['process_count']} procesos · {metrics['movement_count']} movimientos últimos 30 días"
+            )
+        rows = self.stock_cost_price.connection.execute(
+            "SELECT * FROM materials ORDER BY name COLLATE NOCASE"
+        ).fetchall()
+        if not rows:
+            self.stock_summary.set("Inventario vacío · Creá un material para empezar a registrar movimientos.")
+            if hasattr(self, "stock_empty_state"):
+                self.stock_tree.pack_forget()
+                self.stock_empty_state.place(relx=0.5, rely=0.44, anchor="center")
+            return
+        if hasattr(self, "stock_empty_state"):
+            self.stock_empty_state.place_forget()
+            if not self.stock_tree.winfo_manager():
+                self.stock_tree.pack(fill="both", expand=True, padx=1, pady=1)
+        low_stock_count = 0
+        for row in rows:
+            material_id = int(row["id"])
+            physical_stock = float(row["physical_stock"] or 0)
+            reserved_stock = float(row["reserved_stock"] or 0)
+            available_stock = physical_stock - reserved_stock
+            min_stock = float(row["min_stock"] or 0)
+            status = "Bajo" if physical_stock <= min_stock else "OK"
+            if status == "Bajo":
+                low_stock_count += 1
+            iid = str(material_id)
+            self.stock_tree.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(
+                    material_id,
+                    row["name"],
+                    f"{physical_stock:g}",
+                    f"{reserved_stock:g}",
+                    f"{available_stock:g}",
+                    f"${float(row['unit_cost'] or 0):,.2f}",
+                    f"{float(row['sale_quantity'] or 1):g} × ${float(row['sale_unit_price'] or 0):,.2f}",
+                    row["supplier"] or "—",
+                    f"{min_stock:g}",
+                    status,
+                ),
+            )
+            self.stock_material_ids[iid] = material_id
+            if status == "Bajo":
+                self.stock_tree.item(iid, tags=("low_stock",))
+        self.stock_tree.tag_configure("low_stock", foreground=COLORS.error)
+        self.stock_summary.set(
+            f"{len(rows)} materiales · {low_stock_count} con stock bajo · {metrics['material_count']} recursos gestionados"
+        )
+
+    def create_stock_material(self):
+        """Muestra un único formulario con compra, proveedor y datos de venta."""
+        dialog = tk.Toplevel(self)
+        dialog.title("Agregar material")
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        dialog.configure(background=COLORS.panel)
+        dialog.grab_set()
+
+        fields = (
+            ("name", "Nombre del material", ""),
+            ("supplier", "Lugar de compra / proveedor", ""),
+            ("purchase_link", "Enlace de compra (opcional)", ""),
+            ("unit", "Unidad de stock", "unidad"),
+            ("physical_stock", "Cantidad comprada / stock inicial", "0"),
+            ("purchase_price", "Precio total de compra", "0"),
+            ("min_stock", "Stock mínimo", "0"),
+            ("sale_quantity", "Cantidad por venta", "1"),
+            ("sale_unit_price", "Precio de venta por unidad", "0"),
+        )
+        body = ttk.Frame(dialog, padding=18)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Datos del material", style="CommercialTitle.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        ttk.Label(body, text="El costo unitario se calcula automáticamente según la compra inicial.", style="Muted.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 12))
+        values: dict[str, tk.StringVar] = {}
+        for row, (key, label, initial) in enumerate(fields, start=2):
+            ttk.Label(body, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=4)
+            variable = tk.StringVar(value=initial)
+            values[key] = variable
+            entry = ttk.Entry(body, textvariable=variable, width=38)
+            entry.grid(row=row, column=1, sticky="ew", pady=4)
+            if key == "name":
+                entry.focus_set()
+        body.columnconfigure(1, weight=1)
+
+        def save() -> None:
+            name = values["name"].get().strip()
+            if not name:
+                messagebox.showwarning("Agregar material", "Ingresá el nombre del material.", parent=dialog)
+                return
+            try:
+                stock = float(values["physical_stock"].get().replace(",", ".") or 0)
+                purchase_price = float(values["purchase_price"].get().replace(",", ".") or 0)
+                minimum = float(values["min_stock"].get().replace(",", ".") or 0)
+                sale_quantity = float(values["sale_quantity"].get().replace(",", ".") or 0)
+                sale_price = float(values["sale_unit_price"].get().replace(",", ".") or 0)
+            except ValueError:
+                messagebox.showwarning("Agregar material", "Completá los importes y cantidades con números válidos.", parent=dialog)
+                return
+            if min(stock, purchase_price, minimum, sale_quantity, sale_price) < 0 or sale_quantity <= 0:
+                messagebox.showwarning("Agregar material", "Las cantidades no pueden ser negativas y la cantidad por venta debe ser mayor a cero.", parent=dialog)
+                return
+            self.stock_cost_price.create_material(
+                name=name, unit=values["unit"].get().strip() or "unidad", physical_stock=stock,
+                min_stock=minimum, unit_cost=purchase_price / stock if stock else 0.0,
+                supplier=values["supplier"].get().strip(), purchase_price=purchase_price,
+                purchase_link=values["purchase_link"].get().strip(), sale_quantity=sale_quantity,
+                sale_unit_price=sale_price,
+            )
+            dialog.destroy()
+            self.refresh_stock_module()
+            self.status.set(f"Material creado: {name}")
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=len(fields) + 2, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        ttk.Button(buttons, text="Cancelar", command=dialog.destroy, style="Secondary.TButton").pack(side="right")
+        ttk.Button(buttons, text="Guardar material", command=save, style="Primary.TButton").pack(side="right", padx=(0, 8))
+        dialog.bind("<Return>", lambda _event: save())
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        dialog.wait_window()
+
+    def adjust_selected_stock(self):
+        selected = self.stock_tree.selection()
+        if not selected:
+            messagebox.showinfo("Stock", "Seleccioná un material para ajustar su stock.", parent=self)
+            return
+        material_id = self.stock_material_ids.get(selected[0])
+        if material_id is None:
+            return
+        try:
+            delta = float(simpledialog.askfloat("Ajustar stock", "Cantidad a sumar o restar:", parent=self) or 0.0)
+        except (TypeError, ValueError):
+            messagebox.showwarning("Stock", "Ingresá una cantidad válida.", parent=self)
+            return
+        if delta == 0:
+            return
+        self.stock_cost_price.adjust_stock(material_id=material_id, delta=delta, reference="Ajuste manual", details="Ajuste desde la UI")
+        self.refresh_stock_module()
+        self.status.set(f"Stock ajustado para material #{material_id}")
+
+    def register_stock_purchase(self):
+        """Register a replenishment and recalculate the weighted material cost."""
+        selected = self.stock_tree.selection()
+        if not selected:
+            messagebox.showinfo("Registrar compra", "Seleccioná un material para registrar su ingreso.", parent=self)
+            return
+        material_id = self.stock_material_ids.get(selected[0])
+        if material_id is None:
+            return
+        try:
+            quantity = float(simpledialog.askfloat("Registrar compra", "Cantidad ingresada:", minvalue=0.0001, parent=self) or 0)
+            total_cost = float(simpledialog.askfloat("Registrar compra", "Costo total de la compra:", minvalue=0.0, parent=self) or 0)
+        except (TypeError, ValueError):
+            messagebox.showwarning("Registrar compra", "Ingresá valores numéricos válidos.", parent=self)
+            return
+        if quantity <= 0:
+            return
+        reference = simpledialog.askstring("Registrar compra", "Proveedor o referencia:", parent=self) or "Compra manual"
+        new_cost = self.stock_cost_price.register_purchase(
+            material_id=material_id, quantity=quantity, total_cost=total_cost, reference=reference
+        )
+        self.refresh_stock_module()
+        self.status.set(f"Compra registrada · costo promedio actualizado a ${new_cost:,.2f}")
+
+    def show_stock_context_menu(self, event):
+        """Muestra menú contextual al hacer click derecho en un material."""
+        # Get the item under the cursor
+        item = self.stock_tree.identify_row(event.y)
+        if not item:
+            return
+        
+        # Select the item
+        self.stock_tree.selection_set(item)
+        
+        material_id = self.stock_material_ids.get(item)
+        if material_id is None:
+            return
+        
+        # Get material name for confirmation
+        material = self.stock_cost_price.get_material(material_id)
+        material_name = material["name"] if material else f"#{material_id}"
+        
+        menu = tk.Menu(self, tearoff=0)
+        configure_menu(menu)
+        menu.add_command(label="Registrar compra", command=self.register_stock_purchase)
+        menu.add_command(label="Ajustar stock", command=self.adjust_selected_stock)
+        menu.add_separator()
+        menu.add_command(label="🗑 Eliminar material", command=lambda: self.delete_stock_material(material_id, material_name))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def delete_stock_material(self, material_id: int, material_name: str):
+        """Elimina un material después de confirmación."""
+        confirm = messagebox.askyesno(
+            "Eliminar material",
+            f"¿Estás seguro de eliminar el material '{material_name}'?\n\nEsta acción también eliminará todo el historial de movimientos, compras y reservaciones asociadas.",
+            parent=self
+        )
+        if not confirm:
+            return
+        
+        try:
+            self.stock_cost_price.delete_material(material_id)
+            self.refresh_stock_module()
+            self.status.set(f"Material eliminado: {material_name}")
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo eliminar el material: {e}", parent=self)
 
     def build_orders_module(self, parent: tk.Widget):
         """Construye un módulo de Pedidos básico (placeholder ligero).
@@ -851,12 +3620,6 @@ class VisionVaultApp(DndRoot):
         ttk.Button(header, text="Abrir pedido",
                    command=self.open_selected_order,
                    style="Secondary.TButton").pack(side="right", padx=(0, 8))
-        ttk.Button(header, text="Precios",
-                   command=self.configure_price_rules,
-                   style="Secondary.TButton").pack(side="right", padx=(0, 8))
-        ttk.Button(header, text="Costos",
-                   command=self.configure_cost_rules,
-                   style="Secondary.TButton").pack(side="right", padx=(0, 8))
         # Botón urgentes: se inicializa antes de usarse como textvariable
         self.urgent_orders_button_var = tk.StringVar(value="🚨 Pedidos urgentes (0)")
         ttk.Button(header, textvariable=self.urgent_orders_button_var,
@@ -876,13 +3639,56 @@ class VisionVaultApp(DndRoot):
         filter_picker = ttk.Combobox(
             filter_bar, textvariable=self.orders_filter, state="readonly", width=18,
             values=("Todos", "Pendientes", "Recibidos", "Esperando archivos",
-                    "Diseños confirmados", "En producción", "Listos para imprimir", "Finalizados"),
+                    "Diseños confirmados", "En producción", "Listos para imprimir", "Finalizados / entregados"),
         )
         filter_picker.pack(side="left")
         filter_picker.bind("<<ComboboxSelected>>", lambda _event: self.refresh_orders())
         ttk.Button(filter_bar, text="Ver pendientes",
                    command=lambda: (self.orders_filter.set("Pendientes"), self.refresh_orders()),
                    style="Secondary.TButton").pack(side="left", padx=(12, 0))
+
+        # Atajos operativos: reducen la necesidad de escribir búsquedas para
+        # las consultas que se repiten durante el día.
+        quick_filter_bar = ttk.Frame(container, padding=(10, 0, 10, 8))
+        quick_filter_bar.pack(fill="x")
+        ttk.Label(quick_filter_bar, text="Atajos:").pack(side="left", padx=(0, 6))
+        self.orders_quick_filter = tk.StringVar(value="")
+        for label, value in (
+            ("Entrega hoy", "today"),
+            ("Vencidos", "overdue"),
+            ("Con saldo", "balance_due"),
+            ("Sin fecha", "no_delivery_date"),
+        ):
+            ttk.Button(
+                quick_filter_bar, text=label,
+                command=lambda selected=value: self._set_orders_quick_filter(selected),
+                style="Secondary.TButton",
+            ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            quick_filter_bar, text="Limpiar atajos",
+            command=lambda: self._set_orders_quick_filter(""),
+            style="Secondary.TButton",
+        ).pack(side="left")
+
+        # Lectura rápida: el listado de fichas es detallado; esta franja evita
+        # tener que recorrerlo para saber qué requiere atención.
+        orders_overview = tk.Frame(
+            container, background=COLORS.panel_elevated,
+            highlightthickness=1, highlightbackground=COLORS.border,
+        )
+        orders_overview.pack(fill="x", padx=10, pady=(0, 8))
+        self.orders_summary = tk.StringVar(value="Cargando pedidos…")
+        tk.Label(
+            orders_overview, textvariable=self.orders_summary,
+            background=COLORS.panel_elevated, foreground=COLORS.text,
+            font=(UI_FONT, 9, "bold"), anchor="w",
+        ).pack(side="left", fill="x", expand=True, padx=12, pady=7)
+        tk.Label(
+            orders_overview,
+            text="Un clic selecciona · doble clic abre · clic derecho muestra acciones",
+            background=COLORS.panel_elevated, foreground=COLORS.muted,
+            font=(UI_FONT, 8), anchor="e",
+        ).pack(side="right", padx=12)
 
         # ── Panel de estadísticas de ventas ───────────────────────────────────
         self.sales_month        = tk.StringVar(value=datetime.now().strftime("%Y-%m"))
@@ -1035,34 +3841,9 @@ class VisionVaultApp(DndRoot):
         self._orders_cards_frame = inner
         self._orders_cards_frame.columnconfigure(0, weight=1)
 
-        # Otros valores referenciados
-        self.orders_summary = tk.StringVar(value="Cargando pedidos…")
-
         # Cargar contenido inicial sin bloquear
         try:
             self.refresh_orders()
-        except Exception:
-            pass
-
-    def build_production_module(self, parent: tk.Widget):
-        """Construye un módulo de Producción mínimo para evitar errores en el arranque."""
-        container = tk.Frame(parent, background=COLORS.panel)
-        container.pack(fill="both", expand=True)
-
-        header = ttk.Frame(container, padding=10)
-        header.pack(fill="x")
-        ttk.Label(header, text="Producción", style="Title.TLabel").pack(side="left")
-
-        info = tk.Label(container, text="Panel de producción (temporal)", background=COLORS.panel, foreground=COLORS.muted)
-        info.pack(padx=12, pady=12)
-
-        # Guardar referencia mínima para llamadas posteriores
-        self.production_summary = tk.StringVar(value="Sin métricas")
-        ttk.Label(container, textvariable=self.production_summary, style="Muted.TLabel").pack(anchor="w", padx=12)
-
-        try:
-            # No bloquear el arranque con operaciones pesadas
-            pass
         except Exception:
             pass
 
@@ -1074,10 +3855,38 @@ class VisionVaultApp(DndRoot):
         except (tk.TclError, KeyError):
             return
         self._update_navigation(selected)
-        if selected is self.production_tab:
-            self.after_idle(lambda: getattr(self, "refresh_production", lambda: None)())
+        
+        # Cargar "Últimos Procesados" solo cuando se selecciona ese tab
+        if hasattr(self, "processed_tab") and selected is self.processed_tab:
+            # Verificar si necesita carga inicial o actualización
+            needs_refresh = (
+                not hasattr(self, "_processed_gallery_loaded") or 
+                getattr(self, "_processed_gallery_needs_refresh", False)
+            )
+            if needs_refresh:
+                self._processed_gallery_loaded = True
+                self._processed_gallery_needs_refresh = False
+                self.after(100, lambda: getattr(self, "refresh_processed_gallery", lambda: None)())
+        
+        if selected is self.today_tab:
+            self.refresh_today_module()
+        elif selected is self.production_tab:
+            if self._ensure_module("production", self.production_tab) is not None:
+                self.after_idle(lambda: getattr(self, "refresh_production", lambda: None)())
         elif selected is self.orders_tab:
             self.queue_orders_refresh(delay=30)
+        elif selected is self.sales_tab:
+            seller_center = self._ensure_module("sales", self.sales_tab)
+            if seller_center is not None:
+                self.after_idle(seller_center.refresh_current)
+        elif selected is self.products_tab:
+            product_catalog = self._ensure_module("products", self.products_tab)
+            if product_catalog is not None:
+                product_catalog.refresh()
+        elif selected is self.commercial_tab:
+            self._ensure_module("commercial", self.commercial_tab)
+        elif selected is self.chat_tab:
+            self._ensure_module("chat", self.chat_tab)
 
     def change_design_limit(self, _event=None):
         """Muestra 50, 100, 200 o 500 diseños sin cambiar los filtros activos."""
@@ -1087,6 +3896,12 @@ class VisionVaultApp(DndRoot):
         self.refresh(self.search.query.get())
 
     def animate_tab_transition(self):
+        """La animación del cambio de pestaña se desactiva para evitar bloqueos en Tk.
+
+        El canvas de transición crea 7 frames con `after(16)` y puede dejar la UI
+        sin responder durante un ciclo completo; el cambio de sección ya se resuelve
+        con la recarga under-demand y no necesita este efecto visual.
+        """
         if not hasattr(self, "tab_transition"):
             return
         if self._tab_transition_after is not None:
@@ -1094,25 +3909,12 @@ class VisionVaultApp(DndRoot):
                 self.after_cancel(self._tab_transition_after)
             except tk.TclError:
                 pass
+        self._tab_transition_after = None
         self._tab_transition_step = 0
-
-        def paint():
-            if not self.tab_transition.winfo_exists():
-                return
-            width = max(1, self.tab_transition.winfo_width())
-            progress = min(1.0, self._tab_transition_step / 7)
+        try:
             self.tab_transition.delete("all")
-            if progress < 1:
-                end = max(2, round(width * progress))
-                self.tab_transition.create_rectangle(0, 0, end, 3, fill=COLORS.wine, outline="")
-                fade_start = max(0, end - 80)
-                self.tab_transition.create_rectangle(fade_start, 0, end, 3, fill=COLORS.wine_active, outline="")
-                self._tab_transition_step += 1
-                self._tab_transition_after = self.after(16, paint)
-            else:
-                self._tab_transition_after = self.after(55, self.tab_transition.delete, "all")
-
-        paint()
+        except tk.TclError:
+            pass
 
     def _format_datetime_display(self, datetime_str: str) -> str:
         """Formatea una fecha ISO en un formato legible con fecha y hora."""
@@ -1293,7 +4095,22 @@ class VisionVaultApp(DndRoot):
         stage = get_current_stage(order)
         progress = get_stage_progress(order)
         time_str = format_time_remaining(order)
-        financials = self.database.order_financials(order_id)
+        # `orders()` ya trae estos totales agregados. Evita dos o más consultas
+        # por ficha cuando hay una cola de pedidos extensa.
+        if "current_budget_total" in order:
+            budget_total = float(order.get("current_budget_total") or 0)
+            paid_amount = float(order.get("current_paid_amount") or 0)
+            pending_amount = max(0.0, budget_total - paid_amount)
+            payment_status = (
+                "Pagado" if budget_total > 0 and pending_amount <= 0.009
+                else ("Seña recibida" if paid_amount else "Pendiente")
+            )
+            financials = {
+                "budget_total": budget_total, "paid_amount": paid_amount,
+                "pending_amount": pending_amount, "payment_status": payment_status,
+            }
+        else:
+            financials = self.database.order_financials(order_id)
         client_type = order.get("client_type") or "Particular"
         client_name = order.get("client_name") or order.get("client") or "Sin cliente"
         delivery = order.get("delivery_date") or "—"
@@ -1336,11 +4153,37 @@ class VisionVaultApp(DndRoot):
             "delivery_date": order.get("delivery_date", ""),
         }
 
+    def _set_orders_quick_filter(self, value: str) -> None:
+        """Activa o desactiva un atajo de la vista de pedidos."""
+        current = self.orders_quick_filter.get() if hasattr(self, "orders_quick_filter") else ""
+        self.orders_quick_filter.set("" if current == value else value)
+        self.refresh_orders()
+
+    @staticmethod
+    def _order_matches_quick_filter(order: dict, quick_filter: str) -> bool:
+        """Evalúa filtros operativos sobre datos ya cargados para el listado."""
+        if not quick_filter:
+            return True
+
+        status = str(order.get("status") or "")
+        is_closed = status in {"Finalizado", "Entregado", "Terminado", "Archivado", "Cancelado"}
+        delivery_date = str(order.get("delivery_date") or "")[:10]
+        today = datetime.now().date().isoformat()
+        budget = float(order.get("current_budget_total") or order.get("price") or 0)
+        paid = float(order.get("current_paid_amount") or order.get("paid_amount") or 0)
+
+        if quick_filter == "today":
+            return not is_closed and delivery_date == today
+        if quick_filter == "overdue":
+            return not is_closed and bool(delivery_date) and delivery_date < today
+        if quick_filter == "balance_due":
+            return budget > 0 and budget - paid > 0.009
+        if quick_filter == "no_delivery_date":
+            return not is_closed and not delivery_date
+        return True
+
     def refresh_orders(self):
         """Borra y vuelve a dibujar todas las fichas de pedidos."""
-        if not hasattr(self, "_orders_cards_frame"):
-            return
-
         if not hasattr(self, "_orders_cards_frame"):
             return
 
@@ -1351,12 +4194,16 @@ class VisionVaultApp(DndRoot):
             "Diseños confirmados": "Diseños confirmados",
             "En producción": "En Armado de Planchas",
             "Listos para imprimir": "Listo para imprimir",
-            "Finalizados": "Finalizado",
+            # La entrega es un cierre definitivo: debe verse junto con los
+            # pedidos finalizados, aunque conserve su estado propio.
+            "Finalizados / entregados": ("Finalizado", "Entregado", "Terminado"),
         }
         pending_only = view == "Pendientes"
         query = self.orders_query.get() if hasattr(self, "orders_query") else ""
         orders = self.database.orders(
             status=status_map.get(view), query=query, pending_only=pending_only)
+        quick_filter = self.orders_quick_filter.get() if hasattr(self, "orders_quick_filter") else ""
+        orders = [order for order in orders if self._order_matches_quick_filter(order, quick_filter)]
 
         # Limpiar fichas anteriores y registros de cuenta regresiva
         for w in self._orders_cards_frame.winfo_children():
@@ -1381,9 +4228,25 @@ class VisionVaultApp(DndRoot):
             urgent = sum(
                 1 for o in orders
                 if calculate_priority(o, estimate_remaining_work(o))[0] in ("Urgente", "Alta"))
+            today = datetime.now().date().isoformat()
+            active_orders = [
+                order for order in orders
+                if str(order.get("status") or "") not in {"Finalizado", "Entregado", "Terminado", "Archivado", "Cancelado"}
+            ]
+            due_today = sum(str(order.get("delivery_date") or "")[:10] == today for order in active_orders)
+            overdue = sum(
+                bool(str(order.get("delivery_date") or "")[:10])
+                and str(order.get("delivery_date") or "")[:10] < today
+                for order in active_orders
+            )
+            with_balance = sum(
+                float(order.get("current_budget_total") or order.get("price") or 0)
+                - float(order.get("current_paid_amount") or order.get("paid_amount") or 0) > 0.009
+                for order in orders
+            )
             self.orders_summary.set(
-                f"{len(orders)} pedidos · {urgent} urgentes · "
-                f"{len(self.database.pending_orders())} pendientes")
+                f"{len(orders)} pedidos · {urgent} urgentes · {due_today} entrega hoy · "
+                f"{overdue} vencidos · {with_balance} con saldo")
             if hasattr(self, "urgent_orders_button_var"):
                 self.urgent_orders_button_var.set(f"🚨 Pedidos urgentes ({urgent})")
 
@@ -1816,14 +4679,14 @@ class VisionVaultApp(DndRoot):
         """Actualiza el texto de cada chip de cuenta regresiva activo."""
         if not hasattr(self, "_countdown_vars"):
             return
-        for var, delivery_date, _ in self._countdown_vars:
+        for var, delivery_date, _, status_text in self._countdown_vars:
             try:
                 # Verificar que el StringVar sigue vivo
                 var.get()
             except tk.TclError:
                 continue
             from app.workflow.estimator import format_time_remaining
-            text = format_time_remaining({"delivery_date": delivery_date})
+            text = format_time_remaining({"delivery_date": delivery_date, "status": status_text})
             var.set(f"⏱ {text}")
         # Reprogramar para dentro de 60 s
         self._countdown_after = self.after(60_000, self._tick_countdowns)
@@ -1954,6 +4817,9 @@ class VisionVaultApp(DndRoot):
                 chip(f"Entrega: {delivery}")
                 countdown_var = tk.StringVar(value=f"⏱ {time_str}")
                 if str(time_str).startswith("Atrasado"):
+                    countdown_bg = COLORS.error
+                    countdown_fg = COLORS.text
+                elif str(payload["delivery_date"] or "")[:10] == datetime.now().date().isoformat():
                     countdown_bg = COLORS.warning
                     countdown_fg = COLORS.text
                 elif "h" in str(time_str) and any(token in str(time_str) for token in ("72", "48", "24")):
@@ -1966,11 +4832,12 @@ class VisionVaultApp(DndRoot):
                 countdown_lbl.pack(side="left", padx=(0, 6))
                 if not hasattr(self, "_countdown_vars"):
                     self._countdown_vars = []
-                self._countdown_vars.append((countdown_var, payload["delivery_date"], priority_color))
+                self._countdown_vars.append((countdown_var, payload["delivery_date"], priority_color, payload.get("status_text", "")))
 
             chip(f"{material} · {qty} u.")
             chip(f"Total: {format_currency(budget_total)}", fg=COLORS.success if payment_status == "Pagado" else COLORS.text)
             chip(f"Saldo: {format_currency(pending_amount) if pending_amount is not None else '—'}", fg=COLORS.warning if (pending_amount or 0) > 0 else COLORS.text)
+            chip(f"Cobro: {payment_status}", fg=COLORS.success if payment_status == "Pagado" else COLORS.warning)
 
             if pending:
                 pending_lbl = tk.Label(chips, text=f"⚠ {pending[:40] + ('…' if len(pending) > 40 else '')}", background=COLORS.wine_soft, foreground=COLORS.warning, font=(UI_FONT, 8), padx=6, pady=4, relief="flat")
@@ -2016,10 +4883,10 @@ class VisionVaultApp(DndRoot):
         menu.add_command(label="Abrir pedido",
                          command=lambda: self.open_order_workspace(order_id))
         menu.add_separator()
-        menu.add_command(label="Archivar orden",
+        menu.add_command(label="Archivar pedido",
                          command=lambda: self._archive_order(order_id))
         menu.add_separator()
-        menu.add_command(label="Eliminar orden",
+        menu.add_command(label="Eliminar pedido",
                          command=lambda: self._delete_order(order_id))
         menu.tk_popup(event.x_root, event.y_root)
         menu.grab_release()
@@ -2082,6 +4949,13 @@ class VisionVaultApp(DndRoot):
             on_open_order=self.open_order_workspace
         )
     
+    def _schedule_timeline_counter_refresh(self):
+        """Actualiza los contadores abiertos sin intervención de la persona."""
+        for order_id, tab in list(self.order_tabs.items()):
+            if tab.winfo_exists() and hasattr(tab, "timeline_status"):
+                self.refresh_order_timeline(order_id)
+        self._timeline_counter_after = self.after(60_000, self._schedule_timeline_counter_refresh)
+
     def refresh_order_timeline(self, order_id: int):
         """Sincroniza estado, porcentaje, opciones y visual de la línea de tiempo."""
         tab = self.order_tabs.get(order_id)
@@ -2098,6 +4972,9 @@ class VisionVaultApp(DndRoot):
             "id": order_id,
             "status": updated_order.get("status", "Nuevo"),
             "material": updated_order.get("material", ""),
+            "created_at": updated_order.get("created_at", ""),
+            "order_date": updated_order.get("order_date", ""),
+            "updated_at": updated_order.get("updated_at", ""),
             "jobs": getattr(tab, "order_job_state", []),
             "design_count": len(tab.order_design_state),
             "confirmed_count": sum(1 for d in tab.order_design_state if d.get("status") == "Confirmado"),
@@ -2106,7 +4983,7 @@ class VisionVaultApp(DndRoot):
         stage = get_current_stage(temp_order)
         progress = get_stage_progress(temp_order)
         
-        tab.timeline_status.set(f"{stage} · {int(progress * 100)}% completado")
+        tab.timeline_status.set(f"Estado del flujo: {stage} · no mide cantidades físicas")
         if hasattr(tab, "status_widget"):
             tab.status_widget.configure(values=order_statuses(temp_order))
         if hasattr(tab, "timeline_visual"):
@@ -2119,39 +4996,71 @@ class VisionVaultApp(DndRoot):
         from app.workflow.timeline import workflow_stages
         
         timeline_stages = format_timeline(order)
-        columns = min(6, len(timeline_stages))
+        columns = min(4, len(timeline_stages))
         for column in range(columns):
             timeline_visual.columnconfigure(column, weight=1, uniform="timeline")
 
         order_id = order.get("id")
         available_stages = workflow_stages(order)
+        stage_times = timeline_stage_times(
+            order, self.database.order_events(order_id, limit=500) if order_id else [],
+        )
         
         for index, (stage_name, symbol) in enumerate(timeline_stages):
             row, column = divmod(index, columns)
             stage_col = tk.Frame(timeline_visual, background=COLORS.panel)
             stage_col.grid(row=row, column=column, padx=6, pady=(0, 8), sticky="nsew")
             is_current_or_done = symbol == "●"
+            # La guía entre hitos convierte los puntos aislados en un
+            # recorrido; se corta al finalizar cada fila del flujo.
+            if column < columns - 1 and index < len(timeline_stages) - 1:
+                next_symbol = timeline_stages[index + 1][1]
+                connector_color = (
+                    COLORS.wine_active
+                    if is_current_or_done and next_symbol == "●"
+                    else COLORS.border
+                )
+                tk.Frame(
+                    stage_col, height=2, background=connector_color, bd=0,
+                ).place(relx=0.5, rely=0.28, relwidth=0.58)
             
             # Crear botón clicable para el círculo
             def make_stage_updater(stage, stage_index):
                 def update_stage():
-                    # Actualizar el estado del pedido a esta etapa
-                    self.database.update_order_status(order_id, stage)
-                    
-                    # Recargar el pedido actualizado desde la base de datos
+                    if stage == "Recibido":
+                        circle_btn.configure(state="disabled")
+                        try:
+                            result = self.order_workflow.accept_order(order_id)
+                        except (RuntimeError, ValueError, InsufficientStockError) as error:
+                            messagebox.showerror("No se pudo aceptar el pedido", str(error), parent=self)
+                            self.status.set(str(error))
+                            circle_btn.configure(state="normal")
+                            return
+                        tab = self.order_tabs.get(order_id)
+                        if tab:
+                            tab.order_values["status"].set(result["new_status"])
+                        self.refresh_order_timeline(order_id)
+                        self.after_idle(self.refresh_orders)
+                        self.after_idle(self._sync_production_board)
+                        self.after_idle(self.refresh_stock_module)
+                        self.status.set(
+                            f"Pedido #{order_id} ya estaba aceptado." if result["already_processed"]
+                            else f"Pedido #{order_id} aceptado para producción."
+                        )
+                        return
+                    try:
+                        self.database.update_order_status(order_id, stage)
+                    except ValueError as error:
+                        messagebox.showwarning("Entrega no disponible", str(error), parent=self)
+                        return
                     tab = self.order_tabs.get(order_id)
                     if tab:
                         updated_order = self.database.order(order_id)
                         if updated_order:
-                            # Actualizar el StringVar del estado
                             tab.order_values["status"].set(updated_order.get("status", stage))
-                    
-                    # Refrescar la línea de tiempo
+                    self._sync_order_stock_from_state(order_id, stage)
                     self.refresh_order_timeline(order_id)
-                    
-                    # Refrescar la lista de pedidos si está visible
                     self.refresh_orders()
-                    
                     self.status.set(f"Estado actualizado a: {stage}")
                 return update_stage
             
@@ -2185,6 +5094,144 @@ class VisionVaultApp(DndRoot):
                 foreground=COLORS.text if is_current_or_done else COLORS.muted,
                 font=(UI_FONT, 8), justify="center",
             ).pack()
+            if stage_name in stage_times:
+                entered_at, left_at = stage_times[stage_name]
+                elapsed = format_stage_elapsed(entered_at, left_at)
+                prefix = "Hace " if left_at is None else ""
+                tk.Label(
+                    stage_col, text=f"{prefix}{elapsed}", background=COLORS.panel,
+                    foreground=COLORS.wine_active if left_at is None else COLORS.muted,
+                    font=(UI_FONT, 8), justify="center",
+                ).pack(pady=(2, 0))
+
+    def _sync_order_stock_from_state(self, order_id: int, state: str) -> None:
+        """Sincroniza stock a partir del estado del pedido usando el servicio de stock."""
+        try:
+            order = self.database.order(order_id)
+            if not order:
+                return
+            jobs = self.database.order_jobs(order_id)
+            if not jobs:
+                return
+            target_state = (state or "").strip().lower()
+            for job in jobs:
+                job_id = job.get("id")
+                if job_id is None:
+                    continue
+                if not job.get("material"):
+                    continue
+                model_id = None
+                rule = self.database.suggest_price(job.get("material", ""), job.get("size", ""), int(job.get("quantity", 1) or 1))
+                if rule and rule.get("variable_cost_model_id"):
+                    model_id = int(rule.get("variable_cost_model_id"))
+                elif rule and rule.get("cost_model_id"):
+                    model_id = int(rule.get("cost_model_id"))
+                if model_id is None:
+                    continue
+                quantity = max(1, int(job.get("quantity", 1) or 1))
+                if target_state in {"recibido", "esperando archivos", "diseños confirmados", "bloqueado", "pendiente", "cancelado", "rechazado"}:
+                    self.stock_cost_price.release_order_reservation(int(job_id))
+                elif target_state in {"listo para armado de planchas", "en armado de planchas", "listo para imprimir", "impresión", "sublimado / laminado", "corte", "control de calidad"}:
+                    try:
+                        self.stock_cost_price.sync_order_job_stock(order_job_id=int(job_id), state="reserved", cost_model_id=model_id, production_quantity=quantity)
+                    except InsufficientStockError:
+                        self.status.set(f"Stock insuficiente al reservar material para el pedido #{order_id}.")
+                elif target_state in {"finalizado", "entregado"}:
+                    try:
+                        self.stock_cost_price.sync_order_job_stock(order_job_id=int(job_id), state="completed", cost_model_id=model_id, production_quantity=quantity)
+                    except Exception:
+                        pass
+        except Exception as error:
+            self.status.set(f"No se pudo sincronizar stock para el pedido #{order_id}: {error}")
+
+    def _on_board_order_selected(self, _event=None):
+        """Abre el pedido seleccionado desde el tablero de producción."""
+        board = getattr(self, "production_board", None)
+        if board is None:
+            return
+
+        order_id = board.get_selected_order_id()
+        if order_id is None:
+            return
+
+        self._selected_order_id = order_id
+        self.open_order_workspace(order_id)
+    
+    def _on_board_order_open_detail(self, _event=None):
+        """Abre el detalle completo del pedido con doble click desde el tablero de producción."""
+        board = getattr(self, "production_board", None)
+        if board is None:
+            return
+
+        order_id = board.get_selected_order_id()
+        if order_id is None:
+            return
+
+        self._selected_order_id = order_id
+        # Abrir el workspace del pedido y navegar a la pestaña de Pedidos
+        self.open_order_workspace(order_id)
+        # Cambiar a la pestaña de Pedidos para mostrar el detalle completo
+        if hasattr(self, '_main_notebook'):
+            self._main_notebook.select(0)  # Asumiendo que Pedidos es la primera pestaña
+    
+    def _on_open_order_workspace(self, _event=None):
+        """Abre el workspace del pedido original desde el tablero de producción."""
+        board = getattr(self, "production_board", None)
+        if board is None:
+            return
+        order_id = board.get_selected_order_id()
+        if order_id:
+            self._selected_order_id = order_id
+            self.open_order_workspace(order_id)
+    
+    def _on_change_order_stage(self, event):
+        """Maneja solicitud de cambio de etapa desde el tablero."""
+        order_id = event.payload.get("order_id") if hasattr(event, 'payload') else None
+        if order_id:
+            # Emitir evento para abrir diálogo de cambio de etapa
+            self._event_bus.publish(
+                event_type="production.change_stage_dialog",
+                title="Cambiar etapa",
+                message=f"Pedido #{order_id}",
+                priority="normal",
+                entity_type="order",
+                entity_id=order_id,
+                payload={"order_id": order_id, "action": "change_stage"},
+            )
+    
+    def _on_view_order_history(self, event):
+        """Maneja solicitud de ver historial desde el tablero."""
+        order_id = event.payload.get("order_id") if hasattr(event, 'payload') else None
+        if order_id:
+            self._event_bus.publish(
+                event_type="production.history_dialog",
+                title="Ver historial",
+                message=f"Pedido #{order_id}",
+                priority="normal",
+                entity_type="order",
+                entity_id=order_id,
+                payload={"order_id": order_id, "action": "view_history"},
+            )
+    
+    def _on_open_plancha(self, event):
+        """Maneja solicitud de abrir plancha desde el tablero."""
+        order_id = event.payload.get("order_id") if hasattr(event, 'payload') else None
+        if order_id:
+            self._event_bus.publish(
+                event_type="production.open_plancha",
+                title="Abrir plancha",
+                message=f"Pedido #{order_id}",
+                priority="normal",
+                entity_type="order",
+                entity_id=order_id,
+                payload={"order_id": order_id, "action": "open_plancha"},
+            )
+    
+    def _sync_production_board(self):
+        """Sincroniza el tablero de producción cuando hay cambios en pedidos."""
+        board = getattr(self, "production_board", None)
+        if board and hasattr(board, 'refresh'):
+            board.refresh()
 
 # Module-level export helpers (moved here so the class body is uninterrupted)
 def write_orders_csv(orders: list[dict], path: str) -> None:
@@ -2241,9 +5288,9 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         for widget in self.notifications_frame.winfo_children():
             widget.destroy()
         
-        # Obtener pedidos activos (no archivados ni finalizados)
+        # Obtener pedidos activos (no archivados, finalizados ni entregados)
         all_orders = self.database.orders()
-        active_orders = [o for o in all_orders if o.get("status") not in ("Finalizado", "Archivado")]
+        active_orders = [o for o in all_orders if o.get("status") not in ("Finalizado", "Archivado", "Entregado", "Terminado")]
         
         # Si no hay pedidos activos
         if not active_orders:
@@ -2369,6 +5416,320 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             foreground=COLORS.muted,
             font=(IDENTITY_FONT, 8, "bold")
         ).pack(pady=(6, 3))
+
+    def open_configuration_window(self):
+        """Ventana de configuración y herramientas con pestañas organizadas."""
+        # If window already exists, focus it instead of creating a new one
+        if self._config_window and self._config_window.winfo_exists():
+            self._config_window.focus()
+            self._config_window.lift()
+            return
+        # Si la persona abre Configuración durante el primer segundo, preparar
+        # aquí las dependencias que consumen sus paneles en vez de dejar campos
+        # apuntando a un servidor todavía inexistente.
+        self._initialize_deferred_startup_services()
+        
+        dialog = tk.Toplevel(self)
+        dialog.title("Configuración y herramientas")
+        dialog.configure(background=COLORS.background)
+        dialog.transient(self)
+        dialog.geometry("820x560")
+        dialog.minsize(720, 500)
+        self._config_window = dialog
+        
+        # Handle window destruction
+        def on_destroy():
+            self._config_window = None
+            dialog.destroy()
+        dialog.protocol("WM_DELETE_WINDOW", on_destroy)
+
+        # --- Encabezado ---
+        header = tk.Frame(dialog, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
+        header.pack(fill="x", padx=12, pady=(12, 0))
+        tk.Label(header, text="CONFIGURACIÓN Y HERRAMIENTAS", background=COLORS.panel, foreground=COLORS.wine_active,
+                 font=(IDENTITY_FONT, 13, "bold")).pack(side="left", padx=14, pady=10)
+        tk.Label(header, text="Biblioteca · Análisis · Seguridad · Preferencias", background=COLORS.panel,
+                 foreground=COLORS.muted, font=(UI_FONT, 9)).pack(side="left", padx=(0, 14), pady=10)
+
+        # --- Pestañas internas ---
+        notebook = ttk.Notebook(dialog)
+        notebook.pack(fill="both", expand=True, padx=12, pady=12)
+
+        # Pestaña Biblioteca
+        library_tab = ttk.Frame(notebook)
+        notebook.add(library_tab, text="Biblioteca")
+        self._build_config_library(library_tab)
+
+        # Pestaña Análisis e IA
+        ai_tab = ttk.Frame(notebook)
+        notebook.add(ai_tab, text="Análisis e IA")
+        self._build_config_ai(ai_tab)
+
+        # Pestaña General
+        general_tab = ttk.Frame(notebook)
+        notebook.add(general_tab, text="General")
+        self._build_config_general(general_tab)
+
+        # Pestaña Acceso móvil
+        mobile_access_tab = ttk.Frame(notebook)
+        notebook.add(mobile_access_tab, text="Acceso móvil")
+        def build_mobile_access():
+            for child in mobile_access_tab.winfo_children():
+                child.destroy()
+            self._initialize_deferred_startup_services()
+            if self._mobile_jobs_server is not None and self._mobile_jobs_server.is_running:
+                MobileSecurityPanel(
+                    mobile_access_tab,
+                    repository=self._mobile_jobs_server.access_control,
+                    users_repository=self._mobile_jobs_server.mobile_users,
+                    status_callback=self.status.set,
+                )
+                return
+            tk.Label(
+                mobile_access_tab,
+                text="REVISIÓN POR FALLA\n\nLa API móvil no está conectada. Revisá General y reintentá el diagnóstico.",
+                background=COLORS.panel,
+                foreground=COLORS.wine_active,
+                justify="center",
+                wraplength=480,
+            ).pack(fill="x", padx=20, pady=(40, 12))
+            ttk.Button(
+                mobile_access_tab,
+                text="Reintentar conexión",
+                command=build_mobile_access,
+                style="Primary.TButton",
+            ).pack()
+        build_mobile_access()
+
+        # Pestaña de contenido y comportamiento remoto de la app.
+        mobile_runtime_tab = ttk.Frame(notebook)
+        notebook.add(mobile_runtime_tab, text="App móvil")
+        MobileRuntimeSettingsPanel(
+            mobile_runtime_tab,
+            database=self.database,
+            status_callback=self.status.set,
+        ).pack(fill="both", expand=True)
+
+        # Pie
+        footer = tk.Frame(dialog, background=COLORS.background)
+        footer.pack(fill="x", padx=12, pady=(0, 12))
+        ttk.Button(footer, text="Cerrar", command=on_destroy, style="Secondary.TButton").pack(side="right")
+
+    def _build_config_library(self, parent: tk.Widget):
+        """Construye la pestaña Biblioteca con las herramientas de indexación y escaneo."""
+        container = tk.Frame(parent, background=COLORS.panel)
+        container.pack(fill="both", expand=True, padx=16, pady=16)
+        
+        tk.Label(container, text="HERRAMIENTAS DE BIBLIOTECA", background=COLORS.panel, foreground=COLORS.wine_active,
+                 font=(IDENTITY_FONT, 11, "bold")).pack(anchor="w", pady=(0, 12))
+        tk.Label(container, text="Indexá carpetas y escaneá diseños con IA para mejorar la búsqueda.",
+                 background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 9),
+                 wraplength=400, justify="left").pack(anchor="w", pady=(0, 20))
+        
+        # Botones de biblioteca
+        ttk.Button(container, text="Escanear biblioteca", command=self.start_full_gemini_scan,
+                   style="Primary.TButton").pack(fill="x", pady=(0, 10))
+        ttk.Button(container, text="Revisar etiquetas sugeridas", command=self.open_ai_review_queue,
+                   style="Secondary.TButton").pack(fill="x", pady=(0, 10))
+        ttk.Button(container, text="Ver carpeta monitoreada", command=self.show_monitored_folder,
+                   style="Secondary.TButton").pack(fill="x", pady=(0, 10))
+        ttk.Button(container, text="Reemplazar índice con carpeta", command=self.replace_index_with_folder,
+                   style="Secondary.TButton").pack(fill="x", pady=(0, 10))
+        ttk.Button(container, text="Agregar carpeta al índice", command=self.add_folder_to_index,
+                   style="Secondary.TButton").pack(fill="x")
+
+        ttk.Separator(container, orient="horizontal").pack(fill="x", pady=18)
+        tk.Label(container, text="CATÁLOGO DE LA APP MÓVIL", background=COLORS.panel, foreground=COLORS.wine_active,
+                 font=(IDENTITY_FONT, 11, "bold")).pack(anchor="w", pady=(0, 6))
+        tk.Label(container, text="Elegí qué diseños puede ver y vender la app.", background=COLORS.panel,
+                 foreground=COLORS.muted, font=(UI_FONT, 9), wraplength=420, justify="left").pack(anchor="w", pady=(0, 8))
+        catalog_access = tk.StringVar(value=self.database.app_setting("mobile_catalog.access_mode", "all"))
+
+        def save_catalog_access() -> None:
+            self.database.save_app_setting("mobile_catalog.access_mode", catalog_access.get())
+            mode_text = "todo el catálogo" if catalog_access.get() == "all" else "solo los diseños habilitados"
+            self.status.set(f"La app móvil ahora muestra {mode_text}.")
+
+        ttk.Radiobutton(container, text="Solo diseños habilitados", variable=catalog_access, value="selected",
+                        command=save_catalog_access).pack(anchor="w", pady=2)
+        tk.Label(container, text="Publicá un diseño al incorporarlo a Biblioteca.", background=COLORS.panel,
+                 foreground=COLORS.muted, font=(UI_FONT, 8)).pack(anchor="w", padx=24)
+        ttk.Radiobutton(container, text="Todo el catálogo", variable=catalog_access, value="all",
+                        command=save_catalog_access).pack(anchor="w", pady=(8, 2))
+        tk.Label(container, text="Muestra todos los diseños indexados desde la app móvil.", background=COLORS.panel,
+                 foreground=COLORS.muted, font=(UI_FONT, 8)).pack(anchor="w", padx=24)
+
+    def _build_config_ai(self, parent: tk.Widget):
+        """Construye la pestaña Análisis e IA con los controles de proveedor y configuración."""
+        container = tk.Frame(parent, background=COLORS.panel)
+        container.pack(fill="both", expand=True, padx=16, pady=16)
+        
+        tk.Label(container, text="ANÁLISIS E INTELIGENCIA ARTIFICIAL", background=COLORS.panel, foreground=COLORS.wine_active,
+                 font=(IDENTITY_FONT, 11, "bold")).pack(anchor="w", pady=(0, 12))
+        tk.Label(container, text="Configurá el proveedor de análisis y las credenciales de Gemini.",
+                 background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 9),
+                 wraplength=400, justify="left").pack(anchor="w", pady=(0, 20))
+        
+        # Controles de ANÁLISIS
+        ai_frame = tk.Frame(container, background=COLORS.panel)
+        ai_frame.pack(fill="x", pady=(0, 16))
+        
+        tk.Label(ai_frame, text="ANÁLISIS", background=COLORS.panel, foreground=COLORS.muted,
+                 font=(IDENTITY_FONT, 9, "bold")).pack(side="left", padx=(0, 8))
+        provider = ttk.Combobox(ai_frame, textvariable=self.ai_provider, values=("Local", "Gemini"),
+                                state="readonly", width=12)
+        provider.pack(side="left")
+        provider.bind("<<ComboboxSelected>>", lambda _event: (self.save_settings(), self.connect_gemini_on_startup()))
+        
+        ttk.Button(container, text="Configurar Gemini", command=self.configure_gemini,
+                   style="Primary.TButton").pack(fill="x", pady=(8, 0))
+
+    def _build_config_general(self, parent: tk.Widget):
+        """Muestra conexiones reales y conserva toda falla para revisión."""
+        container = tk.Frame(parent, background=COLORS.panel)
+        container.pack(fill="both", expand=True, padx=16, pady=16)
+
+        tk.Label(container, text="ESTADO DE CONEXIONES", background=COLORS.panel, foreground=COLORS.wine_active,
+                 font=(IDENTITY_FONT, 11, "bold")).pack(anchor="w", pady=(0, 12))
+        tk.Label(
+            container,
+            text="Los componentes se verifican localmente. Una falla queda visible y puede reintentarse sin cerrar Doccione Studio.",
+            background=COLORS.panel,
+            foreground=COLORS.muted,
+            font=(UI_FONT, 9),
+            wraplength=680,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 12))
+        rows = tk.Frame(container, background=COLORS.panel)
+        rows.pack(fill="both", expand=True)
+
+        def refresh_review():
+            self._initialize_deferred_startup_services()
+            for child in rows.winfo_children():
+                child.destroy()
+            for index, (component, state, detail) in enumerate(self._collect_connection_statuses()):
+                row = tk.Frame(
+                    rows,
+                    background=COLORS.panel_elevated if index % 2 == 0 else COLORS.panel,
+                )
+                row.pack(fill="x", pady=1)
+                row.columnconfigure(1, weight=1)
+                tk.Label(
+                    row, text=component, background=row.cget("background"), foreground=COLORS.text,
+                    font=(UI_FONT, 9, "bold"), width=24, anchor="w",
+                ).grid(row=0, column=0, sticky="w", padx=9, pady=6)
+                color = {
+                    "Conectado": "#198754",
+                    "Disponible": "#4778a8",
+                    "Pendiente": "#a96b00",
+                    "Revisión por falla": COLORS.wine_active,
+                }.get(state, COLORS.muted)
+                tk.Label(
+                    row, text=state, background=row.cget("background"), foreground=color,
+                    font=(UI_FONT, 9, "bold"), width=19, anchor="w",
+                ).grid(row=0, column=1, sticky="w", padx=6, pady=6)
+                tk.Label(
+                    row, text=detail, background=row.cget("background"), foreground=COLORS.muted,
+                    font=(UI_FONT, 8), anchor="w", justify="left", wraplength=300,
+                ).grid(row=0, column=2, sticky="ew", padx=9, pady=6)
+
+        actions = tk.Frame(container, background=COLORS.panel)
+        actions.pack(fill="x", pady=(12, 0))
+        ttk.Button(
+            actions,
+            text="Revisar y reintentar conexiones",
+            command=refresh_review,
+            style="Primary.TButton",
+        ).pack(side="left")
+        refresh_review()
+
+    def _audit_unconnected_buttons(self) -> list[str]:
+        """Detecta botones utilizables que no tienen command ni enlace de clic."""
+        pending = []
+        stack = [self]
+        while stack:
+            widget = stack.pop()
+            try:
+                stack.extend(widget.winfo_children())
+            except (AttributeError, tk.TclError):
+                continue
+            if not isinstance(widget, (tk.Button, ttk.Button)):
+                continue
+            try:
+                state = str(widget.cget("state"))
+                command = str(widget.cget("command")).strip()
+                click_binding = str(widget.bind("<Button-1>") or "").strip()
+                visible = bool(widget.winfo_ismapped())
+                if visible and state != "disabled" and not command and not click_binding:
+                    pending.append(str(widget.cget("text") or widget.winfo_name()))
+            except (AttributeError, tk.TclError):
+                continue
+        return pending
+
+    def _collect_connection_statuses(self) -> list[tuple[str, str, str]]:
+        """Resume servicios, campos interactivos y módulos cargados bajo demanda."""
+        statuses: list[tuple[str, str, str]] = []
+        try:
+            self.database.connection.execute("SELECT 1").fetchone()
+            statuses.append(("Base de datos", "Conectado", f"{self.database.count()} diseños indexados"))
+        except Exception as error:
+            self._record_connection_failure("Base de datos", error)
+        controls = self._audit_unconnected_buttons()
+        if controls:
+            detail = ", ".join(controls[:4])
+            if len(controls) > 4:
+                detail += f" y {len(controls) - 4} más"
+            self._connection_failures["Controles UI"] = detail
+        else:
+            self._connection_failures.pop("Controles UI", None)
+            statuses.append(("Controles UI", "Conectado", "Sin botones visibles desconectados"))
+        mobile_connected = bool(
+            self._mobile_jobs_server is not None and self._mobile_jobs_server.is_running
+        )
+        statuses.append((
+            "API móvil",
+            "Conectado" if mobile_connected else "Pendiente",
+            "Servidor local preparado" if mobile_connected else "Inicializando servicio",
+        ))
+        statuses.append((
+            "Notificaciones",
+            "Conectado" if self._notification_service is not None else "Pendiente",
+            "Servicio preparado" if self._notification_service is not None else "Inicializando servicio",
+        ))
+        try:
+            quiet_from = self.database.app_setting("notifications.quiet_from", "23:00")
+            quiet_to = self.database.app_setting("notifications.quiet_to", "07:00")
+            quiet_detail = "Desactivado" if quiet_from == quiet_to else f"Retención local {quiet_from}–{quiet_to}"
+            statuses.append(("Horario silencioso", "Conectado", quiet_detail))
+        except Exception as error:
+            self._record_connection_failure("Horario silencioso", error)
+        maintenance_pending = bool(getattr(self.database, "automatic_maintenance_pending", False))
+        statuses.append((
+            "Integridad y respaldo",
+            "Pendiente" if maintenance_pending else "Conectado",
+            "Verificando en segundo plano" if maintenance_pending else "Control automático completado",
+        ))
+        module_labels = {
+            "production": "Producción",
+            "products": "Productos",
+            "sales": "Ventas",
+            "commercial": "Gestión comercial",
+            "chat": "Chat",
+        }
+        for name, info in self.module_registry.statuses().items():
+            label = module_labels.get(name, name.title())
+            if info["error"]:
+                self._connection_failures[f"Módulo {name}"] = str(info["error"])
+            elif info["loaded"]:
+                statuses.append((label, "Conectado", f"Carga {float(info['load_ms']):.0f} ms"))
+            else:
+                statuses.append((label, "Disponible", "Se conecta al abrir la sección"))
+        recorded = {component for component, _state, _detail in statuses}
+        for component, detail in sorted(self._connection_failures.items()):
+            if component in recorded:
+                statuses[:] = [item for item in statuses if item[0] != component]
+            statuses.append((component, "Revisión por falla", detail))
+        return statuses
 
     def open_notification_center(self):
         """Centro de notificaciones: historial de eventos, dispositivos y pruebas."""
@@ -2501,6 +5862,13 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             token_short = device["push_token"][:16] + "..."
             tk.Label(info, text=f"{name} ({platform})", background=COLORS.panel_elevated,
                      foreground=COLORS.text, font=(UI_FONT, 10, "bold"), anchor="w").pack(anchor="w")
+            seller = (
+                device.get("display_name")
+                or device.get("username")
+                or "Dispositivo histórico"
+            )
+            tk.Label(info, text=f"Vendedor: {seller}", background=COLORS.panel_elevated,
+                     foreground=COLORS.muted, font=(UI_FONT, 8), anchor="w").pack(anchor="w")
             tk.Label(info, text=f"Token: {token_short}", background=COLORS.panel_elevated,
                      foreground=COLORS.muted, font=(UI_FONT, 8), anchor="w").pack(anchor="w")
             last = device.get("last_seen_at", "")[:16].replace("T", " ") if device.get("last_seen_at") else "Desconocido"
@@ -2592,12 +5960,29 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         """Abre un diálogo de emparejamiento con código temporal de 6 dígitos.
 
         Flujo seguro:
-        1. PC genera código temporal (6 dígitos, válido 5 min, uso único, almacenado como hash).
-        2. Celular ingresa el código manualmente en Doccione Mobile.
-        3. Celular envía código + token FCM a la PC vía HTTP.
-        4. PC valida el código y registra el dispositivo automáticamente.
+        1. El vendedor inicia sesión con su usuario y contraseña.
+        2. PC genera código temporal (6 dígitos, válido 5 min, uso único).
+        3. Celular envía autorización temporal + código + token FCM.
+        4. PC vincula la cuenta y entrega una sesión persistente revocable.
         """
         import json as _json
+
+        active_users = [
+            user
+            for user in self._mobile_jobs_server.mobile_users.list_users()
+            if user.active
+        ]
+        if not active_users:
+            messagebox.showwarning(
+                "Falta un vendedor",
+                (
+                    "Creá al menos un vendedor antes de generar el código.\n\n"
+                    "Abrí Configuración → Acceso móvil → "
+                    "Vendedores y contraseñas."
+                ),
+                parent=parent,
+            )
+            return
 
         # Generar código en la base de datos
         code = self._event_repo.create_pairing_code()
@@ -2637,11 +6022,11 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         info_frame.pack(fill="x", pady=(0, 12))
         tk.Label(info_frame, text="Instrucciones:", background=COLORS.panel_elevated,
                  foreground=COLORS.text, font=(UI_FONT, 9, "bold")).pack(anchor="w", padx=8, pady=(6, 4))
-        tk.Label(info_frame, text="1. Abre Doccione Mobile en tu celular", background=COLORS.panel_elevated,
+        tk.Label(info_frame, text="1. Iniciá sesión con el usuario del vendedor", background=COLORS.panel_elevated,
                  foreground=COLORS.text, font=(UI_FONT, 9)).pack(anchor="w", padx=8)
-        tk.Label(info_frame, text="2. Ingresa el código de 6 dígitos", background=COLORS.panel_elevated,
+        tk.Label(info_frame, text="2. Ingresá este código de 6 dígitos", background=COLORS.panel_elevated,
                  foreground=COLORS.text, font=(UI_FONT, 9)).pack(anchor="w", padx=8)
-        tk.Label(info_frame, text="3. El dispositivo se vinculará automáticamente", background=COLORS.panel_elevated,
+        tk.Label(info_frame, text="3. El dispositivo quedará vinculado y entrará automáticamente", background=COLORS.panel_elevated,
                  foreground=COLORS.text, font=(UI_FONT, 9)).pack(anchor="w", padx=8, pady=(0, 6))
 
         # Botones
@@ -2667,6 +6052,11 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
 
     def _build_notification_settings(self, parent):
         """Configuración global de notificaciones."""
+        quiet_from = self.database.app_setting("notifications.quiet_from", "23:00")
+        quiet_to = self.database.app_setting("notifications.quiet_to", "07:00")
+        errors_bypass = self.database.app_setting("notifications.quiet_errors_bypass", "1").lower() not in {
+            "0", "false", "no", "off",
+        }
         # Horario silencioso
         frame = tk.Frame(parent, background=COLORS.panel_elevated, highlightthickness=1, highlightbackground=COLORS.border)
         frame.pack(fill="x", padx=10, pady=10)
@@ -2682,19 +6072,57 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         quiet_frame.pack(anchor="w")
         tk.Label(quiet_frame, text="Desde:", background=COLORS.panel_elevated, foreground=COLORS.text,
                  font=(UI_FONT, 9)).pack(side="left")
-        self._quiet_from = tk.StringVar(value="23:00")
+        self._quiet_from = tk.StringVar(value=quiet_from)
         ttk.Combobox(quiet_frame, textvariable=self._quiet_from,
                      values=[f"{h:02d}:00" for h in range(24)], width=6, state="readonly").pack(side="left", padx=(4, 12))
         tk.Label(quiet_frame, text="Hasta:", background=COLORS.panel_elevated, foreground=COLORS.text,
                  font=(UI_FONT, 9)).pack(side="left")
-        self._quiet_to = tk.StringVar(value="07:00")
+        self._quiet_to = tk.StringVar(value=quiet_to)
         ttk.Combobox(quiet_frame, textvariable=self._quiet_to,
                      values=[f"{h:02d}:00" for h in range(24)], width=6, state="readonly").pack(side="left", padx=4)
 
         # Errores ignoran silencio
-        self._errors_bypass_quiet = tk.BooleanVar(value=True)
+        self._errors_bypass_quiet = tk.BooleanVar(value=errors_bypass)
         ttk.Checkbutton(inner, text="Errores urgentes ignoran horario silencioso",
                         variable=self._errors_bypass_quiet).pack(anchor="w", pady=(10, 0))
+        tk.Label(
+            inner,
+            text="Usá la misma hora de inicio y fin para desactivar el horario silencioso.",
+            background=COLORS.panel_elevated,
+            foreground=COLORS.muted,
+            font=(UI_FONT, 8),
+        ).pack(anchor="w", pady=(4, 0))
+
+        quiet_feedback = tk.StringVar(value="")
+
+        def save_quiet_hours():
+            try:
+                self.database.save_app_setting("notifications.quiet_from", self._quiet_from.get())
+                self.database.save_app_setting("notifications.quiet_to", self._quiet_to.get())
+                self.database.save_app_setting(
+                    "notifications.quiet_errors_bypass",
+                    "1" if self._errors_bypass_quiet.get() else "0",
+                )
+                self._connection_failures.pop("Horario silencioso", None)
+                quiet_feedback.set("Configuración guardada y conectada al servicio de envíos.")
+                self.status.set("Horario silencioso de notificaciones actualizado.")
+            except Exception as error:
+                self._record_connection_failure("Horario silencioso", error)
+                quiet_feedback.set(f"REVISIÓN POR FALLA: {error}")
+
+        ttk.Button(
+            inner,
+            text="Guardar horario silencioso",
+            command=save_quiet_hours,
+            style="Primary.TButton",
+        ).pack(anchor="w", pady=(10, 0))
+        tk.Label(
+            inner,
+            textvariable=quiet_feedback,
+            background=COLORS.panel_elevated,
+            foreground=COLORS.muted,
+            font=(UI_FONT, 8),
+        ).pack(anchor="w", pady=(4, 0))
 
         # Info Firebase
         info = tk.Frame(parent, background=COLORS.panel_elevated, highlightthickness=1, highlightbackground=COLORS.border)
@@ -2739,7 +6167,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 pass
 
     def new_order_dialog(self):
-        """Alta rápida: solo identifica el pedido antes de abrir su ficha completa."""
+        """Alta completa: crea cabecera, trabajos y demanda en un único flujo."""
         dialog = tk.Toplevel(self)
         dialog.title("Crear pedido")
         dialog.configure(background=COLORS.background)
@@ -2754,13 +6182,101 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             background=COLORS.panel_elevated, foreground=COLORS.text,
             arrowcolor=COLORS.text, padding=(8, 6),
         )
-        client_var, delivery_var = tk.StringVar(), tk.StringVar()
+        delivery_var = tk.StringVar()
         order_date_var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
         concept_var = tk.StringVar(value="")
         description_var = tk.StringVar(value="")
         client_type_var = tk.StringVar(value="Particular")
-        client_hint = tk.StringVar(value="Escribí para buscar un cliente existente.")
-        last_query = {"value": ""}
+        draft_jobs = []
+        draft_designs = []
+        
+        # Customer autocomplete widget
+        customer_autocomplete = None
+
+        def show_new_customer_dialog():
+            """Show inline dialog to create a new customer."""
+            nonlocal customer_autocomplete
+            new_dialog = tk.Toplevel(dialog)
+            new_dialog.title("Nuevo cliente")
+            new_dialog.configure(background=COLORS.background)
+            new_dialog.transient(dialog)
+            new_dialog.grab_set()
+            new_dialog.geometry("400x320")
+            new_dialog.resizable(False, False)
+            
+            header = tk.Frame(new_dialog, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
+            header.pack(fill="x", padx=18, pady=(18, 12))
+            tk.Label(header, text="NUEVO CLIENTE", background=COLORS.panel, foreground=COLORS.text,
+                     font=(IDENTITY_FONT, 14, "bold")).pack(anchor="w", padx=20, pady=(12, 3))
+            tk.Label(header, text="Ingresá los datos del cliente nuevo.", background=COLORS.panel, foreground=COLORS.muted,
+                     font=(UI_FONT, 9)).pack(anchor="w", padx=20, pady=(0, 12))
+            
+            form = tk.Frame(new_dialog, background=COLORS.background)
+            form.pack(fill="both", expand=True, padx=30, pady=(2, 0))
+            form.columnconfigure(1, weight=1)
+            
+            tk.Label(form, text="Nombre", background=COLORS.background, foreground=COLORS.text,
+                     font=(UI_FONT, 10, "bold")).grid(row=0, column=0, sticky="w", pady=(8, 6), padx=(0, 12))
+            name_var = tk.StringVar()
+            name_entry = tk.Entry(form, textvariable=name_var, background=COLORS.field, foreground=COLORS.text,
+                                 insertbackground=COLORS.text, relief="flat", highlightthickness=1,
+                                 highlightbackground=COLORS.border, highlightcolor=COLORS.wine_active, font=(UI_FONT, 11))
+            name_entry.grid(row=0, column=1, sticky="ew", pady=(8, 6))
+            
+            tk.Label(form, text="WhatsApp", background=COLORS.background, foreground=COLORS.text,
+                     font=(UI_FONT, 10, "bold")).grid(row=1, column=0, sticky="w", pady=(6, 6), padx=(0, 12))
+            whatsapp_var = tk.StringVar()
+            whatsapp_entry = tk.Entry(form, textvariable=whatsapp_var, background=COLORS.field, foreground=COLORS.text,
+                                       insertbackground=COLORS.text, relief="flat", highlightthickness=1,
+                                       highlightbackground=COLORS.border, highlightcolor=COLORS.wine_active, font=(UI_FONT, 11))
+            whatsapp_entry.grid(row=1, column=1, sticky="ew", pady=(6, 6))
+            
+            tk.Label(form, text="Tipo", background=COLORS.background, foreground=COLORS.text,
+                     font=(UI_FONT, 10, "bold")).grid(row=2, column=0, sticky="w", pady=(6, 6), padx=(0, 12))
+            type_var = tk.StringVar(value="Particular")
+            type_combo = ttk.Combobox(form, textvariable=type_var, values=("Particular", "Empresa", "Revendedor", "VIP"),
+                                     state="readonly", style="QuickOrder.TCombobox")
+            type_combo.grid(row=2, column=1, sticky="ew", pady=(6, 6))
+            
+            def create_customer():
+                name = name_var.get().strip()
+                if not name:
+                    messagebox.showwarning("Nuevo cliente", "Indicá el nombre del cliente.", parent=new_dialog)
+                    name_entry.focus_set()
+                    return
+                
+                whatsapp = whatsapp_var.get().strip()
+                client_type = type_var.get().strip()
+                
+                # Create customer using database method
+                from datetime import datetime
+                now = datetime.now().isoformat(timespec="seconds")
+                cursor = self.database.connection.execute(
+                    "INSERT INTO clients (name, whatsapp, created_at, updated_at, client_type) VALUES (?, ?, ?, ?, ?)",
+                    (name, whatsapp, now, now, client_type)
+                )
+                customer_id = cursor.lastrowid
+                self.database.connection.commit()
+                
+                # Refresh autocomplete and select the new customer
+                customer_autocomplete.refresh()
+                customer_autocomplete.set_customer(customer_id, name, whatsapp, client_type)
+                
+                # Update client type in dialog
+                client_type_var.set(client_type)
+                
+                new_dialog.destroy()
+                Toast(dialog, f"Cliente '{name}' creado correctamente", tone="success")
+            
+            actions = tk.Frame(new_dialog, background=COLORS.background)
+            actions.pack(fill="x", padx=30, pady=(20, 24))
+            ttk.Button(actions, text="Cancelar", command=new_dialog.destroy, style="Secondary.TButton").pack(side="right")
+            ttk.Button(actions, text="Crear", command=create_customer, style="Primary.TButton").pack(side="right", padx=(0, 9))
+            
+            new_dialog.bind("<Return>", lambda e: create_customer())
+            new_dialog.bind("<Escape>", lambda e: new_dialog.destroy())
+            self.center_window(new_dialog)
+            name_entry.focus_set()
 
         header = tk.Frame(dialog, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
         header.pack(fill="x", padx=18, pady=(18, 12))
@@ -2768,12 +6284,31 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                  font=(IDENTITY_FONT, 19, "bold")).pack(anchor="w", padx=20, pady=(16, 3))
         tk.Label(
             header,
-            text="Ingrese los datos mínimos para crear el pedido. Luego podrá completar el resto de la información.",
+            text="Cargá el cliente, los trabajos y sus diseños. También podés guardar incompleto: Producción indicará qué falta.",
             background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 10), wraplength=500, justify="left",
         ).pack(anchor="w", padx=20, pady=(0, 16))
 
-        form = tk.Frame(dialog, background=COLORS.background)
-        form.pack(fill="both", expand=True, padx=30, pady=(2, 0))
+        # El alta rápida puede tener más campos que la altura disponible.
+        # Dejamos el encabezado y las acciones fijos, y desplazamos únicamente
+        # los campos para que nunca queden cortados en pantallas pequeñas.
+        form_shell = tk.Frame(dialog, background=COLORS.background)
+        form_shell.pack(fill="both", expand=True, padx=30, pady=(2, 0))
+        form_canvas = tk.Canvas(form_shell, background=COLORS.background, highlightthickness=0)
+        form_scroll = ttk.Scrollbar(form_shell, orient="vertical", command=form_canvas.yview)
+        form_canvas.configure(yscrollcommand=form_scroll.set)
+        form_canvas.pack(side="left", fill="both", expand=True)
+        form_scroll.pack(side="right", fill="y")
+        form = tk.Frame(form_canvas, background=COLORS.background)
+        form_window = form_canvas.create_window((0, 0), window=form, anchor="nw")
+        form.bind("<Configure>", lambda _event: form_canvas.configure(scrollregion=form_canvas.bbox("all")))
+        form_canvas.bind("<Configure>", lambda event: form_canvas.itemconfigure(form_window, width=event.width))
+
+        def scroll_form(event):
+            form_canvas.yview_scroll(-1 * int(event.delta / 120), "units")
+            return "break"
+
+        form_canvas.bind("<MouseWheel>", scroll_form)
+        form.bind("<MouseWheel>", scroll_form)
         form.columnconfigure(0, weight=1)
 
         def label(text, row, top=0):
@@ -2781,37 +6316,21 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                      font=(UI_FONT, 10, "bold")).grid(row=row, column=0, sticky="w", pady=(top, 6))
 
         label("Cliente", 0)
-        client_combo = ttk.Combobox(form, textvariable=client_var, style="QuickOrder.TCombobox", font=(UI_FONT, 11))
-        client_combo.grid(row=1, column=0, sticky="ew")
-        tk.Label(form, textvariable=client_hint, background=COLORS.background, foreground=COLORS.muted,
-                 font=(UI_FONT, 9)).grid(row=2, column=0, sticky="w", pady=(4, 17))
+        
+        # Customer autocomplete with inline creation
+        def apply_existing_customer(customer):
+            """Completa la ficha rápida con los datos guardados del cliente."""
+            client_type_var.set(customer.get("client_type") or "Particular")
 
-        def refresh_client_matches(_event=None):
-            query = client_var.get().strip()
-            if query.startswith("＋ Crear cliente nuevo"):
-                return
-            last_query["value"] = query
-            rows = self.database.connection.execute(
-                "SELECT name FROM clients WHERE name LIKE ? COLLATE NOCASE ORDER BY name LIMIT 8",
-                (f"%{query}%",),
-            ).fetchall()
-            matches = [str(row[0]) for row in rows]
-            if query and not matches:
-                client_combo.configure(values=("＋ Crear cliente nuevo",))
-                client_hint.set("No se encontró el cliente. Se podrá crear uno nuevo al confirmar.")
-            else:
-                client_combo.configure(values=matches)
-                client_hint.set("Seleccioná un cliente existente o escribí uno nuevo.")
-
-        def choose_client(_event=None):
-            if client_var.get() == "＋ Crear cliente nuevo":
-                client_var.set(last_query["value"])
-                client_combo.icursor("end")
-                client_hint.set("Cliente nuevo listo para crear al confirmar.")
-
-        client_combo.bind("<KeyRelease>", refresh_client_matches)
-        client_combo.bind("<<ComboboxSelected>>", choose_client)
-        refresh_client_matches()
+        customer_autocomplete = CustomerAutocomplete(
+            form, self.database,
+            on_customer_selected=apply_existing_customer,
+            on_new_customer=show_new_customer_dialog
+        )
+        customer_autocomplete.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        
+        tk.Label(form, text="Buscá por nombre o teléfono, o creá uno nuevo.", background=COLORS.background,
+                 foreground=COLORS.muted, font=(UI_FONT, 9)).grid(row=2, column=0, sticky="w", pady=(4, 17))
 
         label("Tipo de cliente", 3)
         type_combo = ttk.Combobox(
@@ -2861,41 +6380,226 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         tk.Label(form, text="Ejemplo: Stickers para termo.", background=COLORS.background, foreground=COLORS.muted,
                  font=(UI_FONT, 9)).grid(row=20, column=0, sticky="w", pady=(4, 0))
 
+        label("Trabajos", 21, 15)
+        jobs_tree = ttk.Treeview(form, columns=("product", "unit", "material", "size", "quantity", "price"),
+                                 show="headings", height=4)
+        for column, heading, width in (("product", "Producto", 145), ("unit", "Unidad", 90),
+                                       ("material", "Material", 105), ("size", "Medida", 65),
+                                       ("quantity", "Cant.", 45), ("price", "Precio", 65)):
+            jobs_tree.heading(column, text=heading); jobs_tree.column(column, width=width, stretch=column in {"product", "material"})
+        jobs_tree.grid(row=22, column=0, sticky="ew")
+        jobs_actions = tk.Frame(form, background=COLORS.background)
+        jobs_actions.grid(row=23, column=0, sticky="w", pady=(5, 10))
+
+        def refresh_draft_jobs():
+            jobs_tree.delete(*jobs_tree.get_children())
+            labels = {"item": "Unidades", "sheet": "Hojas", "": "Sin configurar"}
+            for index, job in enumerate(draft_jobs):
+                jobs_tree.insert("", "end", iid=str(index), values=(job.get("title"), labels.get(job.get("unit_kind", ""), "Sin configurar"),
+                    job.get("material"), job.get("size"), job.get("quantity"), f"${float(job.get('subtotal') or 0):,.0f}"))
+
+        def add_draft_job():
+            self.edit_order_job_dialog(dialog, None, lambda clean: (draft_jobs.append(clean), refresh_draft_jobs(), refresh_draft_designs()))
+
+        def edit_draft_job():
+            selected = jobs_tree.selection()
+            if not selected: return
+            index = int(selected[0])
+            self.edit_order_job_dialog(dialog, draft_jobs[index], lambda clean: (draft_jobs.__setitem__(index, clean), refresh_draft_jobs(), refresh_draft_designs()))
+
+        def remove_draft_job():
+            selected = jobs_tree.selection()
+            if not selected: return
+            index = int(selected[0])
+            if any(item.get("order_job_index") == index for item in draft_designs):
+                messagebox.showwarning("Quitar trabajo", "Reasigná o quitá primero sus diseños.", parent=dialog); return
+            draft_jobs.pop(index)
+            for item in draft_designs:
+                if item.get("order_job_index", -1) > index: item["order_job_index"] -= 1
+            refresh_draft_jobs(); refresh_draft_designs()
+
+        ttk.Button(jobs_actions, text="Agregar trabajo", command=add_draft_job, style="Primary.TButton").pack(side="left")
+        ttk.Button(jobs_actions, text="Editar", command=edit_draft_job, style="Secondary.TButton").pack(side="left", padx=5)
+        ttk.Button(jobs_actions, text="Quitar", command=remove_draft_job, style="Secondary.TButton").pack(side="left")
+
+        label("Diseños y distribución", 24)
+        designs_tree = ttk.Treeview(form, columns=("file", "job", "quantity"), show="headings", height=4)
+        for column, heading, width in (("file", "Archivo", 230), ("job", "Trabajo", 170), ("quantity", "Cantidad", 70)):
+            designs_tree.heading(column, text=heading); designs_tree.column(column, width=width, stretch=column != "quantity")
+        designs_tree.grid(row=25, column=0, sticky="ew")
+        tk.Label(form, text="Cada fila es una línea independiente, aunque dos trabajos usen el mismo archivo.",
+                 background=COLORS.background, foreground=COLORS.muted, font=(UI_FONT, 9)).grid(row=26, column=0, sticky="w", pady=(4, 3))
+        design_actions = tk.Frame(form, background=COLORS.background)
+        design_actions.grid(row=27, column=0, sticky="w", pady=(2, 8))
+
+        def refresh_draft_designs():
+            designs_tree.delete(*designs_tree.get_children())
+            for index, item in enumerate(draft_designs):
+                job_index = item.get("order_job_index")
+                job_name = draft_jobs[job_index].get("title") if isinstance(job_index, int) and job_index < len(draft_jobs) else "Sin trabajo"
+                designs_tree.insert("", "end", iid=str(index), values=(Path(item["image_path"]).name, job_name, item.get("quantity", 1)))
+
+        def add_selected_designs():
+            if not draft_jobs:
+                messagebox.showinfo("Diseños", "Agregá primero al menos un trabajo.", parent=dialog); return
+            if not self.selected_images:
+                messagebox.showinfo("Diseños", "Seleccioná archivos en Diseños y volvé a usar este botón.", parent=dialog); return
+            job_number = simpledialog.askinteger("Asignar diseños", f"Número de trabajo (1 a {len(draft_jobs)}):", minvalue=1, maxvalue=len(draft_jobs), parent=dialog)
+            if job_number is None: return
+            quantity = simpledialog.askinteger("Distribuir cantidad", "Cantidad de esta línea de diseño:", minvalue=1, parent=dialog)
+            if quantity is None: return
+            job = draft_jobs[job_number - 1]
+            try: size_cm = float(re.search(r"[0-9]+(?:[.,][0-9]+)?", str(job.get("size") or "5")).group().replace(",", "."))
+            except (AttributeError, ValueError): size_cm = 5.0
+            for image in self.selected_images.values():
+                draft_designs.append({"design_line_id": uuid.uuid4().hex, "image_path": image["path"],
+                    "quantity": quantity, "size_cm": size_cm, "rotation": 0, "status": "Pendiente",
+                    "source": "library", "order_job_index": job_number - 1, "unit_kind": job.get("unit_kind", "")})
+            refresh_draft_designs()
+
+        def remove_draft_design():
+            selected = designs_tree.selection()
+            if selected: draft_designs.pop(int(selected[0])); refresh_draft_designs()
+
+        ttk.Button(design_actions, text="Agregar seleccionados", command=add_selected_designs, style="Primary.TButton").pack(side="left")
+        ttk.Button(design_actions, text="Quitar línea", command=remove_draft_design, style="Secondary.TButton").pack(side="left", padx=5)
+
         def create():
-            client = client_var.get().strip()
-            if not client or client == "＋ Crear cliente nuevo":
-                messagebox.showwarning("Crear pedido", "Indicá el cliente.", parent=dialog)
-                client_combo.focus_set()
-                return
+            print("\n=== DEBUG: Iniciando creación de pedido ===")
+            selected_customer = customer_autocomplete.get_selected_customer()
+            print(f"DEBUG: Cliente seleccionado: {selected_customer}")
+            
+            if not selected_customer:
+                # If no customer selected, check if user typed a name
+                typed_name = customer_autocomplete.search_var.get().strip()
+                print(f"DEBUG: Nombre tipeado: '{typed_name}'")
+                if not typed_name or typed_name == "Buscar cliente...":
+                    messagebox.showwarning("Crear pedido", "Seleccioná o creá un cliente.", parent=dialog)
+                    customer_autocomplete.search_entry.focus_set()
+                    return
+                
+                # Check if a customer with this name already exists
+                from datetime import datetime
+                now = datetime.now().isoformat(timespec="seconds")
+                existing = self.database.connection.execute(
+                    "SELECT id, name, whatsapp, client_type FROM clients WHERE name = ? COLLATE NOCASE LIMIT 1",
+                    (typed_name,)
+                ).fetchone()
+                
+                if existing:
+                    # Customer exists - use it instead of creating a duplicate
+                    print(f"DEBUG: Cliente ya existe con ID: {existing['id']}")
+                    customer_id = existing["id"]
+                    client_name = existing["name"]
+                    client_whatsapp = existing["whatsapp"] or ""
+                    client_type_var.set(existing["client_type"] or "Particular")
+                else:
+                    # Create customer on the fly
+                    print(f"DEBUG: Creando cliente nuevo: {typed_name}")
+                    try:
+                        cursor = self.database.connection.execute(
+                            "INSERT INTO clients (name, whatsapp, created_at, updated_at, client_type) VALUES (?, ?, ?, ?, ?)",
+                            (typed_name, "", now, now, client_type_var.get())
+                        )
+                        customer_id = cursor.lastrowid
+                        self.database.connection.commit()
+                        client_name = typed_name
+                        client_whatsapp = ""
+                        print(f"DEBUG: Cliente creado con ID: {customer_id}")
+                    except Exception as e:
+                        print(f"DEBUG: Error al crear cliente: {e}")
+                        messagebox.showerror(
+                            "Error al crear cliente",
+                            f"No se pudo crear el cliente:\n\n{str(e)}",
+                            parent=dialog
+                        )
+                        return
+            else:
+                customer_id = selected_customer["id"]
+                client_name = selected_customer["name"]
+                client_whatsapp = selected_customer["whatsapp"]
+                client_type_var.set(selected_customer.get("client_type") or "Particular")
+                print(f"DEBUG: Usando cliente existente ID: {customer_id}, Nombre: {client_name}")
+            
             try:
-                order_id = self.database.create_order(
-                    client, order_date=order_date_var.get().strip() or datetime.now().isoformat(timespec="seconds"),
+                print(f"DEBUG: Llamando a create_order()...")
+                print(f"  - Cliente: {client_name}")
+                print(f"  - Whatsapp: {client_whatsapp}")
+                print(f"  - Fecha orden: {order_date_var.get().strip()}")
+                print(f"  - Estado: Recibido")
+                print(f"  - Fecha entrega: {delivery_var.get().strip()}")
+                print(f"  - Concepto: {concept_var.get().strip()}")
+                
+                order_id = self.database.create_order_with_details(
+                    client_name, whatsapp=client_whatsapp,
+                    order_date=order_date_var.get().strip() or datetime.now().isoformat(timespec="seconds"),
                     status="Recibido",
                     delivery_date=delivery_var.get().strip(), observations=notes.get("1.0", "end").strip(),
                     order_concept=concept_var.get().strip(),
                     order_description=description_entry.get("1.0", "end").strip(),
+                    jobs=draft_jobs, designs=draft_designs,
                 )
-                # Actualizar tipo de cliente si se especificó uno distinto al default
+                print(f"DEBUG: Pedido creado con ID: {order_id}")
+                
+                # Update customer_id in the order
+                print(f"DEBUG: Actualizando customer_id={customer_id} en pedido {order_id}")
+                self.database.connection.execute(
+                    "UPDATE orders SET client_id = ? WHERE id = ?",
+                    (customer_id, order_id)
+                )
+                self.database.connection.commit()
+                print(f"DEBUG: customer_id actualizado")
+                
+                # Update client type if specified
                 client_type = client_type_var.get().strip()
                 if client_type and client_type != "Particular":
-                    order_row = self.database.connection.execute(
-                        "SELECT client_id FROM orders WHERE id = ?", (order_id,)
-                    ).fetchone()
-                    if order_row and order_row[0]:
-                        self.database.update_client_type(order_row[0], client_type)
+                    print(f"DEBUG: Actualizando tipo de cliente a: {client_type}")
+                    self.database.update_client_type(customer_id, client_type)
+                
                 # Publicar evento de nuevo pedido
                 try:
+                    print(f"DEBUG: Publicando evento de pedido creado")
                     order_data = self.database.order(order_id)
                     total = float(order_data.get("budget_total", 0) or 0) if order_data else 0
-                    self._event_bus.publish_order_created(order_id, client, total)
-                except Exception:
+                    self._event_bus.publish_order_created(order_id, client_name, total)
+                except Exception as e:
+                    print(f"DEBUG: Error publicando evento (no crítico): {e}")
                     pass
+                    
             except ValueError as error:
+                print(f"DEBUG: ValueError capturado: {error}")
                 messagebox.showwarning("Crear pedido", str(error), parent=dialog)
                 return
+            except Exception as error:
+                import traceback
+                error_details = traceback.format_exc()
+                print(f"DEBUG: Exception capturada: {error}")
+                print(f"DEBUG: Traceback completo:\n{error_details}")
+                messagebox.showerror(
+                    "Error al crear pedido",
+                    f"No se pudo crear el pedido:\n\n{str(error)}\n\nRevise los logs para más detalles.",
+                    parent=dialog
+                )
+                return
+            
+            print(f"DEBUG: Cerrando diálogo")
             dialog.destroy()
+            print(f"DEBUG: Refrescando lista de pedidos")
             self.refresh_orders()
-            self.open_order_workspace(order_id)
+            print(f"DEBUG: Abriendo workspace del pedido {order_id}")
+            try:
+                self.open_order_workspace(order_id)
+                print(f"DEBUG: Workspace abierto exitosamente")
+            except Exception as e:
+                import traceback
+                error_details = traceback.format_exc()
+                print(f"DEBUG: ERROR al abrir workspace: {e}")
+                print(f"DEBUG: Traceback:\n{error_details}")
+                messagebox.showerror(
+                    "Error al abrir pedido",
+                    f"El pedido se creó correctamente (ID: {order_id}), pero no se pudo abrir:\n\n{str(e)}",
+                )
+            print("=== DEBUG: Fin de creación de pedido ===\n")
 
         actions = tk.Frame(dialog, background=COLORS.background)
         actions.pack(fill="x", padx=30, pady=(20, 24))
@@ -2908,7 +6612,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         dialog.bind("<Return>", create_with_enter)
         dialog.bind("<Escape>", lambda _event: dialog.destroy())
         self.center_window(dialog)
-        client_combo.focus_set()
+        customer_autocomplete.search_entry.focus_set()
 
     def edit_order_job_dialog(self, parent, job: dict | None, on_save):
         """Edita un trabajo individual sin modificar los demás ítems del pedido."""
@@ -2918,7 +6622,10 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         dialog.configure(background=COLORS.background)
         dialog.transient(parent)
         dialog.grab_set()
-        dialog.geometry("520x650")
+        # El formulario incluye notas y acciones: reservar altura suficiente
+        # evita que la barra de confirmación quede fuera de la ventana.
+        dialog.geometry("520x720")
+        dialog.minsize(520, 720)
         dialog.resizable(False, False)
         
         style = ttk.Style(dialog)
@@ -2927,17 +6634,50 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         
         values = {key: tk.StringVar(value=str(source.get(key, default))) for key, default in (
             ("title", ""), ("material", ""), ("size", ""), ("quantity", 1),
-            ("discount_percent", 0), ("extra_services", 0), ("status", "Pendiente"),
+            ("unit_kind", ""), ("distribution_policy", "partial"), ("discount_percent", 0), ("extra_services", 0), ("status", "Pendiente"),
         )}
+        # La prioridad se cobra como un servicio sobre el valor del producto.
+        priority_service_var = tk.StringVar(value="Sin prioridad extra")
+        priority_service_rates = {
+            "Sin prioridad extra": 0.0,
+            "Prioridad Alta": 0.30,
+            "Prioridad Urgente": 0.40,
+        }
         
         # Variables adicionales para mostrar info
         subtotal_var = tk.StringVar(value="$ 0,00")
         price_detail_var = tk.StringVar(value="Seleccioná material y tamaño")
-        
+        quantity_promo_var = tk.StringVar(value="")
+        fotocopia_pricing = FotocopiaPricingService(self.database.connection)
+        fotocopia_products = {
+            "Fotocopia B/N Simple": "fotocopia_bn_simple",
+            "Fotocopia B/N Doble Faz": "fotocopia_bn_doble",
+            "Fotocopia Color Simple": "fotocopia_color_simple",
+            "Fotocopia Color Doble Faz": "fotocopia_color_doble",
+            "Impresion Fotografica (1 Unidad)": "impresion_fotografica_1_unidad",
+            "Folletos Fotográficos (4 unidades)": "folletos_fotograficos_4_unidades",
+            "Tarjetas Presentacion Fotograficas (10 Unidades)": "tarjetas_presentacion_fotograficas_10_unidades",
+        }
+
+        def fotocopia_calculation():
+            product_type = fotocopia_products.get(values["title"].get().strip())
+            if not product_type:
+                return None
+            try:
+                sheets = max(1, int(values["quantity"].get() or 1))
+            except (TypeError, ValueError):
+                sheets = 1
+            return fotocopia_pricing.calculate_for_product(
+                product_type,
+                physical_sheets=sheets,
+                copies=1,
+                is_urgent=priority_service_var.get() == "Prioridad Urgente",
+            )
+
         form = tk.Frame(dialog, background=COLORS.panel_elevated, highlightthickness=1, highlightbackground=COLORS.border)
         form.pack(fill="both", expand=True, padx=18, pady=18)
         tk.Label(form, text="DETALLE DEL TRABAJO", background=COLORS.panel_elevated, foreground=COLORS.wine_active,
-                 font=(IDENTITY_FONT, 14, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", padx=16, pady=(16, 12))
+                 font=(IDENTITY_FONT, 14, "bold")).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 12))
         form.columnconfigure(1, weight=1)
 
         def field_entry(value, state="normal"):
@@ -2946,6 +6686,89 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                             highlightbackground=COLORS.border, highlightcolor=COLORS.wine_active, 
                             font=(UI_FONT, 10), state=state)
         
+        def get_available_sizes_for_product(material, title):
+            """Return configured sizes, preferring a rule that belongs to the product."""
+            material = material.strip()
+            title = title.strip()
+            if not material and not title:
+                return []
+
+            rows = self.database.connection.execute(
+                "SELECT material, size FROM price_rules WHERE active = 1 AND TRIM(size) <> ''"
+            ).fetchall()
+
+            def normalized_words(value):
+                # The colour is a support variant, rather than the material
+                # family. This keeps historical sticker rules discoverable.
+                return {
+                    word for word in re.findall(r"[a-z0-9]+", value.casefold())
+                    if word not in {"blanco", "blanca"}
+                }
+
+            selected_words = normalized_words(material)
+            product_sizes = []
+            material_sizes = []
+            for row in rows:
+                rule_material = str(row["material"] or "").strip()
+                rule_size = str(row["size"] or "").strip()
+                if material and rule_material.casefold() == material.casefold():
+                    material_sizes.append(rule_size)
+                if title and rule_material.casefold().startswith(f"{title.casefold()} - "):
+                    rule_words = normalized_words(rule_material.split(" - ", 1)[-1])
+                    if not selected_words or rule_words <= selected_words or selected_words <= rule_words:
+                        product_sizes.append(rule_size)
+
+            if "sticker" in title.casefold():
+                # Los stickers individuales se cotizan y producen en esta
+                # escala, aun cuando el catálogo sólo tenga una regla cargada.
+                return ["5cm", "7cm", "8cm", "10cm", "12cm", "15cm", "18cm", "20cm", "25cm", "29cm"]
+
+            return list(dict.fromkeys(product_sizes or material_sizes))
+
+        def price_material_for_product(material, title, size):
+            """Find the stored pricing material for an equivalent product material."""
+            material = material.strip()
+            title = title.strip()
+            size = size.strip()
+            if not material or not title or not size:
+                return material
+
+            def normalized_words(value):
+                return {
+                    word for word in re.findall(r"[a-z0-9]+", value.casefold())
+                    if word not in {"blanco", "blanca"}
+                }
+
+            selected_words = normalized_words(material)
+            rows = self.database.connection.execute(
+                "SELECT material FROM price_rules WHERE active = 1 AND size = ? COLLATE NOCASE",
+                (size,),
+            ).fetchall()
+            prefix = f"{title.casefold()} - "
+            for row in rows:
+                rule_material = str(row["material"] or "").strip()
+                if not rule_material.casefold().startswith(prefix):
+                    continue
+                rule_words = normalized_words(rule_material.split(" - ", 1)[-1])
+                if rule_words <= selected_words or selected_words <= rule_words:
+                    return rule_material
+
+            # El catálogo vigente comparte la escala de precios de los
+            # stickers individuales bajo esta regla genérica. La regla propia
+            # del producto, si existe (por ejemplo 29 cm), siempre prevalece.
+            if "sticker" in title.casefold():
+                generic = next(
+                    (
+                        str(row["material"] or "").strip()
+                        for row in rows
+                        if str(row["material"] or "").strip().casefold() == "vinilo full color hd"
+                    ),
+                    "",
+                )
+                if generic:
+                    return generic
+            return material
+
         def get_available_sizes_for_material(material):
             """Obtiene los tamaños disponibles para un material específico desde la BD."""
             if not material or not material.strip():
@@ -2963,6 +6786,35 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             
             return [row[0] for row in rows]
         
+        def quantity_promotion_details(price_material, rule, quantity):
+            """Describe el tramo vigente sin volver a descontarlo del total."""
+            base_rule_keys = {
+                "p\u00f3ster plastificado": "plastificado_a4_1",
+                "impresi\u00f3n a4": "commercial_impresion_fotografica_a4_1",
+            }
+            base_rule_key = base_rule_keys.get(price_material.casefold())
+            if not base_rule_key or not rule:
+                return None
+            base_rule = self.database.connection.execute(
+                "SELECT price FROM price_rules WHERE catalog_key = ? AND active = 1",
+                (base_rule_key,),
+            ).fetchone()
+            if not base_rule:
+                return None
+            base_unit = float(base_rule["price"] or 0)
+            tier_unit = float(rule.get("price") or base_unit)
+            minimum = int(rule.get("min_quantity") or 1)
+            maximum = rule.get("max_quantity")
+            scale = f"{minimum}\u2013{int(maximum)} unidades" if maximum is not None else f"{minimum} o m\u00e1s unidades"
+            unit_text = f"$ {tier_unit:,.0f}".replace(",", ".")
+            primary = f"Precio unitario: {unit_text} \u00b7 Escala aplicada: {scale}"
+            if base_unit <= 0 or tier_unit >= base_unit:
+                return primary, "Descuento por cantidad: no aplica"
+            percent = (base_unit - tier_unit) * 100 / base_unit
+            savings = (base_unit - tier_unit) * quantity
+            saving_text = f"$ {savings:,.0f}".replace(",", ".")
+            return primary, f"Descuento por cantidad: -{percent:g}% \u00b7 Ahorr\u00e1s: {saving_text}"
+
         def calculate_subtotal():
             """Calcula y actualiza el subtotal usando suggest_price de la BD."""
             try:
@@ -2970,65 +6822,120 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 size = values["size"].get().strip()
                 quantity = max(1, int(values["quantity"].get() or 1))
                 discount = max(0, min(100, float(values["discount_percent"].get() or 0)))
-                extra = max(0, float(values["extra_services"].get() or 0))
+                priority_rate = priority_service_rates.get(priority_service_var.get(), 0.0)
+                fotocopia = fotocopia_calculation()
+                if fotocopia:
+                    subtotal_var.set(f"$ {fotocopia.final_price:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+                    detail = f"{fotocopia.calculation_details['total_quantity']} hoja(s) × $ {fotocopia.calculation_details['unit_price']:,.0f}"
+                    if fotocopia.surcharge_amount:
+                        detail += f" · urgente +{fotocopia.surcharge_percent:g}%"
+                    price_detail_var.set(detail)
+                    quantity_promo_var.set("")
+                    return
                 
                 if not material or not size:
                     subtotal_var.set("$ 0,00")
                     price_detail_var.set("Seleccioná material y tamaño")
+                    quantity_promo_var.set("")
                     return
                 
                 # Usar el método suggest_price de la base de datos
-                rule = self.database.suggest_price(material, size, quantity)
+                price_material = price_material_for_product(material, values["title"].get(), size)
+                rule = self.database.suggest_price(price_material, size, quantity)
                 
                 if rule and rule.get("suggested_subtotal"):
                     subtotal_base = float(rule["suggested_subtotal"])
                     calculation_detail = rule.get("calculation_detail", "")
                     
-                    # Aplicar descuento y servicios extra
+                    # La prioridad se cobra sobre el valor base del producto.
                     importe_descuento = subtotal_base * discount / 100
+                    extra = subtotal_base * priority_rate
                     subtotal_final = subtotal_base - importe_descuento + extra
                     
                     # Actualizar visualización
                     subtotal_var.set(f"$ {subtotal_final:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-                    price_detail_var.set(calculation_detail)
+                    promotion = quantity_promotion_details(price_material, rule, quantity)
+                    if promotion:
+                        price_detail_var.set(promotion[0])
+                        quantity_promo_var.set(promotion[1])
+                    else:
+                        # Mostrar precio unitario y total cuando no hay promoción
+                        unit_price = subtotal_base / quantity if quantity > 0 else 0
+                        unit_text = f"$ {unit_price:,.0f}".replace(",", ".")
+                        total_text = f"$ {subtotal_base:,.0f}".replace(",", ".")
+                        if quantity > 1:
+                            price_detail_var.set(f"{quantity} × {unit_text} = {total_text}")
+                        else:
+                            price_detail_var.set(f"Precio unitario: {unit_text}")
+                        quantity_promo_var.set("")
                 else:
                     subtotal_var.set("$ 0,00")
                     price_detail_var.set("No hay precio configurado para esta combinación")
+                    quantity_promo_var.set("")
                     
             except (ValueError, TypeError) as e:
+                print(f"[ERROR] calculate_subtotal: {e}")
+                import traceback
+                traceback.print_exc()
                 subtotal_var.set("$ 0,00")
                 price_detail_var.set("Error al calcular")
+                quantity_promo_var.set("")
         
-        def on_material_change(*args):
-            """Actualiza los tamaños disponibles cuando cambia el material."""
-            material = values["material"].get().strip()
+        def on_title_change(*args):
+            """Actualiza los tamaños disponibles cuando cambia el título/producto."""
             current_title = values["title"].get().strip()
-            if not current_title and material:
-                values["title"].set(material)
+            material = values["material"].get().strip()
+            
+            # Si no hay material pero hay título, intentar inferir material del título
+            if not material and current_title:
+                # Buscar reglas de precios del producto
+                if current_title in product_variants_map:
+                    price_rules = product_variants_map[current_title]
+                    if price_rules:
+                        first_rule = price_rules[0]
+                        if first_rule.get("material"):
+                            values["material"].set(first_rule["material"])
+                            material = first_rule["material"]
+                        # Autocompletar tamaño si está vacío y el producto es A4
+                        size_value = first_rule.get("size", "")
+                        if not size_value and "A4" in current_title:
+                            size_value = "A4"
+                            values["size"].set(size_value)
+                # Para servicios y fotocopias, usar presets
+                elif current_title.casefold() in service_presets:
+                    values["material"].set(service_presets[current_title.casefold()]["material"])
+                    material = service_presets[current_title.casefold()]["material"]
+                    values["size"].set(service_presets[current_title.casefold()]["size"])
+                elif current_title.casefold() in fotocopia_presets:
+                    values["material"].set(fotocopia_presets[current_title.casefold()]["material"])
+                    material = fotocopia_presets[current_title.casefold()]["material"]
+                    values["size"].set(fotocopia_presets[current_title.casefold()]["size"])
 
-            available_sizes = get_available_sizes_for_material(material)
+            available_sizes = get_available_sizes_for_product(material, current_title)
             size_combo.configure(values=available_sizes)
             
             # Si el tamaño actual no está disponible, limpiar
             current_size = values["size"].get().strip()
             if current_size not in available_sizes:
-                values["size"].set("")
+                # Evita dejar el formulario sin precio cuando el producto tiene
+                # una sola medida posible (como los stickers de 29 cm).
+                values["size"].set(available_sizes[0] if len(available_sizes) == 1 else "")
             
             calculate_subtotal()
         
         # Conectar cambios a la calculadora
-        values["material"].trace_add("write", on_material_change)
+        values["title"].trace_add("write", on_title_change)
         values["size"].trace_add("write", lambda *args: calculate_subtotal())
         values["quantity"].trace_add("write", lambda *args: calculate_subtotal())
         values["discount_percent"].trace_add("write", lambda *args: calculate_subtotal())
-        values["extra_services"].trace_add("write", lambda *args: calculate_subtotal())
+        priority_service_var.trace_add("write", lambda *args: calculate_subtotal())
 
         def build_presupuesto_text():
             material = values["material"].get().strip()
             size = values["size"].get().strip()
             quantity = max(1, int(values["quantity"].get() or 1))
             discount = max(0, min(100, float(values["discount_percent"].get() or 0)))
-            extra = max(0, float(values["extra_services"].get() or 0))
+            priority_rate = priority_service_rates.get(priority_service_var.get(), 0.0)
             if " - " in material:
                 title = values["title"].get().strip() or material.split(" - ", 1)[0]
                 material_label = material.split(" - ", 1)[1] if material.split(" - ", 1)[1] else material
@@ -3039,16 +6946,26 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             def format_amount(value: float) -> str:
                 return f"$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-            rule = self.database.suggest_price(material, size, quantity)
-            subtotal_base = float(rule["suggested_subtotal"]) if rule and rule.get("suggested_subtotal") else 0
-            unit_price = subtotal_base / quantity if quantity and subtotal_base else 0
+            fotocopia = fotocopia_calculation()
+            if fotocopia:
+                subtotal_base = fotocopia.base_price
+                unit_price = fotocopia.calculation_details["unit_price"]
+                extra = fotocopia.surcharge_amount
+                final_total = fotocopia.final_price
+                detail = f"{fotocopia.calculation_details['total_quantity']} hoja(s) × $ {unit_price:,.0f}"
+            else:
+                price_material = price_material_for_product(material, values["title"].get(), size)
+                rule = self.database.suggest_price(price_material, size, quantity)
+                subtotal_base = float(rule["suggested_subtotal"]) if rule and rule.get("suggested_subtotal") else 0
+                unit_price = subtotal_base / quantity if quantity and subtotal_base else 0
+                extra = subtotal_base * priority_rate
+                final_total = max(0.0, subtotal_base - subtotal_base * discount / 100 + extra)
+                detail = rule.get("calculation_detail") if rule else ""
             precio_unitario = format_amount(unit_price) if unit_price else "-"
             base_text = format_amount(subtotal_base)
             extra_text = format_amount(extra) if extra else "$ 0,00"
             discount_text = f"{discount:g}%" if discount else "0%"
-            final_total = max(0.0, subtotal_base - subtotal_base * discount / 100 + extra)
             final_total_text = format_amount(final_total)
-            detail = rule.get("calculation_detail") if rule else ""
             detail = re.sub(r"\$\s*([0-9,]+\.[0-9]{2})", lambda m: format_amount(float(m.group(1).replace(",", ""))), detail) if detail else detail
 
             lines = [
@@ -3114,58 +7031,115 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         # Campos del formulario
         row = 1
         
-        # Producto (Combobox editable con historial)
+        # Los servicios se agregan como trabajos independientes, sin tener que
+        # elegir primero un producto de impresión. Esto permite cobrar el
+        # diseño de cada plancha A4 de forma directa.
+        service_presets = {
+            "diseño simple": {"material": "Diseño simple", "size": "A4"},
+            "impresión": {"material": "Impresión", "size": "A4"},
+            "corte": {"material": "Corte", "size": "A4"},
+            "plancha diseño único": {"material": "Vinilo estándar", "size": "A4"},
+        }
+        fotocopia_presets = {
+            title.casefold(): {"material": "Papel A4", "size": "A4"}
+            for title in fotocopia_products
+        }
+        
+        # Producto (Combobox editable con catálogo de productos)
         tk.Label(form, text="Producto", background=COLORS.panel_elevated, foreground=COLORS.text,
                  font=(UI_FONT, 10, "bold")).grid(row=row, column=0, sticky="w", padx=16, pady=5)
         
-        # Obtener lista de títulos existentes
-        existing_titles = self.database.job_titles()
+        # Obtener productos del catálogo con sus variantes
+        catalog_products = self.database.catalog_products(include_inactive=False)
+        product_names = [p.get("name", "") for p in catalog_products if p.get("name")]
         
-        product_combo = ttk.Combobox(form, textvariable=values["title"], values=existing_titles, style="Order.TCombobox")
+        # Crear mapeo de producto -> reglas de precios para autocompletar material/tamaño
+        product_variants_map = {}
+        for product in catalog_products:
+            product_name = product.get("name", "")
+            if product_name:
+                # Obtener reglas de precios del producto (en lugar de variantes)
+                price_rules = self.database.connection.execute(
+                    """SELECT material, size, price_mode FROM price_rules 
+                       WHERE product_id = ? AND active = 1""",
+                    (product.get("id"),)
+                ).fetchall()
+                if price_rules:
+                    product_variants_map[product_name] = [
+                        {
+                            "material": rule["material"],
+                            "size": rule["size"],
+                            "modality": rule["price_mode"]
+                        }
+                        for rule in price_rules
+                    ]
+        
+        # Mantener compatibilidad con legacy: agregar títulos históricos y servicios hardcoded
+        legacy_titles = list(dict.fromkeys([
+            *self.database.job_titles(),
+            *fotocopia_products,
+            "Plancha Doccione",
+            "Plancha Personalizada 5 cm",
+            "Plancha Personalizada Mixta",
+            "Plancha Diseño Único",
+            "Diseño simple",
+            "Impresión",
+            "Corte",
+        ]))
+        
+        # Combinar catálogo con legacy (prioridad al catálogo)
+        all_products = list(dict.fromkeys([*product_names, *legacy_titles]))
+        
+        product_combo = ttk.Combobox(form, textvariable=values["title"], values=all_products, style="Order.TCombobox")
         product_combo.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=5)
         row += 1
+        
+        # Función para autocompletar material/tamaño cuando se selecciona un producto del catálogo
+        def on_product_selected(event):
+            selected_product = values["title"].get().strip()
+            if selected_product in product_variants_map:
+                price_rules = product_variants_map[selected_product]
+                if price_rules:
+                    # Usar la primera regla de precio para autocompletar
+                    first_rule = price_rules[0]
+                    if first_rule.get("material"):
+                        values["material"].set(first_rule["material"])
+                    # Autocompletar tamaño incluso si está vacío (para productos sin variante de tamaño)
+                    size_value = first_rule.get("size", "")
+                    if not size_value and "A4" in selected_product:
+                        size_value = "A4"
+                    values["size"].set(size_value)
+        
+        product_combo.bind("<<ComboboxSelected>>", on_product_selected)
 
-        # Material (selector — muestra solo la parte de material; mapea al valor completo)
-        tk.Label(form, text="Material", background=COLORS.panel_elevated, foreground=COLORS.text,
-             font=(UI_FONT, 10, "bold")).grid(row=row, column=0, sticky="w", padx=16, pady=5)
+        # Los servicios se agregan como trabajos independientes, sin tener que
+        # elegir primero un producto de impresión. Esto permite cobrar el
+        # diseño de cada plancha A4 de forma directa.
+        service_presets = {
+            "diseño simple": {"material": "Diseño simple", "size": "A4"},
+            "impresión": {"material": "Impresión", "size": "A4"},
+            "corte": {"material": "Corte", "size": "A4"},
+            "plancha diseño único": {"material": "Plancha A4 - Diseño Único", "size": "A4"},
+            "plancha personalizada": {"material": "Plancha A4 - Vinilo Blanco Full Color", "size": "A4"},
+            "plancha personalizada 5 cm": {"material": "Plancha A4 - Vinilo Blanco Full Color", "size": "A4"},
+            "plancha personalizada mixta": {"material": "Plancha A4 - Vinilo Blanco Full Color", "size": "A4"},
+            "plancha doccione": {"material": "Plancha A4 - Diseño Único", "size": "A4"},
+        }
+        fotocopia_presets = {
+            title.casefold(): {"material": "Papel A4", "size": "A4"}
+            for title in fotocopia_products
+        }
 
-        # Preparar lista visible y mapa a valor almacenado en DB
-        stored_materials = self.database.price_materials()
-        material_display_map = {}
-        material_display_list = []
-        for m in stored_materials:
-            if " - " in m:
-                disp = m.split(" - ", 1)[1]
-            else:
-                disp = m
-            if disp in material_display_map:
-                # si ya existe visualmente, usar la forma completa para evitar ambigüedad
-                disp = m
-            material_display_map[disp] = m
-            material_display_list.append(disp)
-
-        material_display_var = tk.StringVar()
-        # Inicializar vista desde valor almacenado si existe
-        stored_current = values.get("material", tk.StringVar()).get()
-        if stored_current:
-            if " - " in stored_current:
-                initial_disp = stored_current.split(" - ", 1)[1]
-            else:
-                initial_disp = stored_current
-            material_display_var.set(initial_disp if initial_disp in material_display_map else initial_disp)
-
-        material_combo = ttk.Combobox(form, textvariable=material_display_var, values=material_display_list, style="Order.TCombobox", state="readonly")
-        material_combo.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=5)
-
-        def on_material_select(_event=None):
-            sel = material_display_var.get().strip()
-            if not sel:
-                values["material"].set("")
+        def on_product_select(_event=None):
+            preset = service_presets.get(values["title"].get().strip().casefold()) or fotocopia_presets.get(values["title"].get().strip().casefold())
+            if not preset:
                 return
-            stored = material_display_map.get(sel, sel)
-            values["material"].set(stored)
+            stored_material = preset["material"]
+            values["material"].set(stored_material)
+            values["size"].set(preset["size"])
+            calculate_subtotal()
 
-        material_combo.bind("<<ComboboxSelected>>", on_material_select)
+        product_combo.bind("<<ComboboxSelected>>", on_product_select)
         row += 1
         
         # Tamaño
@@ -3178,7 +7152,27 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         # Cantidad
         tk.Label(form, text="Cantidad", background=COLORS.panel_elevated, foreground=COLORS.text,
                  font=(UI_FONT, 10, "bold")).grid(row=row, column=0, sticky="w", padx=16, pady=5)
-        field_entry(values["quantity"]).grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=5)
+        quantity_entry = field_entry(values["quantity"])
+        quantity_entry.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=5)
+        # También conectar el evento de cambio de foco y tecla presionada
+        quantity_entry.bind("<FocusOut>", lambda e: calculate_subtotal())
+        quantity_entry.bind("<KeyRelease>", lambda e: calculate_subtotal())
+        row += 1
+
+        tk.Label(form, text="Unidad", background=COLORS.panel_elevated, foreground=COLORS.text,
+                 font=(UI_FONT, 10, "bold")).grid(row=row, column=0, sticky="nw", padx=16, pady=5)
+        unit_frame = tk.Frame(form, background=COLORS.panel_elevated)
+        unit_frame.grid(row=row, column=1, sticky="w", padx=(0, 16), pady=5)
+        ttk.Radiobutton(unit_frame, text="Unidades / stickers", variable=values["unit_kind"], value="item").pack(anchor="w")
+        ttk.Radiobutton(unit_frame, text="Hojas / planchas", variable=values["unit_kind"], value="sheet").pack(anchor="w")
+        ttk.Radiobutton(unit_frame, text="Distribución completa", variable=values["distribution_policy"], value="complete").pack(anchor="w")
+        ttk.Radiobutton(unit_frame, text="Distribución parcial permitida", variable=values["distribution_policy"], value="partial").pack(anchor="w")
+        if source.get("distribution_policy", "legacy") == "legacy" and source:
+            values["distribution_policy"].set("legacy")
+            ttk.Radiobutton(unit_frame, text="Conservar política histórica", variable=values["distribution_policy"], value="legacy").pack(anchor="w")
+        tk.Label(unit_frame, text="Elegí cómo se vende este trabajo; no se deduce del archivo.",
+                 background=COLORS.panel_elevated, foreground=COLORS.muted,
+                 font=(UI_FONT, 8), wraplength=290, justify="left").pack(anchor="w")
         row += 1
         
         # Detalle de precio (info)
@@ -3186,17 +7180,29 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                  foreground=COLORS.muted, font=(UI_FONT, 9)).grid(row=row, column=0, columnspan=2, 
                                                                     sticky="w", padx=16, pady=(2, 5))
         row += 1
+
+        tk.Label(form, textvariable=quantity_promo_var, background=COLORS.panel_elevated,
+                 foreground=COLORS.wine_active, font=(UI_FONT, 9, "bold")).grid(
+                     row=row, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 5)
+                 )
+        row += 1
         
         # Descuento %
         tk.Label(form, text="Descuento %", background=COLORS.panel_elevated, foreground=COLORS.text,
                  font=(UI_FONT, 10, "bold")).grid(row=row, column=0, sticky="w", padx=16, pady=5)
-        field_entry(values["discount_percent"]).grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=5)
+        discount_entry = field_entry(values["discount_percent"])
+        discount_entry.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=5)
+        discount_entry.bind("<FocusOut>", lambda e: calculate_subtotal())
+        discount_entry.bind("<KeyRelease>", lambda e: calculate_subtotal())
         row += 1
         
-        # Servicios extra ($)
-        tk.Label(form, text="Servicios extra ($)", background=COLORS.panel_elevated, foreground=COLORS.text,
+        # Servicio extra de prioridad
+        tk.Label(form, text="Servicio extra", background=COLORS.panel_elevated, foreground=COLORS.text,
                  font=(UI_FONT, 10, "bold")).grid(row=row, column=0, sticky="w", padx=16, pady=5)
-        field_entry(values["extra_services"]).grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=5)
+        ttk.Combobox(
+            form, textvariable=priority_service_var,
+            values=tuple(priority_service_rates), state="readonly", style="Order.TCombobox",
+        ).grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=5)
         row += 1
         
         # Subtotal (solo lectura)
@@ -3206,6 +7212,147 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                                    foreground=COLORS.wine_active, anchor="e", relief="flat",
                                    font=(UI_FONT, 12, "bold"), padx=10, pady=8)
         subtotal_label.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=5)
+        row += 1
+
+        # Fase 3: panel compacto, visible únicamente para el adaptador A4.
+        # La simulación usa Database.calculate_productive_plancha_a4(); aquí no
+        # hay fórmulas ni precios duplicados.
+        productive_state = {"analysis": None, "applied": source.get("applied_price_snapshot"), "manual": source.get("manual_price_snapshot"), "price_source": source.get("price_source", "suggested"),
+                            "historical": bool(source.get("id") and source.get("base_price_snapshot"))}
+        estimate_source = dict(source.get("production_estimate") or {})
+        productive_vars = {
+            "unique_designs": tk.StringVar(value=str(estimate_source.get("unique_designs", 1))),
+            "design_minutes": tk.StringVar(value=str(estimate_source.get("design_minutes", 10))),
+            "print_minutes": tk.StringVar(value=str(estimate_source.get("print_minutes", 10))),
+            "cut_minutes": tk.StringVar(value=str(estimate_source.get("cut_minutes", 10))),
+            "mode": tk.StringVar(value=str(estimate_source.get("production_mode", source.get("production_mode", "individual")) or "individual")),
+            "manual_price": tk.StringVar(value="" if productive_state["manual"] is None else str(productive_state["manual"])),
+        }
+        productive_frame = tk.LabelFrame(form, text="Estimación productiva", background=COLORS.panel_elevated,
+                                         foreground=COLORS.wine_active, font=(UI_FONT, 10, "bold"), padx=10, pady=7)
+        productive_frame.grid(row=row, column=0, columnspan=2, sticky="ew", padx=16, pady=(7, 5))
+        productive_frame.columnconfigure(1, weight=1)
+        productive_frame.grid_remove()
+        productive_summary = tk.StringVar(value="Pedido anterior al modelo productivo · calculá con reglas actuales.")
+        productive_warning = tk.StringVar(value="")
+        summary_label = tk.Label(productive_frame, textvariable=productive_summary, background=COLORS.panel_elevated,
+                 foreground=COLORS.text, justify="left", wraplength=350, font=(UI_FONT, 9))
+        summary_label.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 5))
+        productive_expanded = {"value": False}
+        detail_widgets = []
+        def toggle_productive_details():
+            productive_expanded["value"] = not productive_expanded["value"]
+            for widget in detail_widgets:
+                (widget.grid if productive_expanded["value"] else widget.grid_remove)()
+            productive_toggle.configure(text="Ocultar detalle" if productive_expanded["value"] else "Ver detalle")
+        productive_toggle = ttk.Button(productive_frame, text="Ver detalle", command=toggle_productive_details,
+                                       style="Secondary.TButton")
+        productive_toggle.grid(row=0, column=2, sticky="e")
+
+        def productive_number(key, fallback=0.0):
+            try:
+                return max(0.0, float(productive_vars[key].get().replace(",", ".") or fallback))
+            except (ValueError, AttributeError):
+                return fallback
+
+        def simulate_productive(*_args):
+            if not supports_productive_plancha_a4({"title": values["title"].get(), "material": values["material"].get(), "size": values["size"].get()}):
+                productive_frame.grid_remove()
+                productive_state["analysis"] = None
+                return
+            productive_frame.grid()
+            if productive_state["historical"]:
+                productive_summary.set(
+                    f"Plancha A4 · {source.get('productive_classification') or 'histórico'}\n"
+                    f"Sugerido ${float(source.get('suggested_price_snapshot') or 0):,.0f} · "
+                    f"Aplicado ${float(source.get('applied_price_snapshot') or 0):,.0f} · "
+                    f"Margen final {float(source.get('final_margin') or 0):.1f}%"
+                )
+                productive_warning.set("Valores históricos guardados. Usá Recalcular para comparar con las reglas actuales.")
+                return
+            try:
+                unique = max(1, int(productive_number("unique_designs", 1)))
+                minutes = productive_number("design_minutes", 10)
+                applied = productive_state["applied"]
+                context = analysis_context({
+                    "quantity": values["quantity"].get(), "production_estimate": {
+                        "unique_designs": unique, "design_minutes_list": [minutes] * unique,
+                        "print_minutes": productive_number("print_minutes", 10), "cut_minutes": productive_number("cut_minutes", 10),
+                        "production_mode": productive_vars["mode"].get(),
+                    },
+                    "extra_services": values["extra_services"].get(),
+                }, applied_price=applied)
+                if productive_state["manual"] is not None:
+                    context["manual_price"] = productive_state["manual"]
+                context["price_source"] = productive_state["price_source"]
+                analysis = self.database.calculate_productive_plancha_a4(context)
+                productive_state["analysis"] = analysis
+                applied_text = "Sin aplicar" if analysis["applied_price"] is None else f"${analysis['applied_price']:,.0f}"
+                productive_summary.set(
+                    f"Plancha A4 · {analysis['classification'].replace('_', ' ')}\n"
+                    f"{analysis['estimated_total_minutes']:g} min · Sugerido ${analysis['suggested_price']:,.0f} · "
+                    f"Aplicado {applied_text} · Margen final {analysis.get('applied_final_margin_percentage') if analysis['applied_price'] is not None else analysis['final_margin_percentage']:.1f}%"
+                )
+                notices = list(analysis.get("warnings") or [])
+                if analysis["production_mode"] == "batch" and not self.database.productive_plancha_a4_settings().get("batch_efficiency_enabled"):
+                    notices.append("La eficiencia por tanda no está activada en la configuración.")
+                productive_warning.set("\n".join(notices))
+            except Exception:
+                productive_state["analysis"] = None
+                productive_warning.set("Faltan datos productivos para calcular un precio confiable.")
+
+        labels = (("Diseños únicos", "unique_designs"), ("Minutos por diseño", "design_minutes"),
+                  ("Minutos impresión", "print_minutes"), ("Minutos corte/control", "cut_minutes"))
+        def on_productive_input(*_args):
+            productive_state["historical"] = False
+            simulate_productive()
+        for panel_row, (label, key) in enumerate(labels, start=1):
+            tk.Label(productive_frame, text=label, background=COLORS.panel_elevated, foreground=COLORS.text, font=(UI_FONT, 9)).grid(row=panel_row, column=0, sticky="w")
+            entry = tk.Entry(productive_frame, textvariable=productive_vars[key], background=COLORS.field, foreground=COLORS.text, insertbackground=COLORS.text, width=11)
+            entry.grid(row=panel_row, column=1, sticky="w", pady=1)
+            productive_vars[key].trace_add("write", on_productive_input)
+        ttk.Combobox(productive_frame, textvariable=productive_vars["mode"], values=["individual", "batch"], state="readonly", width=12, style="Order.TCombobox").grid(row=1, column=2, sticky="e")
+        productive_vars["mode"].trace_add("write", on_productive_input)
+
+        def apply_productive_price(kind):
+            analysis = productive_state.get("analysis")
+            if not analysis:
+                simulate_productive(); analysis = productive_state.get("analysis")
+            if not analysis:
+                return
+            if kind == "suggested":
+                productive_state.update(applied=analysis["suggested_price"], manual=None, price_source="suggested")
+                productive_vars["manual_price"].set("")
+            elif kind == "base":
+                productive_state.update(applied=analysis["base_price"], manual=None, price_source="base")
+                productive_vars["manual_price"].set("")
+            else:
+                try:
+                    manual = float(productive_vars["manual_price"].get().replace(",", "."))
+                except ValueError:
+                    productive_warning.set("Ingresá un precio manual válido."); return
+                if manual < 0:
+                    productive_warning.set("El precio manual no puede ser negativo."); return
+                productive_state.update(applied=manual, manual=manual, price_source="manual")
+            simulate_productive()
+            if productive_state.get("analysis"):
+                subtotal_var.set(f"$ {productive_state['analysis']['applied_price']:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+
+        price_actions = tk.Frame(productive_frame, background=COLORS.panel_elevated)
+        price_actions.grid(row=5, column=0, columnspan=3, sticky="w", pady=(5, 2))
+        ttk.Button(price_actions, text="Aplicar sugerido", command=lambda: apply_productive_price("suggested"), style="Secondary.TButton").pack(side="left")
+        ttk.Button(price_actions, text="Mantener base", command=lambda: apply_productive_price("base"), style="Secondary.TButton").pack(side="left", padx=4)
+        tk.Entry(price_actions, textvariable=productive_vars["manual_price"], width=10, background=COLORS.field, foreground=COLORS.text, insertbackground=COLORS.text).pack(side="left", padx=(4, 2))
+        ttk.Button(price_actions, text="Precio manual", command=lambda: apply_productive_price("manual"), style="Secondary.TButton").pack(side="left")
+        def recalculate_current_rules():
+            productive_state["historical"] = False
+            simulate_productive()
+        ttk.Button(price_actions, text="Recalcular", command=recalculate_current_rules, style="Secondary.TButton").pack(side="left", padx=4)
+        tk.Label(productive_frame, textvariable=productive_warning, background=COLORS.panel_elevated, foreground=COLORS.warning if hasattr(COLORS, "warning") else COLORS.wine_active, justify="left", wraplength=440, font=(UI_FONT, 8)).grid(row=6, column=0, columnspan=3, sticky="w")
+        detail_widgets[:] = [widget for widget in productive_frame.winfo_children()
+                             if widget not in (summary_label, productive_toggle)]
+        for widget in detail_widgets:
+            widget.grid_remove()
         row += 1
         
         # Estado
@@ -3224,58 +7371,248 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         notes.grid(row=row, column=1, sticky="ew", padx=(0, 16), pady=(8, 5))
         notes.insert("1.0", source.get("notes", ""))
 
-        button_row = row + 1
-        ttk.Button(form, text="Generar presupuesto", command=open_presupuesto_modal, style="Primary.TButton").grid(row=button_row, column=0, columnspan=2, sticky="ew", padx=16, pady=(4, 10))
-        row = button_row + 1
-        
         # Inicializar tamaños si hay material previo
         if source.get("material"):
             on_material_change()
+
+        # Restaurar la prioridad visual de un trabajo ya guardado, tomando el
+        # importe del servicio que se persistió junto al trabajo.
+        try:
+            saved_extra = float(source.get("extra_services") or 0)
+            saved_rule = self.database.suggest_price(
+                price_material_for_product(values["material"].get(), values["title"].get(), values["size"].get()),
+                values["size"].get().strip(), max(1, int(values["quantity"].get() or 1)),
+            )
+            saved_base = float(saved_rule["suggested_subtotal"]) if saved_rule and saved_rule.get("suggested_subtotal") else 0.0
+            for service_name, service_rate in priority_service_rates.items():
+                if service_rate and abs(saved_extra - saved_base * service_rate) < 0.01:
+                    priority_service_var.set(service_name)
+                    break
+        except (TypeError, ValueError):
+            pass
+
+        for productive_trigger in (values["title"], values["material"], values["size"], values["quantity"]):
+            productive_trigger.trace_add("write", on_productive_input)
+        simulate_productive()
         
         # Calcular subtotal inicial
         calculate_subtotal()
 
         def save():
+            extra = 0.0
             # Calcular el subtotal numérico final
             try:
                 material = values["material"].get().strip()
                 size = values["size"].get().strip()
                 quantity = max(1, int(values["quantity"].get() or 1))
                 discount = max(0, min(100, float(values["discount_percent"].get() or 0)))
-                extra = max(0, float(values["extra_services"].get() or 0))
-                
-                # Usar suggest_price para obtener el subtotal base
-                rule = self.database.suggest_price(material, size, quantity)
-                
-                if rule and rule.get("suggested_subtotal"):
-                    subtotal_base = float(rule["suggested_subtotal"])
-                    importe_descuento = subtotal_base * discount / 100
-                    subtotal_final = subtotal_base - importe_descuento + extra
+                priority_rate = priority_service_rates.get(priority_service_var.get(), 0.0)
+                fotocopia = fotocopia_calculation()
+                if fotocopia:
+                    subtotal_final = fotocopia.final_price
+                    extra = fotocopia.surcharge_amount
                 else:
-                    subtotal_final = 0
+                    # Usar suggest_price para obtener el subtotal base
+                    price_material = price_material_for_product(material, values["title"].get(), size)
+                    rule = self.database.suggest_price(price_material, size, quantity)
+                    
+                    if rule and rule.get("suggested_subtotal"):
+                        subtotal_base = float(rule["suggested_subtotal"])
+                        importe_descuento = subtotal_base * discount / 100
+                        extra = subtotal_base * priority_rate
+                        subtotal_final = subtotal_base - importe_descuento + extra
+                    else:
+                        extra = 0.0
+                        subtotal_final = 0
                     
             except (ValueError, TypeError):
                 subtotal_final = 0
+
+            productive_snapshot = {}
+            if supports_productive_plancha_a4({"title": values["title"].get(), "material": material, "size": size}):
+                # Una simulación sin elección explícita de precio no altera el
+                # total comercial guardado ni inventa un precio aplicado.
+                subtotal_final = float(source.get("subtotal") or 0)
+                simulate_productive()
+                analysis = productive_state.get("analysis")
+                if analysis:
+                    if analysis.get("applied_price") == 0 and not messagebox.askyesno(
+                        "Precio aplicado en cero", "El precio aplicado es $0 y no cubre el costo. ¿Guardar de todos modos?", parent=dialog
+                    ):
+                        return
+                    unique = max(1, int(productive_number("unique_designs", 1)))
+                    productive_snapshot = snapshot_job({
+                        **source, "quantity": quantity, "title": values["title"].get(), "material": material, "size": size,
+                        "production_estimate": {
+                            "unique_designs": unique, "design_minutes_list": [productive_number("design_minutes", 10)] * unique,
+                            "design_minutes": productive_number("design_minutes", 10) * unique,
+                            "print_minutes": productive_number("print_minutes", 10), "cut_minutes": productive_number("cut_minutes", 10),
+                            "production_mode": productive_vars["mode"].get(),
+                        },
+                    }, analysis)
+                    if analysis.get("applied_price") is not None:
+                        subtotal_final = analysis["applied_price"]
+            
+            # Obtener product_id si el producto está en el catálogo
+            selected_product_name = values["title"].get().strip()
+            product_id = None
+            variant_id = None
+            
+            # Buscar el producto en el catálogo
+            catalog_product = None
+            for product in catalog_products:
+                if product.get("name") == selected_product_name:
+                    catalog_product = product
+                    product_id = product.get("id")
+                    break
+            
+            # Si tenemos product_id, buscar variant_id que coincida con material/size
+            if product_id:
+                variant = self.database.connection.execute(
+                    """SELECT id FROM product_variants 
+                       WHERE product_id = ? AND active = 1 
+                       AND material = ? AND size = ?""",
+                    (product_id, material, size)
+                ).fetchone()
+                if variant:
+                    variant_id = variant["id"]
             
             clean = self.database._clean_order_job({
-                **source,
+                **source, **productive_snapshot,
                 "title": values["title"].get(),
                 "material": values["material"].get(),
                 "size": values["size"].get(),
                 "quantity": int(values["quantity"].get() or 1),
+                "unit_kind": values["unit_kind"].get(),
+                "distribution_policy": values["distribution_policy"].get(),
                 "subtotal": subtotal_final,
-                "discount_percent": float(values["discount_percent"].get() or 0),
-                "extra_services": float(values["extra_services"].get() or 0),
+                "discount_percent": max(0, min(100, float(values["discount_percent"].get() or 0))),
+                "extra_services": round(extra, 2),
                 "status": values["status"].get(),
                 "notes": notes.get("1.0", "end").strip(),
+                "product_id": product_id,
+                "variant_id": variant_id,
             })
             on_save(clean)
+            # Sincroniza la prioridad comercial con la casilla del pedido.
+            if hasattr(parent, "order_values"):
+                selected_priority = {
+                    "Prioridad Alta": "Alta",
+                    "Prioridad Urgente": "Urgente",
+                }.get(priority_service_var.get())
+                if selected_priority:
+                    parent.order_values["print_priority"].set(selected_priority)
             dialog.destroy()
 
-        actions = tk.Frame(dialog, background=COLORS.background)
-        actions.pack(fill="x", padx=18, pady=(0, 18))
+        def save_with_feedback():
+            """Evita que un error al guardar quede oculto detrás del diálogo."""
+            try:
+                save()
+            except Exception as error:
+                messagebox.showerror(
+                    "No se pudo guardar el trabajo",
+                    f"Ocurrió un error al guardar:\n{error}",
+                    parent=dialog,
+                )
+
+        def accept_simple():
+            """Guarda el trabajo desde los campos visibles del formulario.
+
+            Esta ruta no depende de la simulación productiva ni de variantes
+            auxiliares; el botón ACEPTAR debe poder confirmar siempre.
+            """
+            try:
+                material = values["material"].get().strip()
+                size = values["size"].get().strip()
+                quantity = max(1, int(values["quantity"].get() or 1))
+                discount = max(0, min(100, float(values["discount_percent"].get() or 0)))
+                priority_rate = priority_service_rates.get(priority_service_var.get(), 0.0)
+                # Las fotocopias no pueden pasar por ``suggest_price``: todas
+                # comparten el material Papel A4 y esa búsqueda puede tomar la
+                # regla de color. Usar siempre el código del producto elegido.
+                fotocopia = fotocopia_calculation()
+                if fotocopia:
+                    subtotal = fotocopia.final_price
+                    extra = fotocopia.surcharge_amount
+                else:
+                    rule = self.database.suggest_price(
+                        price_material_for_product(material, values["title"].get(), size), size, quantity,
+                    )
+                    subtotal_base = float(rule.get("suggested_subtotal") or 0) if rule else 0.0
+                    extra = round(subtotal_base * priority_rate, 2)
+                    subtotal = round(subtotal_base * (1 - discount / 100) + extra, 2)
+                clean = self.database._clean_order_job({
+                    **source,
+                    "title": values["title"].get().strip(), "material": material, "size": size,
+                    "quantity": quantity, "subtotal": subtotal,
+                    "unit_kind": values["unit_kind"].get(),
+                    "distribution_policy": values["distribution_policy"].get(),
+                    "discount_percent": discount, "extra_services": extra,
+                    "status": values["status"].get(),
+                    "notes": notes.get("1.0", "end").strip(),
+                })
+                identity_changed = any(str(clean.get(key) or "") != str(source.get(key) or "")
+                                       for key in ("title", "material", "size", "quantity"))
+                if source.get("id") and not identity_changed and discount == float(source.get("discount_percent") or 0) and not priority_rate:
+                    clean["subtotal"] = float(source.get("subtotal") or 0)
+                if identity_changed or not source.get("id"):
+                    product = next((p for p in catalog_products if p.get("name") == clean["title"]), None)
+                    clean["product_id"] = product["id"] if product else None
+                    variant = self.database.connection.execute(
+                        "SELECT id FROM product_variants WHERE product_id=? AND active=1 AND material=? AND size=?",
+                        (clean["product_id"], material, size),
+                    ).fetchone()
+                    clean["variant_id"] = variant["id"] if variant else None
+                on_save(clean)
+                dialog.destroy()
+            except Exception as error:
+                # No ocultar fallos de persistencia o de actualización de la
+                # pantalla: el usuario necesita ver el motivo exacto.
+                messagebox.showerror(
+                    "No se pudo guardar el trabajo",
+                    f"No se aplicaron los cambios.\n\nDetalle: {error}",
+                    parent=dialog,
+                )
+
+        # Las acciones forman parte del panel para que no dependan del espacio
+        # libre que el gestor ``pack`` deje fuera del formulario.
+        # Acciones sobre la ventana, no dentro del panel expandible. Esto evita
+        # que cualquier cálculo de altura del formulario las recorte.
+        # Las acciones se ubican dentro del formulario para que el panel no
+        # las cubra cuando ocupa toda la altura disponible del diálogo.
+        actions = tk.Frame(form, background=COLORS.panel_elevated)
+        actions.grid(row=row + 1, column=0, columnspan=2, sticky="e", padx=16, pady=(18, 16))
         ttk.Button(actions, text="Cancelar", command=dialog.destroy, style="Secondary.TButton").pack(side="right")
-        ttk.Button(actions, text="Guardar trabajo", command=save, style="Primary.TButton").pack(side="right", padx=(0, 8))
+        ttk.Button(
+            actions,
+            text="Guardar modificaciones" if job else "Agregar trabajo",
+            command=accept_simple,
+            style="Primary.TButton",
+        ).pack(side="right", padx=(0, 9))
+
+        # Enter confirma desde los campos de una línea. En Notas conserva su
+        # comportamiento normal para que se puedan escribir varios renglones.
+        def save_on_enter(_event=None):
+            accept_simple()
+            return "break"
+
+        # ``bind_all`` no se usa: el atajo queda limitado a este diálogo.
+        # Se registra sobre cada widget de una línea para que los Combobox no
+        # consuman Enter antes de llegar al Toplevel.
+        dialog.bind("<Return>", save_on_enter)
+        dialog.bind("<KP_Enter>", save_on_enter)
+        for widget in dialog.winfo_children():
+            if widget is not form:
+                continue
+            for field in widget.winfo_children():
+                if isinstance(field, (tk.Entry, ttk.Combobox)):
+                    field.bind("<Return>", save_on_enter)
+                    field.bind("<KP_Enter>", save_on_enter)
+        def newline_in_notes(_event=None):
+            notes.insert("insert", "\n")
+            return "break"
+
+        notes.bind("<Return>", newline_in_notes)
         self.center_window(dialog)
 
     def _recover_order_draft(self, order_id: int):
@@ -3309,6 +7646,14 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         tab.order_id, tab.order_dirty, tab.order_save_after = order_id, False, None
         tab.order_design_state = self.database.order_designs(order_id)
         tab.order_job_state = self.database.order_jobs(order_id)
+        # Los campos históricos de concepto y descripción se consolidan en una
+        # sola nota legible para evitar tres lugares para escribir lo mismo.
+        note_parts = [
+            str(order.get(key) or "").strip()
+            for key in ("order_concept", "order_description", "observations")
+            if str(order.get(key) or "").strip()
+        ]
+        tab.unified_order_notes = "\n\n".join(dict.fromkeys(note_parts))
         tab.order_values = {
             "client": tk.StringVar(value=order.get("client_name") or order["client"]),
             "whatsapp": tk.StringVar(value=order.get("whatsapp") or ""),
@@ -3324,18 +7669,63 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             "discount_percent": tk.StringVar(value=str(order.get("discount_percent") or 0)),
             "extra_services": tk.StringVar(value=order.get("extra_services") or ""),
             "assigned_to": tk.StringVar(value=order.get("assigned_to") or ""),
+            "seller_commission_percent": tk.StringVar(
+                value="10" if (order.get("assigned_to") or "").strip() == "Francisco Franco Salguero" else "0"
+            ),
             "delivery_date": tk.StringVar(value=order.get("delivery_date") or ""),
             "print_priority": tk.StringVar(value=priority_label(order.get("print_priority"))),
             "pending_reason": tk.StringVar(value=order.get("pending_reason") or ""),
+            "complaint_notes": tk.StringVar(value=order.get("complaint_notes") or ""),
         }
         top = ttk.Frame(tab, padding=(12, 12, 12, 5))
         top.pack(fill="x")
         tab.order_title = tk.StringVar(value=f"Pedido #{order_id} · {order.get('client_name') or order['client']}")
-        ttk.Label(top, textvariable=tab.order_title, style="Title.TLabel").pack(side="left")
+        title_label = ttk.Label(tab, textvariable=tab.order_title, font=(UI_FONT, 14, "bold"), wraplength=700)
+        title_label.pack(fill="x", before=top, padx=12, pady=(8, 0))
+        tab.bind("<Configure>", lambda event: title_label.configure(wraplength=max(220, event.width-32))
+                 if event.widget is tab else None, add="+")
         tab.order_saved = tk.StringVar(value="Guardado")
         ttk.Label(top, textvariable=tab.order_saved, style="Muted.TLabel").pack(side="right")
-        ttk.Button(top, text="Guardar ahora", command=lambda: self.flush_order_autosave(order_id)).pack(side="right", padx=(0, 8))
-        ttk.Button(top, text="Armado de planchas", command=lambda: self.open_plancha_for_order(order_id)).pack(side="right", padx=(0, 8))
+        ttk.Button(top, text="Guardar", command=lambda: self.flush_order_autosave(order_id)).pack(side="right", padx=(0, 8))
+        ttk.Button(
+            top, text="Vincular pedido principal",
+            command=lambda: self.link_order_to_parent(order_id),
+        ).pack(side="right", padx=(0, 8))
+        if order.get("parent_order_id"):
+            ttk.Button(
+                top, text="Desvincular",
+                command=lambda: self.unlink_order_from_parent(order_id),
+            ).pack(side="right", padx=(0, 8))
+            ttk.Label(
+                top, text=f"Relacionado con pedido #{order['parent_order_id']}",
+                style="Muted.TLabel",
+            ).pack(side="right", padx=(0, 8))
+        ttk.Button(top, text="Factura C / ARCA", command=lambda: self.show_order_fiscal_dialog(order_id)).pack(side="right", padx=(0, 8))
+        production_route = order_production_route(order, tab.order_job_state)
+        production_label = {
+            "plancha": "Armado de planchas",
+            "photo_printing": "Impresiones fotográficas",
+            "continuous": "Impresión continua",
+        }[production_route]
+        ttk.Button(top, text=production_label, command=lambda: self.open_plancha_for_order(order_id)).pack(side="right", padx=(0, 8))
+
+        # Keep every action reachable even with the sidebar open at 1040 px.
+        action_widgets = list(reversed(top.winfo_children()))
+        for widget in action_widgets:
+            widget.pack_forget()
+        def layout_order_actions(event=None):
+            width = max(180, top.winfo_width() - 24)
+            row = column = used = 0
+            for widget in action_widgets:
+                needed = widget.winfo_reqwidth() + 8
+                if used and used + needed > width:
+                    row += 1
+                    column = used = 0
+                widget.grid(row=row, column=column, sticky="w", padx=(0, 8), pady=2)
+                used += needed
+                column += 1
+        top.bind("<Configure>", layout_order_actions, add="+")
+        top.after_idle(layout_order_actions)
 
         workspace = ttk.Frame(tab)
         workspace.pack(fill="both", expand=True)
@@ -3367,7 +7757,11 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         # Etapa actual y progreso
         stage = get_current_stage(order)
         progress = get_stage_progress(order)
-        tab.timeline_status = tk.StringVar(value=f"{stage} · {int(progress * 100)}% completado")
+        tab.timeline_status = tk.StringVar(value=f"Estado del flujo: {stage} · no mide cantidades físicas")
+        tk.Label(
+            timeline_panel, text="ESTADO DEL FLUJO · avance físico en el panel de producción", background=COLORS.panel,
+            foreground=COLORS.muted, font=(IDENTITY_FONT, 8, "bold"),
+        ).pack(anchor="w", padx=14)
         tk.Label(
             timeline_panel,
             textvariable=tab.timeline_status,
@@ -3391,16 +7785,48 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             font=(UI_FONT, 9)
         ).pack(anchor="w", padx=14, pady=(0, 12))
         
-        form = ttk.Frame(body, padding=12)
-        form.pack(side="left", fill="y")
-        designs = ttk.Frame(body, padding=12)
-        designs.pack(side="left", fill="both", expand=True, padx=(10, 0))
+        # El detalle necesita conservar dos columnas en pantallas anchas, pero
+        # no debe encoger el panel de trabajos hasta volverlo ilegible cuando
+        # la ventana se reduce.  El contenedor cambia a una columna antes de
+        # que alguno de los dos paneles quede recortado por el canvas.
+        detail_panels = ttk.Frame(body)
+        detail_panels.pack(fill="both", expand=True)
+        detail_panels.columnconfigure(0, weight=3, minsize=440)
+        detail_panels.columnconfigure(1, weight=2, minsize=360)
+
+        form = ttk.Frame(detail_panels, padding=12)
+        designs = ttk.Frame(detail_panels, padding=12)
+        finance_section = ttk.Frame(detail_panels, padding=12)
+        finance_section.columnconfigure(0, weight=1)
+
+        def arrange_detail_panels(event=None):
+            compact = detail_panels.winfo_width() < 1040
+            if compact:
+                detail_panels.columnconfigure(0, minsize=0)
+                detail_panels.columnconfigure(1, minsize=0)
+                # En una pantalla chica, los datos del cliente siguen a la
+                # línea de tiempo y preceden a los trabajos y diseños.
+                form.grid(row=0, column=0, sticky="ew")
+                designs.grid(row=1, column=0, sticky="nsew", padx=0)
+                finance_section.grid(row=2, column=0, sticky="ew")
+            else:
+                detail_panels.columnconfigure(0, minsize=440)
+                detail_panels.columnconfigure(1, minsize=360)
+                form.grid(row=0, column=0, sticky="nsew")
+                designs.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+                finance_section.grid(row=1, column=0, columnspan=2, sticky="ew")
+
+        detail_panels.bind("<Configure>", arrange_detail_panels)
+        # La primera distribución evita un salto visual antes del primer
+        # evento Configure del canvas.
+        arrange_detail_panels()
         ttk.Label(form, text="DATOS GENERALES", style="Tag.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
         fields = (
             ("Cliente", "client"), ("WhatsApp", "whatsapp"), ("Tipo de cliente", "client_type"),
             ("Fecha de ingreso", "order_date"), ("Estado", "status"),
-            ("Asignado a", "assigned_to"), ("Fecha de entrega", "delivery_date"),
-            ("Prioridad", "print_priority"), ("Trabajo pendiente", "pending_reason"),
+            ("Asignado a", "assigned_to"),
+            ("Fecha de entrega", "delivery_date"),
+            ("Prioridad", "print_priority"),
         )
         for row, (label, key) in enumerate(fields, start=1):
             ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=4)
@@ -3426,6 +7852,18 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                         )
                     self.queue_orders_refresh()
                 tab.order_values[key].trace_add("write", _on_type_change)
+            elif key == "assigned_to":
+                widget = ttk.Combobox(
+                    form, textvariable=tab.order_values[key],
+                    values=("Augusto Franco Salguero", "Francisco Franco Salguero"),
+                    state="readonly", width=26,
+                )
+
+                def _apply_sales_commission(*_args):
+                    is_francisco = tab.order_values["assigned_to"].get().strip() == "Francisco Franco Salguero"
+                    tab.order_values["seller_commission_percent"].set("10" if is_francisco else "0")
+
+                tab.order_values[key].trace_add("write", _apply_sales_commission)
             elif key == "order_date":
                 # Campo de fecha de creación: solo lectura, muestra fecha y hora
                 widget = ttk.Entry(form, textvariable=tab.order_values[key], width=29, state="readonly")
@@ -3444,83 +7882,212 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             else:
                 widget = ttk.Entry(form, textvariable=tab.order_values[key], width=29)
             widget.grid(row=row, column=1, sticky="ew", pady=4)
-        ttk.Label(form, text="Concepto").grid(row=len(fields) + 1, column=0, sticky="nw", padx=(0, 10), pady=(9, 4))
-        ttk.Entry(form, textvariable=tab.order_values["order_concept"], width=29).grid(row=len(fields) + 1, column=1, sticky="ew", pady=(9, 4))
-        ttk.Label(form, text="Descripción").grid(row=len(fields) + 2, column=0, sticky="nw", padx=(0, 10), pady=(9, 4))
-        ttk.Entry(form, textvariable=tab.order_values["order_description"], width=29).grid(row=len(fields) + 2, column=1, sticky="ew", pady=(9, 4))
-        ttk.Label(form, text="Observaciones").grid(row=len(fields) + 3, column=0, sticky="nw", padx=(0, 10), pady=(9, 4))
+        ttk.Label(form, text="Descripción y observaciones").grid(row=len(fields) + 1, column=0, sticky="nw", padx=(0, 10), pady=(9, 4))
         tab.order_notes = tk.Text(form, width=30, height=7, background="#050606", foreground="#e7d3c4", insertbackground="#e7d3c4", relief="flat")
-        tab.order_notes.grid(row=len(fields) + 3, column=1, sticky="ew", pady=(9, 4))
-        tab.order_notes.insert("1.0", order.get("observations") or "")
+        tab.order_notes.grid(row=len(fields) + 1, column=1, sticky="ew", pady=(9, 4))
+        tab.order_notes.insert("1.0", tab.unified_order_notes)
         form.columnconfigure(1, weight=1)
-        ttk.Separator(form, orient="horizontal").grid(row=len(fields) + 4, column=0, columnspan=2, sticky="ew", pady=12)
-        
+        ttk.Separator(form, orient="horizontal").grid(row=len(fields) + 3, column=0, columnspan=2, sticky="ew", pady=12)
+
         # Sección de prioridad y tiempo
-        ttk.Label(form, text="PRIORIDAD Y TIEMPO", style="Tag.TLabel").grid(row=len(fields) + 5, column=0, columnspan=2, sticky="w")
+        ttk.Label(form, text="PRIORIDAD Y TIEMPO", style="Tag.TLabel").grid(row=len(fields) + 4, column=0, columnspan=2, sticky="w")
         tab.priority_info = tk.StringVar()
-        ttk.Label(form, textvariable=tab.priority_info, style="Muted.TLabel", wraplength=300).grid(row=len(fields) + 6, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        ttk.Separator(form, orient="horizontal").grid(row=len(fields) + 7, column=0, columnspan=2, sticky="ew", pady=12)
+        ttk.Label(form, textvariable=tab.priority_info, style="Muted.TLabel", wraplength=300).grid(row=len(fields) + 5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Separator(form, orient="horizontal").grid(row=len(fields) + 6, column=0, columnspan=2, sticky="ew", pady=12)
         
-        # Sección de progreso
-        tab.order_progress = tk.StringVar()
-        ttk.Label(form, text="PROGRESO", style="Tag.TLabel").grid(row=len(fields) + 8, column=0, columnspan=2, sticky="w")
-        ttk.Label(form, textvariable=tab.order_progress, style="Muted.TLabel", wraplength=300).grid(row=len(fields) + 9, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        ttk.Separator(form, orient="horizontal").grid(row=len(fields) + 10, column=0, columnspan=2, sticky="ew", pady=12)
-        ttk.Label(form, text="PRESUPUESTO Y COBROS", style="Tag.TLabel").grid(row=len(fields) + 11, column=0, columnspan=2, sticky="w")
+        # Sección de progreso: separar el avance de diseños de las unidades del pedido.
+        # Antes ambos datos convivían en una sola frase y daba la impresión de que
+        # "5 diseños" equivalían a "6000 unidades".
+        ttk.Label(form, text="PROGRESO", style="Tag.TLabel").grid(row=len(fields) + 7, column=0, columnspan=2, sticky="w")
+        progress_panel = tk.Frame(
+            form, background=COLORS.panel, highlightthickness=1,
+            highlightbackground=COLORS.border,
+        )
+        progress_panel.grid(row=len(fields) + 8, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        progress_panel.columnconfigure(0, weight=1)
+        tab.order_progress = tk.StringVar(value="Sin diseños asignados")
+        tab.order_progress_percent = tk.StringVar(value="0%")
+        tab.order_progress_detail = tk.StringVar(value="Agregá diseños para iniciar el seguimiento.")
+        tab.order_progress_value = tk.DoubleVar(value=0)
+        tk.Label(progress_panel, textvariable=tab.order_progress, background=COLORS.panel,
+                 foreground=COLORS.text, font=(UI_FONT, 10, "bold"), anchor="w").grid(
+                     row=0, column=0, sticky="w", padx=(10, 6), pady=(9, 2))
+        tk.Label(progress_panel, textvariable=tab.order_progress_percent, background=COLORS.panel,
+                 foreground=COLORS.wine_active, font=(UI_FONT, 10, "bold"), anchor="e").grid(
+                     row=0, column=1, sticky="e", padx=(6, 10), pady=(9, 2))
+        ttk.Progressbar(progress_panel, orient="horizontal", mode="determinate", maximum=100,
+                        variable=tab.order_progress_value).grid(
+                            row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(4, 5))
+        tk.Label(progress_panel, textvariable=tab.order_progress_detail, background=COLORS.panel,
+                 foreground=COLORS.muted, font=(UI_FONT, 9), anchor="w").grid(
+                     row=2, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 9))
+        ttk.Separator(form, orient="horizontal").grid(row=len(fields) + 11, column=0, columnspan=2, sticky="ew", pady=12)
+        finances_header = tk.Frame(finance_section, background=COLORS.background)
+        finances_header.grid(row=0, column=0, sticky="ew")
+        finances_header.columnconfigure(0, weight=1)
+        tk.Label(
+            finances_header, text="PRESUPUESTO Y COBROS", background=COLORS.background,
+            foreground=COLORS.wine_active, font=(IDENTITY_FONT, 10, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        tab.order_payment_status = tk.StringVar(value="PENDIENTE")
+        tab.order_payment_status_badge = tk.Label(
+            finances_header, textvariable=tab.order_payment_status,
+            background=COLORS.warning, foreground=COLORS.background,
+            font=(UI_FONT, 8, "bold"), padx=8, pady=3,
+        )
+        tab.order_payment_status_badge.grid(row=0, column=1, sticky="e")
 
-        # Panel de desglose de costos y margen
-        fin_panel = tk.Frame(form, background=COLORS.panel,
-                             highlightthickness=1, highlightbackground=COLORS.border)
-        fin_panel.grid(row=len(fields) + 12, column=0, columnspan=2, sticky="ew", pady=(6, 4))
+        # Resumen comercial: primero muestra lo que hay que cobrar; el detalle de
+        # costos queda disponible sin competir con las acciones cotidianas.
+        fin_panel = tk.Frame(
+            finance_section, background=COLORS.panel, highlightthickness=1,
+            highlightbackground=COLORS.border,
+        )
+        fin_panel.grid(row=1, column=0, sticky="ew", pady=(7, 4))
         fin_panel.columnconfigure(0, weight=1)
-        fin_panel.columnconfigure(1, weight=0)
+        fin_panel.columnconfigure(1, weight=1)
+        tab.order_fin_vars = {
+            key: tk.StringVar(value="—")
+            for key in (
+                "fin_price", "fin_paid", "fin_pending", "fin_cost_mp",
+                "fin_cost_mo", "fin_cost_cf", "fin_commission", "fin_cost_total", "fin_margin",
+            )
+        }
 
-        _fin_rows = [
-            ("Precio de venta",   "fin_price",    COLORS.text,       False),
-            ("─────────────────", None,            COLORS.border,     False),
-            ("M.P — Materia Prima","fin_cost_mp",  "#4E8AC7",         False),
-            ("M.O — Mano de Obra", "fin_cost_mo",  "#4E8AC7",         False),
-            ("C.F — Carga Fabril", "fin_cost_cf",  "#4E8AC7",         False),
-            ("Costo total",        "fin_cost_total","#C98A27",         True),
-            ("Margen bruto",       "fin_margin",    "#2D9B66",         True),
-            ("─────────────────", None,            COLORS.border,     False),
-            ("Cobrado",            "fin_paid",      "#2D9B66",         False),
-            ("Pendiente",          "fin_pending",   "#C94B27",         False),
-        ]
-        tab.order_fin_vars = {}
-        for r_idx, (label, var_key, color, bold) in enumerate(_fin_rows):
-            if var_key is None:
-                tk.Frame(fin_panel, height=1, background=color
-                         ).grid(row=r_idx, column=0, columnspan=2, sticky="ew",
-                                padx=8, pady=2)
-                continue
-            font = (IDENTITY_FONT if bold else UI_FONT, 9, "bold" if bold else "normal")
-            tk.Label(fin_panel, text=label, background=COLORS.panel,
-                     foreground=COLORS.muted, font=(UI_FONT, 9)
-                     ).grid(row=r_idx, column=0, sticky="w", padx=(10, 4), pady=1)
-            sv = tk.StringVar(value="—")
-            tab.order_fin_vars[var_key] = sv
-            tk.Label(fin_panel, textvariable=sv, background=COLORS.panel,
-                     foreground=color, font=font
-                     ).grid(row=r_idx, column=1, sticky="e", padx=(4, 10), pady=1)
+        tk.Label(
+            fin_panel, text="SALDO PENDIENTE", background=COLORS.panel,
+            foreground=COLORS.muted, font=(UI_FONT, 8, "bold"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(11, 1))
+        tab.order_pending_label = tk.Label(
+            fin_panel, textvariable=tab.order_fin_vars["fin_pending"],
+            background=COLORS.panel, foreground=COLORS.error,
+            font=(IDENTITY_FONT, 20, "bold"),
+        )
+        tab.order_pending_label.grid(row=1, column=0, columnspan=2, sticky="w", padx=12)
 
-        # Mantener la StringVar legacy que usa refresh_order_workspace
+        metrics = tk.Frame(fin_panel, background=COLORS.panel)
+        metrics.grid(row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=(9, 7))
+        for column in range(2):
+            metrics.columnconfigure(column, weight=1)
+        for column, (caption, var_key, color) in enumerate((
+            ("TOTAL", "fin_price", COLORS.text),
+            ("COBRADO", "fin_paid", COLORS.success),
+        )):
+            metric = tk.Frame(metrics, background=COLORS.panel_elevated)
+            metric.grid(
+                row=0, column=column, sticky="ew",
+                padx=(0, 4) if column == 0 else (4, 0),
+            )
+            tk.Label(
+                metric, text=caption, background=COLORS.panel_elevated,
+                foreground=COLORS.muted, font=(UI_FONT, 8, "bold"),
+            ).pack(anchor="w", padx=9, pady=(7, 1))
+            tk.Label(
+                metric, textvariable=tab.order_fin_vars[var_key],
+                background=COLORS.panel_elevated, foreground=color,
+                font=(IDENTITY_FONT, 12, "bold"),
+            ).pack(anchor="w", padx=9, pady=(0, 7))
+
+        tab.order_payment_progress_value = tk.DoubleVar(value=0)
+        ttk.Progressbar(
+            fin_panel, orient="horizontal", mode="determinate", maximum=100,
+            variable=tab.order_payment_progress_value,
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", padx=12, pady=(2, 3))
+        tab.order_payment_progress_text = tk.StringVar(value="Todavía no se registraron cobros")
+        tk.Label(
+            fin_panel, textvariable=tab.order_payment_progress_text,
+            background=COLORS.panel, foreground=COLORS.muted,
+            font=(UI_FONT, 8),
+        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=12)
+
+        tab.order_last_payment = tk.StringVar(value="Sin cobros registrados")
+        tk.Label(
+            fin_panel, textvariable=tab.order_last_payment,
+            background=COLORS.panel, foreground=COLORS.muted,
+            font=(UI_FONT, 8), wraplength=280, justify="left",
+        ).grid(row=5, column=0, columnspan=2, sticky="w", padx=12, pady=(3, 8))
+
+        cost_details = tk.Frame(fin_panel, background=COLORS.panel_elevated)
+        cost_details.grid(row=7, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 10))
+        cost_details.columnconfigure(1, weight=1)
+        for row, (label, var_key, color, bold) in enumerate((
+            ("Materia prima", "fin_cost_mp", COLORS.info, False),
+            ("Mano de obra", "fin_cost_mo", COLORS.info, False),
+            ("Carga fabril", "fin_cost_cf", COLORS.info, False),
+            ("Comisión Francisco (10% de ganancia)", "fin_commission", COLORS.info, False),
+            ("Costo total", "fin_cost_total", COLORS.warning, True),
+            ("Ganancia interna", "fin_margin", COLORS.success, True),
+        )):
+            tk.Label(
+                cost_details, text=label, background=COLORS.panel_elevated,
+                foreground=COLORS.muted, font=(UI_FONT, 8),
+            ).grid(row=row, column=0, sticky="w", padx=(9, 4), pady=2)
+            tk.Label(
+                cost_details, textvariable=tab.order_fin_vars[var_key],
+                background=COLORS.panel_elevated, foreground=color,
+                font=(UI_FONT, 8, "bold" if bold else "normal"),
+            ).grid(row=row, column=1, sticky="e", padx=(4, 9), pady=2)
+        tab.order_cost_details_visible = False
+        cost_details.grid_remove()
+
+        def toggle_cost_details():
+            tab.order_cost_details_visible = not tab.order_cost_details_visible
+            if tab.order_cost_details_visible:
+                cost_details.grid()
+                tab.order_cost_toggle.configure(text="Ocultar rentabilidad  ▲")
+            else:
+                cost_details.grid_remove()
+                tab.order_cost_toggle.configure(text="Ver rentabilidad  ▼")
+
+        tab.order_cost_toggle = ttk.Button(
+            fin_panel, text="Ver rentabilidad  ▼", command=toggle_cost_details,
+            style="Secondary.TButton",
+        )
+        tab.order_cost_toggle.grid(
+            row=6, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 8),
+        )
+
+        # Mantener la StringVar legacy que usa refresh_order_workspace.
         tab.order_financials = tk.StringVar(value="")
 
-        finances_actions = ttk.Frame(form)
-        finances_actions.grid(row=len(fields) + 13, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        ttk.Button(finances_actions, text="Registrar cobro", command=lambda: self.register_order_payment(order_id)).pack(side="left")
-        ttk.Button(finances_actions, text="Ver actividad", command=lambda: self.show_order_activity(order_id)).pack(side="left", padx=6)
-        ttk.Button(finances_actions, text="Usar sugerido", command=lambda: self.apply_suggested_order_price(order_id)).pack(side="left")
+        finances_actions = ttk.Frame(finance_section)
+        finances_actions.grid(row=2, column=0, sticky="ew", pady=(5, 0))
+        for column in range(2):
+            finances_actions.columnconfigure(column, weight=1)
+        ttk.Button(
+            finances_actions, text="Registrar cobro", style="Primary.TButton",
+            command=lambda: self.register_order_payment(order_id),
+        ).grid(row=0, column=0, columnspan=2, sticky="ew")
+        ttk.Button(
+            finances_actions, text="Generar presupuesto",
+            command=lambda: self.generate_order_budget(order_id),
+        ).grid(row=1, column=0, sticky="ew", padx=(0, 3), pady=(6, 0))
+        ttk.Button(
+            finances_actions, text="Eliminar cobro", style="Danger.TButton",
+            command=lambda: self.show_order_payments(order_id),
+        ).grid(row=1, column=1, sticky="ew", padx=(3, 0), pady=(6, 0))
+        ttk.Button(
+            finances_actions, text="Usar precio sugerido",
+            command=lambda: self.apply_suggested_order_price(order_id),
+        ).grid(row=2, column=0, sticky="ew", padx=(0, 3), pady=(6, 0))
+        ttk.Button(
+            finances_actions, text="Configurar precios", style="Secondary.TButton",
+            command=lambda: self.show_commercial_management("prices"),
+        ).grid(row=2, column=1, sticky="ew", padx=(3, 0), pady=(6, 0))
         ttk.Separator(form, orient="horizontal").grid(row=len(fields) + 14, column=0, columnspan=2, sticky="ew", pady=12)
         ttk.Label(form, text="DISEÑOS", style="Tag.TLabel").grid(row=len(fields) + 15, column=0, columnspan=2, sticky="w")
         tab.preparation_summary = tk.StringVar(value="Agregá diseños al pedido desde la biblioteca.")
         ttk.Label(form, textvariable=tab.preparation_summary, style="Muted.TLabel", wraplength=300).grid(row=len(fields) + 16, column=0, columnspan=2, sticky="w", pady=(4, 6))
         prep_actions = ttk.Frame(form)
         prep_actions.grid(row=len(fields) + 17, column=0, columnspan=2, sticky="ew")
-        ttk.Button(prep_actions, text="Crear Sticker", command=lambda: self.open_sticker_studio(), style="Primary.TButton").pack(side="left")
-        ttk.Button(prep_actions, text="Agregar diseños", command=lambda: self.show_add_designs_dialog(order_id), style="Secondary.TButton").pack(side="left", padx=6)
-        ttk.Label(form, text="Creá nuevos stickers o agregá desde la biblioteca.", style="Muted.TLabel", wraplength=300).grid(row=len(fields) + 18, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Button(
+            prep_actions,
+            text="Crear sticker para este pedido",
+            command=lambda: self.open_sticker_creator_for_order(order_id),
+            style="Primary.TButton",
+        ).pack(side="left")
+        ttk.Button(prep_actions, text="Abrir catálogo de diseños", command=lambda: self.show_add_designs_catalog(order_id), style="Secondary.TButton").pack(side="left", padx=6)
+        ttk.Label(form, text="Los nuevos stickers quedan privados en este pedido; también podés agregar diseños desde la biblioteca.", style="Muted.TLabel", wraplength=300).grid(row=len(fields) + 18, column=0, columnspan=2, sticky="w", pady=(4, 0))
         ttk.Separator(form, orient="horizontal").grid(row=len(fields) + 19, column=0, columnspan=2, sticky="ew", pady=12)
         ttk.Label(form, text="APROBACIÓN", style="Tag.TLabel").grid(row=len(fields) + 20, column=0, columnspan=2, sticky="w")
         tab.order_approval_summary = tk.StringVar(value="Sin planchas vinculadas.")
@@ -3530,8 +8097,35 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         ttk.Label(form, textvariable=tab.order_previews_summary, style="Muted.TLabel", wraplength=300).grid(row=len(fields) + 23, column=0, columnspan=2, sticky="w", pady=(4, 6))
         ttk.Button(form, text="Abrir última vista", command=lambda: self.open_latest_order_preview(order_id)).grid(row=len(fields) + 24, column=0, columnspan=2, sticky="w")
 
-        jobs_panel = ttk.Frame(designs, padding=(0, 0, 0, 10))
-        jobs_panel.pack(fill="x")
+        # El detalle queda oculto hasta que se necesite registrar un reclamo.
+        complaints_panel = ttk.Frame(form)
+        complaints_panel.grid(row=len(fields) + 25, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        complaints_panel.columnconfigure(0, weight=1)
+        tab.complaint_notes_visible = tk.BooleanVar(value=bool(tab.order_values["complaint_notes"].get().strip()))
+        tab.complaint_notes_box = tk.Text(
+            complaints_panel, width=30, height=4, background="#050606", foreground="#e7d3c4",
+            insertbackground="#e7d3c4", relief="flat", wrap="word",
+        )
+        tab.complaint_notes_box.insert("1.0", tab.order_values["complaint_notes"].get())
+
+        def toggle_complaint_notes():
+            if tab.complaint_notes_visible.get():
+                tab.complaint_notes_box.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+            else:
+                tab.complaint_notes_box.grid_remove()
+
+        def on_complaint_button():
+            tab.complaint_notes_visible.set(not tab.complaint_notes_visible.get())
+            toggle_complaint_notes()
+
+        ttk.Button(complaints_panel, text="¿Reclamos o quejas?", command=on_complaint_button).grid(row=0, column=0, sticky="w")
+        toggle_complaint_notes()
+
+        jobs_panel = ttk.Frame(form, padding=(0, 0, 0, 10))
+        jobs_panel.grid(
+            row=len(fields) + 2, column=0, columnspan=2,
+            sticky="ew", pady=(4, 0),
+        )
         # Panel: Trabajos del pedido (filtrado de trabajos con estado 'Confirmado' o 'Entregado')
         products_panel = tk.Frame(jobs_panel, background=COLORS.panel_elevated, highlightbackground=COLORS.border, highlightthickness=1)
         products_panel.pack(fill="x", padx=14, pady=(0, 12))
@@ -3540,54 +8134,139 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         tk.Label(header_row, text="TRABAJOS DEL PEDIDO", background=COLORS.panel_elevated, foreground=COLORS.wine_active, font=(IDENTITY_FONT, 10, "bold")).pack(side="left")
         tab.order_products_summary = tk.StringVar(value="")
         tk.Label(header_row, textvariable=tab.order_products_summary, background=COLORS.panel_elevated, foreground=COLORS.muted, font=(UI_FONT, 9)).pack(side="left", padx=10)
+        ttk.Button(
+            header_row,
+            text="Generar presupuesto",
+            command=lambda oid=order_id: self.generate_order_budget(oid),
+        ).pack(side="right", padx=(6, 0))
         ttk.Button(header_row, text="＋ Agregar", command=lambda oid=order_id: self.add_order_job(oid), style="Primary.TButton").pack(side="right")
         # Treeview para trabajos del pedido (columnas adaptables al espacio)
-        prod_cols = ("title", "material", "quantity", "price")
+        prod_cols = ("title", "quantity", "production", "price")
         prod_tree = ttk.Treeview(products_panel, columns=prod_cols, show="headings", height=6)
         # Configurar columnas con stretch para que se adapten al espacio
         prod_tree.heading("title", text="Producto")
-        prod_tree.column("title", width=180, minwidth=120, stretch=True, anchor="w")
-        prod_tree.heading("material", text="Material")
-        prod_tree.column("material", width=130, minwidth=80, stretch=True, anchor="w")
+        prod_tree.column("title", width=250, minwidth=150, stretch=True, anchor="w")
         prod_tree.heading("quantity", text="Cantidad")
-        prod_tree.column("quantity", width=70, minwidth=60, stretch=True, anchor="center")
+        prod_tree.column("quantity", width=80, minwidth=60, stretch=True, anchor="center")
+        prod_tree.heading("production", text="Producción")
+        prod_tree.column("production", width=310, minwidth=250, stretch=True, anchor="w")
         prod_tree.heading("price", text="Precio")
-        prod_tree.column("price", width=90, minwidth=70, stretch=True, anchor="center")
+        prod_tree.column("price", width=100, minwidth=80, stretch=True, anchor="center")
         prod_tree.tag_configure("done", foreground=COLORS.wine_active)
         prod_tree.tag_configure("pending", foreground=COLORS.muted)
         prod_tree.pack(fill="x", padx=10, pady=(0, 10))
         # Doble clic para editar trabajo
         prod_tree.bind("<Double-1>", lambda _event, oid=order_id: self.edit_order_job_from_products(oid))
+        prod_tree.bind("<Button-3>", lambda event, oid=order_id: self.show_order_job_context_menu(event, oid))
         # Placeholder label shown when there are no products
         tab.order_products_placeholder = tk.Label(products_panel, text="Sin trabajos", background=COLORS.panel_elevated,
                               foreground=COLORS.muted, font=(UI_FONT, 10), anchor="center")
         tab.order_products_tree = prod_tree
 
+        from app.ui.order_production_panel import OrderProductionPanel
+        tab.production_panel = OrderProductionPanel(
+            designs, self.database, order_id,
+            prepare=lambda job_ids: self.prepare_order_production(order_id, job_ids),
+            open_planchas=lambda ids: self.show_production_planchas(plancha_ids=ids),
+        )
+        tab.production_panel.pack(fill="x", pady=(0, 10))
+
+        # Los adjuntos originales del celular tienen un módulo propio. Siguen
+        # vinculados al pedido, pero se distinguen de los stickers ya preparados.
+        mobile_panel = tk.Frame(
+            designs, background=COLORS.panel_elevated,
+            highlightbackground=COLORS.wine_active, highlightthickness=1,
+        )
+        mobile_panel.pack(fill="x", pady=(0, 12))
+        mobile_header = tk.Frame(mobile_panel, background=COLORS.panel_elevated)
+        mobile_header.pack(fill="x", padx=12, pady=(10, 6))
+        tk.Label(
+            mobile_header, text="IMÁGENES DEL CELULAR",
+            background=COLORS.panel_elevated, foreground=COLORS.wine_active,
+            font=(IDENTITY_FONT, 10, "bold"),
+        ).pack(side="left")
+        tab.mobile_images_summary = tk.StringVar(value="")
+        tk.Label(
+            mobile_header, textvariable=tab.mobile_images_summary,
+            background=COLORS.panel_elevated, foreground=COLORS.muted,
+            font=(UI_FONT, 9),
+        ).pack(side="left", padx=10)
+        ttk.Button(
+            mobile_header, text="Enviar seleccionadas al Creador",
+            command=lambda oid=order_id: self.send_mobile_images_to_sticker_creator(oid),
+            style="Primary.TButton",
+        ).pack(side="right")
+        ttk.Button(
+            mobile_header, text="Seleccionar todas",
+            command=lambda oid=order_id: self.select_all_mobile_order_images(oid),
+            style="Secondary.TButton",
+        ).pack(side="right", padx=(0, 6))
+        tab.mobile_images_list = tk.Frame(mobile_panel, background=COLORS.panel_elevated)
+        tab.mobile_images_list.pack(fill="x", padx=12, pady=(0, 10))
+        tab.mobile_image_selection = set()
+        tab.mobile_image_selection_initialized = False
+        tab.mobile_images_panel = mobile_panel
+
         header = ttk.Frame(designs)
         header.pack(fill="x", pady=(0, 8))
-        ttk.Label(header, text="DISEÑOS DEL PEDIDO", style="Tag.TLabel").pack(side="left")
+        tab.order_designs_header = header
+        # El encabezado separa las acciones para incorporar diseños de las que
+        # operan sobre la selección actual; así sigue siendo legible en pedidos
+        # angostos sin convertir los botones en tiras minúsculas.
+        header_info = ttk.Frame(header)
+        header_info.pack(side="left", fill="x", expand=True)
+        header_actions = ttk.Frame(header)
+        header_actions.pack(side="right")
+        ttk.Label(header_info, text="DISEÑOS DEL PEDIDO", style="Tag.TLabel").pack(side="left")
         tab.order_designs_summary = tk.StringVar(value="0 diseños")
-        ttk.Label(header, textvariable=tab.order_designs_summary, style="Muted.TLabel").pack(side="left", padx=10)
-        ttk.Button(header, text="Agregar seleccionados", command=lambda: self.link_selection_to_order(order_id)).pack(side="right")
-        ttk.Button(header, text="Quitar", command=lambda: self.remove_order_designs(order_id)).pack(side="right", padx=(0, 6))
-        ttk.Button(header, text="Cantidad", command=lambda: self.change_order_design_quantity(order_id)).pack(side="right", padx=(0, 6))
-        ttk.Button(header, text="Confirmar", command=lambda: self.set_order_design_status(order_id, "Confirmado")).pack(side="right", padx=(0, 6))
-        ttk.Button(header, text="Ver todos", command=lambda: self.show_all_order_designs(order_id)).pack(side="right", padx=(0, 6))
+        ttk.Label(header_info, textvariable=tab.order_designs_summary, style="Muted.TLabel").pack(side="left", padx=10)
+
+        primary_actions = ttk.Frame(header_actions)
+        primary_actions.pack(anchor="e")
+        ttk.Button(primary_actions, text="Agregar al pedido", command=lambda: self.link_selection_to_order(order_id), style="Primary.TButton").pack(side="right")
+        ttk.Button(primary_actions, text="Crear sticker", command=lambda oid=order_id: self.open_sticker_creator_for_order(oid), style="Secondary.TButton").pack(side="right", padx=(0, 6))
+        ttk.Button(primary_actions, text="Biblioteca", command=lambda oid=order_id: self.open_sticker_bank_for_order(oid), style="Secondary.TButton").pack(side="right", padx=(0, 6))
+
+        selection_actions = ttk.Frame(header_actions)
+        selection_actions.pack(anchor="e", pady=(4, 0))
+        ttk.Button(selection_actions, text="Armado de planchas", command=lambda: self.open_plancha_for_order(order_id), style="Primary.TButton").pack(side="right")
+        ttk.Button(selection_actions, text="Quitar", command=lambda: self.remove_order_designs(order_id), style="Danger.TButton").pack(side="right", padx=(0, 6))
+        ttk.Button(selection_actions, text="Vincular trabajo", command=lambda: self.assign_order_designs_to_job(order_id)).pack(side="right", padx=(0, 6))
+        ttk.Button(selection_actions, text="Cantidad", command=lambda: self.change_order_design_quantity(order_id)).pack(side="right", padx=(0, 6))
+        ttk.Button(selection_actions, text="Confirmar", command=lambda: self.set_order_design_status(order_id, "Confirmado")).pack(side="right", padx=(0, 6))
+        ttk.Button(selection_actions, text="Ver todos", command=lambda: self.show_all_order_designs(order_id)).pack(side="right", padx=(0, 6))
         
         # Contenedor con scroll para la lista de diseños con miniaturas
         designs_container = tk.Frame(designs, background=COLORS.panel)
         designs_container.pack(fill="both", expand=True)
+
+        # Vista compacta del diseño activo: acompaña la lista sin competir con
+        # los controles de cantidad, tamaño y estado.
+        preview_panel = tk.Frame(designs_container, width=164, background=COLORS.panel_elevated,
+                                 highlightthickness=1, highlightbackground=COLORS.border)
+        preview_panel.pack(side="right", fill="y", padx=(6, 0))
+        preview_panel.pack_propagate(False)
+        tk.Label(preview_panel, text="VISTA PREVIA", background=COLORS.panel_elevated,
+                 foreground=COLORS.muted, font=(IDENTITY_FONT, 8, "bold")).pack(pady=(8, 4))
+        tab.order_design_preview = tk.Label(
+            preview_panel, text="Elegí un diseño", justify="center", wraplength=140,
+            background=COLORS.panel_elevated, foreground=COLORS.muted, font=(UI_FONT, 9),
+        )
+        tab.order_design_preview.pack(expand=True, fill="both", padx=8, pady=(0, 8))
         
         designs_canvas = tk.Canvas(designs_container, background=COLORS.panel, highlightthickness=0)
         designs_scrollbar = ttk.Scrollbar(designs_container, orient="vertical", command=designs_canvas.yview)
         designs_scrollable = tk.Frame(designs_canvas, background=COLORS.panel)
         
-        designs_scrollable.bind(
-            "<Configure>",
-            lambda e: designs_canvas.configure(scrollregion=designs_canvas.bbox("all"))
-        )
-        
-        designs_canvas.create_window((0, 0), window=designs_scrollable, anchor="nw")
+        def sync_designs_viewport(_event=None):
+            """Keep the design cards magnetically attached to the canvas width."""
+            canvas_width = max(1, designs_canvas.winfo_width())
+            designs_canvas.itemconfigure(designs_window, width=canvas_width)
+            designs_canvas.configure(scrollregion=designs_canvas.bbox("all"))
+
+        designs_scrollable.bind("<Configure>", sync_designs_viewport)
+        designs_window = designs_canvas.create_window((0, 0), window=designs_scrollable, anchor="nw", width=1)
+        designs_canvas.bind("<Configure>", sync_designs_viewport)
         designs_canvas.configure(yscrollcommand=designs_scrollbar.set)
         
         designs_canvas.pack(side="left", fill="both", expand=True)
@@ -3596,6 +8275,8 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         # Guardar referencias para uso posterior
         tab.order_designs_canvas = designs_canvas
         tab.order_designs_scrollable = designs_scrollable
+        tab.order_designs_window = designs_window
+        tab.order_designs_pin_to_top = True
         tab.order_design_items = []  # Lista para guardar referencias de widgets
         
         # Bind para scroll con mouse wheel
@@ -3606,6 +8287,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         for variable in tab.order_values.values():
             variable.trace_add("write", lambda *_args, current=order_id: self.queue_order_autosave(current))
         tab.order_notes.bind("<KeyRelease>", lambda _event, current=order_id: self.queue_order_autosave(current))
+        tab.complaint_notes_box.bind("<KeyRelease>", lambda _event, current=order_id: self.queue_order_autosave(current))
         self.render_order_workspace(tab)
         self.after(1500, lambda current=order_id: self.poll_order_preparations(current))
 
@@ -3617,7 +8299,9 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             canvas = getattr(tab, "order_scroll_canvas", None)
             if not canvas or not canvas.winfo_exists():
                 return None
-            steps = -max(1, abs(event.delta) // 120) if event.delta < 0 else max(1, event.delta // 120)
+            # Tk usa delta positivo al girar hacia arriba; yview_scroll usa
+            # valores negativos para desplazarse hacia arriba.
+            steps = -max(1, abs(event.delta) // 120) if event.delta > 0 else max(1, abs(event.delta) // 120)
             canvas.yview_scroll(steps, "units")
             return "break"
 
@@ -3627,6 +8311,180 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 bind_descendants(child)
 
         bind_descendants(root)
+
+    def _set_mobile_image_selected(self, tab, image_path: str, selected: bool, images: list[dict]) -> None:
+        if selected:
+            tab.mobile_image_selection.add(image_path)
+        else:
+            tab.mobile_image_selection.discard(image_path)
+        self._update_mobile_images_summary(tab, images)
+
+    @staticmethod
+    def _update_mobile_images_summary(tab, images: list[dict]) -> None:
+        total = len(images)
+        sent = sum(1 for image in images if image.get("creator_status") == "Enviado")
+        selected = len({
+            str(image.get("image_path") or "")
+            for image in images
+        } & set(tab.mobile_image_selection))
+        tab.mobile_images_summary.set(
+            f"{total} recibida(s) · {sent} enviada(s) · {selected} seleccionada(s)"
+        )
+
+    def render_mobile_order_images(self, tab) -> None:
+        """Renderiza los archivos fuente del celular separados de la biblioteca."""
+        if not hasattr(tab, "mobile_images_panel"):
+            return
+        images = self.database.mobile_order_images(tab.order_id)
+        panel = tab.mobile_images_panel
+        if not images:
+            panel.pack_forget()
+            return
+        if not panel.winfo_manager():
+            panel.pack(
+                fill="x", pady=(0, 12),
+                before=getattr(tab, "order_designs_header", None),
+            )
+
+        paths = {
+            str(image.get("image_path") or "")
+            for image in images
+            if image.get("image_path")
+        }
+        tab.mobile_image_selection.intersection_update(paths)
+        if not tab.mobile_image_selection_initialized:
+            tab.mobile_image_selection.update(paths)
+            tab.mobile_image_selection_initialized = True
+        self._update_mobile_images_summary(tab, images)
+
+        for widget in tab.mobile_images_list.winfo_children():
+            widget.destroy()
+        tab.mobile_image_photos = []
+        for column in range(2):
+            tab.mobile_images_list.columnconfigure(column, weight=1, uniform="mobile-images")
+
+        try:
+            from PIL import Image, ImageTk
+        except (ImportError, OSError):
+            Image = ImageTk = None
+
+        for index, image in enumerate(images):
+            path = str(image.get("image_path") or "")
+            file_path = Path(path)
+            exists = file_path.is_file()
+            sent = image.get("creator_status") == "Enviado"
+            card = tk.Frame(
+                tab.mobile_images_list,
+                background=COLORS.panel,
+                highlightbackground=COLORS.border,
+                highlightthickness=1,
+            )
+            card.grid(
+                row=index // 2, column=index % 2, sticky="nsew",
+                padx=(0, 5) if index % 2 == 0 else (5, 0), pady=4,
+            )
+            card.columnconfigure(1, weight=1)
+
+            selected_var = tk.BooleanVar(value=path in tab.mobile_image_selection)
+            selector = tk.Checkbutton(
+                card, variable=selected_var, background=COLORS.panel,
+                activebackground=COLORS.panel, selectcolor=COLORS.field,
+                command=lambda p=path, v=selected_var, rows=images:
+                    self._set_mobile_image_selected(tab, p, v.get(), rows),
+            )
+            selector.grid(row=0, column=0, rowspan=2, padx=(7, 3), pady=8)
+
+            preview = tk.Label(
+                card, text="IMG", width=8, height=4,
+                background=COLORS.panel_elevated, foreground=COLORS.muted,
+                font=(UI_FONT, 8, "bold"),
+            )
+            preview.grid(row=0, column=1, rowspan=2, padx=(0, 8), pady=8)
+            if Image is not None and ImageTk is not None and exists:
+                try:
+                    with Image.open(file_path) as source:
+                        thumb = source.convert("RGBA")
+                        thumb.thumbnail((72, 72), Image.Resampling.LANCZOS)
+                    photo = ImageTk.PhotoImage(thumb)
+                    tab.mobile_image_photos.append(photo)
+                    preview.configure(image=photo, text="", width=72, height=72)
+                except (OSError, ValueError):
+                    pass
+
+            name = image.get("name") or file_path.name or f"Imagen {index + 1}"
+            if len(name) > 34:
+                name = f"{name[:31]}..."
+            tk.Label(
+                card, text=name, anchor="w",
+                background=COLORS.panel, foreground=COLORS.text,
+                font=(UI_FONT, 9, "bold"),
+            ).grid(row=0, column=2, sticky="sw", padx=(0, 8), pady=(8, 2))
+
+            queued_at = str(image.get("creator_queued_at") or "")
+            if not exists:
+                state_text, state_color = "Archivo no disponible", COLORS.error
+            elif sent:
+                time_label = queued_at[11:16] if len(queued_at) >= 16 else ""
+                state_text = f"Enviada al Creador{f' · {time_label}' if time_label else ''}"
+                state_color = COLORS.success
+            else:
+                state_text, state_color = "Lista para crear sticker", COLORS.muted
+            tk.Label(
+                card, text=state_text, anchor="w",
+                background=COLORS.panel, foreground=state_color,
+                font=(UI_FONT, 8),
+            ).grid(row=1, column=2, sticky="nw", padx=(0, 8), pady=(0, 8))
+
+    def select_all_mobile_order_images(self, order_id: int) -> None:
+        tab = self.order_tabs.get(order_id)
+        if not tab:
+            return
+        images = self.database.mobile_order_images(order_id)
+        tab.mobile_image_selection = {
+            str(image["image_path"])
+            for image in images
+            if image.get("image_path")
+        }
+        tab.mobile_image_selection_initialized = True
+        self.render_mobile_order_images(tab)
+
+    def send_mobile_images_to_sticker_creator(self, order_id: int) -> None:
+        """Pasa al creador únicamente los adjuntos móviles seleccionados."""
+        tab = self.order_tabs.get(order_id)
+        if not tab:
+            return
+        selected = set(tab.mobile_image_selection)
+        images = self.database.mobile_order_images(order_id)
+        paths = [
+            str(image["image_path"])
+            for image in images
+            if str(image.get("image_path") or "") in selected
+        ]
+        if not paths:
+            messagebox.showinfo(
+                "Imágenes del celular",
+                "Seleccioná al menos una imagen para enviarla al Creador de Stickers.",
+                parent=self,
+            )
+            return
+        existing = [path for path in paths if Path(path).is_file()]
+        missing = len(paths) - len(existing)
+        if not existing:
+            messagebox.showerror(
+                "Imágenes del celular",
+                "Los archivos seleccionados ya no están disponibles en esta PC.",
+                parent=self,
+            )
+            return
+        if not self.open_sticker_studio(initial_paths=existing):
+            return
+        queued = self.database.mark_mobile_images_sent_to_creator(order_id, existing)
+        tab.order_design_state = self.database.order_designs(order_id)
+        self.render_mobile_order_images(tab)
+        detail = f" · {missing} archivo(s) no disponible(s)" if missing else ""
+        self.status.set(
+            f"Pedido #{order_id}: {queued} imagen(es) enviada(s) al Creador de Stickers{detail}."
+        )
 
     def show_all_order_designs(self, order_id: int):
         """Muestra todos los diseños del pedido en un panel amplio y desplazable."""
@@ -3643,9 +8501,8 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         content = ttk.Frame(dialog, padding=18)
         content.pack(fill="both", expand=True)
         total = len(tab.order_design_state)
-        confirmed = sum(1 for design in tab.order_design_state if design.get("status") == "Confirmado")
         ttk.Label(content, text="TODOS LOS DISEÑOS DEL PEDIDO", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(content, text=f"{total} diseños vinculados · {confirmed} confirmados", style="Muted.TLabel").pack(anchor="w", pady=(2, 14))
+        ttk.Label(content, text=f"{total} diseños vinculados", style="Muted.TLabel").pack(anchor="w", pady=(2, 14))
 
         table_frame = ttk.Frame(content)
         table_frame.pack(fill="both", expand=True)
@@ -3668,7 +8525,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 index,
                 design.get("name") or Path(image_path).name or f"Diseño {index}",
                 max(1, int(design.get("quantity", 1) or 1)),
-                f"{float(design.get('size_cm', 5.9) or 5.9):g} cm",
+                f"{float(design.get('size_cm', 5.0) or 5.0):g} cm",
                 design.get("status") or "Pendiente",
                 design.get("tags") or "Sin etiquetas",
                 image_path or "Sin archivo",
@@ -3684,6 +8541,12 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             quantity = 0
         values = {key: value.get() for key, value in tab.order_values.items()}
         values["print_priority"] = PRIORITY_VALUES.get(values.get("print_priority"), 0)
+        # Migrar el contenido histórico al campo unificado de notas para que
+        # concepto, descripción y observaciones no vuelvan a duplicarse.
+        values["order_concept"] = ""
+        values["order_description"] = ""
+        if hasattr(tab, "complaint_notes_box"):
+            values["complaint_notes"] = tab.complaint_notes_box.get("1.0", "end").strip()
         return {**values, "quantity": quantity,
                 "observations": tab.order_notes.get("1.0", "end").strip()}
 
@@ -3713,8 +8576,19 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             )
             # Recalcular costos automáticamente después de guardar
             self.database.recalculate_order_costs(order_id)
+            # Sincronizar con el tablero de producción
+            self._sync_production_board()
         except (ValueError, TypeError) as error:
-            tab.order_saved.set(str(error))
+            tab.order_saved.set(f"Error: {error}")
+            print(f"[ERROR] flush_order_autosave: {error}")
+            import traceback
+            traceback.print_exc()
+            return
+        except Exception as error:
+            tab.order_saved.set(f"Error inesperado: {error}")
+            print(f"[ERROR CRÍTICO] flush_order_autosave: {error}")
+            import traceback
+            traceback.print_exc()
             return
         tab.order_dirty, tab.order_save_after = False, None
         tab.order_saved.set("Guardado ahora")
@@ -3767,7 +8641,32 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 subtotal = float(j.get("subtotal", 0) or 0)
                 qty = int(j.get("quantity", 1) or 1)
                 tag = "done" if (j.get("status") or "").lower() in done_set else "pending"
-                prod_tree.insert("", "end", iid=f"prod:{idx}", tags=(tag,), values=(j.get("title") or f"Producto {idx+1}", j.get("material") or "", qty, f"${subtotal:,.2f}"))
+                # Los trabajos persistidos usan su ID real de base de datos como iid.
+                job_id = j.get("id")
+                iid = str(job_id) if job_id is not None else f"draft:{idx}"
+                if job_id is not None:
+                    progress = self.database.order_job_production_quantities(int(job_id))
+                    if progress["traceability"] == "untracked":
+                        production_text = "Sin trazabilidad · falta vincular diseños"
+                    else:
+                        production_text = (
+                            f"Sin preparar {progress['unprepared']:g} · Preparadas {progress['prepared_unprinted']:g} · "
+                            f"Impresas {progress['printed_unfinished']:g} · Terminadas {progress['finished']:g} · "
+                            f"Pend. terminar {progress['pending_finish']:g}"
+                        )
+                else:
+                    production_text = "Sin trazabilidad · guardar trabajo"
+                assigned = sum(int(d.get("quantity") or 0) for d in tab.order_design_state
+                               if (job_id is not None and d.get("order_job_id") == job_id)
+                               or (d.get("order_job_id") is None and d.get("order_job_index") == idx)
+                               or (len(jobs) == 1 and d.get("order_job_id") is None))
+                unit_label = {"item": "unidades", "sheet": "hojas"}.get(j.get("unit_kind"), "sin unidad")
+                policy_label = {"complete": "Completa", "partial": "Parcial", "legacy": "Histórica"}.get(j.get("distribution_policy"), "Histórica")
+                distribution = f"{policy_label}: {assigned}/{qty} {unit_label} · Sin distribuir {max(0, qty-assigned)}"
+                production_text = f"{distribution} | {production_text} | Costo ${float(j.get('cost_total') or 0):,.2f}"
+                prod_tree.insert("", "end", iid=iid, tags=(tag,), values=(
+                    " · ".join(str(v) for v in (j.get("title") or f"Producto {idx+1}", j.get("material"), j.get("size")) if v), f"{qty} {unit_label}", production_text, f"${subtotal:,.2f}",
+                ))
                 prod_total += subtotal
             if not jobs:
                 # Hide the tree and show a centered placeholder label
@@ -3788,6 +8687,8 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 prod_tree.pack(fill="x", padx=10, pady=(0, 10))
             if hasattr(tab, "order_products_summary"):
                 tab.order_products_summary.set(f"{len(jobs)} trabajo(s) · Total: ${prod_total:,.0f}")
+
+        self.render_mobile_order_images(tab)
         
         # Renderizar diseños con miniaturas
         if hasattr(tab, "order_designs_scrollable"):
@@ -3811,12 +8712,13 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 assigned += quantity
                 name = design.get("name") or Path(str(design.get("image_path", ""))).name
                 image_path = design.get("image_path", "")
-                size_cm = f"{float(design.get('size_cm', 5.9) or 5.9):g} cm"
+                size_cm = f"{float(design.get('size_cm', 5.0) or 5.0):g} cm"
                 status = design.get("status") or "Pendiente"
                 tags = design.get("tags") or "Sin etiquetas"
                 is_selected = index in tab.selected_design_indexes
                 
-                # Frame para cada diseño (resaltar si está seleccionado)
+                # Cada tarjeta mantiene una jerarquía clara: selección, nombre
+                # y etiquetas arriba; controles operativos abajo.
                 bg_color = COLORS.wine_soft if is_selected else COLORS.panel_elevated
                 item_frame = tk.Frame(
                     tab.order_designs_scrollable,
@@ -3874,7 +8776,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 info_frame.pack(side="left", fill="both", expand=True, padx=10, pady=5)
                 info_frame.bind("<Button-3>", show_context_menu)
                 
-                # Primera línea: Nombre (label que permite selección)
+                # Primera línea: nombre y estado de selección visibles.
                 name_frame = tk.Frame(info_frame, background=bg_color)
                 name_frame.pack(fill="x", pady=(0, 3))
                 name_display = name if len(name) <= 50 else name[:47] + "..."
@@ -3883,6 +8785,15 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 name_label.pack(side="left", fill="x", expand=True)
                 name_label.bind("<Button-1>", lambda e, idx=index: self.toggle_design_selection(tab, idx))
                 name_label.bind("<Button-3>", show_context_menu)
+                selection_text = "✓ Seleccionado" if is_selected else "Seleccionar"
+                selection_color = COLORS.wine_active if is_selected else COLORS.muted
+                selection_badge = tk.Label(
+                    name_frame, text=selection_text, background=bg_color,
+                    foreground=selection_color, font=(UI_FONT, 8, "bold"), cursor="hand2",
+                )
+                selection_badge.pack(side="right", padx=(8, 0))
+                selection_badge.bind("<Button-1>", lambda e, idx=index: self.toggle_design_selection(tab, idx))
+                selection_badge.bind("<Button-3>", show_context_menu)
                 
                 # Segunda línea: Controles editables (Cantidad, Tamaño, Estado) + Etiquetas
                 controls_frame = tk.Frame(info_frame, background=bg_color)
@@ -3907,7 +8818,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                         foreground=COLORS.muted, font=(UI_FONT, 9)).pack(side="left", padx=(0, 2))
                 size_var = tk.StringVar(value=size_cm)
                 # Crear lista de tamaños: enteros de 5 a 29cm
-                all_sizes = [f"{i} cm" for i in range(5, 30)]
+                all_sizes = [f"{i} cm" for i in range(2, 30)]
                 size_combo = ttk.Combobox(controls_frame, textvariable=size_var, values=all_sizes,
                                          width=8, font=(UI_FONT, 9), state="readonly")
                 size_combo.pack(side="left", padx=(0, 8))
@@ -3925,37 +8836,160 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 status_combo.bind("<<ComboboxSelected>>", lambda e, idx=index, var=status_var:
                                  self.update_design_status(tab, idx, var.get()))
                 
-                # Etiquetas (solo lectura, más pequeñas)
-                tags_display = tags if len(tags) <= 30 else tags[:27] + "..."
-                tk.Label(controls_frame, text=f"• {tags_display}", background=bg_color,
-                        foreground=COLORS.muted, font=(UI_FONT, 8), anchor="w").pack(side="left", fill="x", expand=True)
+                # Etiquetas: se conservan en la línea de controles, pero con
+                # un prefijo que evita confundirlas con el estado del diseño.
+                tags_display = tags if len(tags) <= 26 else tags[:23] + "..."
+                tags_label = tk.Label(controls_frame, text=f"Etiquetas: {tags_display}", background=bg_color,
+                        foreground=COLORS.muted, font=(UI_FONT, 8), anchor="w")
+                tags_label.pack(side="left", fill="x", expand=True)
+                tags_label.bind("<Button-1>", lambda e, idx=index: self.toggle_design_selection(tab, idx))
+                tags_label.bind("<Button-3>", show_context_menu)
                 
                 tab.order_design_items.append({"index": index, "frame": item_frame})
+
+            self._update_order_design_preview(tab)
         
-            target = self._order_values_from_tab(tab)["quantity"]
-            completed = sum(1 for design in tab.order_design_state if design.get("status") == "Confirmado")
-            tab.order_progress.set(f"{assigned} diseños asignados para {target} unidades · {completed}/{len(tab.order_design_state)} diseños confirmados.")
+            order_values = self._order_values_from_tab(tab)
+            target = order_values["quantity"]
+            capacity_label, capacity_detail, capacity_min, capacity_max = sticker_design_assignment_hint(
+                order_values, getattr(tab, "order_job_state", ()),
+            )
+            unique_design_count = len(tab.order_design_state)
+            design_count = sticker_design_assignment_count(tab.order_design_state)
+            completed = sticker_design_assignment_count(
+                design for design in tab.order_design_state if design.get("status") == "Confirmado"
+            )
+            capacity_range = (
+                str(capacity_min) if capacity_min == capacity_max
+                else f"{capacity_min}–{capacity_max}"
+            ) if capacity_min is not None else None
+            assignment_progress = sticker_design_assignment_progress(design_count, capacity_min)
+            # Con una meta de la guía, la barra mide diseños asignados. La
+            # confirmación sigue siendo una etapa separada que se informa abajo.
+            progress_percent = (
+                assignment_progress
+                if assignment_progress is not None
+                else ((completed / design_count * 100) if design_count else 0)
+            )
+            if design_count:
+                if capacity_min is not None:
+                    tab.order_progress.set(
+                        f"{design_count} de {capacity_min} diseños asignados"
+                    )
+                else:
+                    tab.order_progress.set(f"{completed} de {design_count} diseños confirmados")
+                tab.order_progress_percent.set(f"{progress_percent:.0f}%")
+                try:
+                    target_text = f"{int(float(target)):,}".replace(",", ".")
+                except (TypeError, ValueError):
+                    target_text = str(target or "—")
+                tab.order_progress_detail.set(
+                    f"{design_count} diseños asignados · Pedido de {target_text} unidades"
+                )
+                assignment = f"{design_count} diseños asignados ({unique_design_count} distintos) · {completed} confirmados"
+                if capacity_range:
+                    assignment += f" · Guía {capacity_label}: {capacity_range}"
+                tab.order_progress_detail.set(f"{assignment} · {capacity_detail}")
+                tab.order_progress_value.set(progress_percent)
+            else:
+                tab.order_progress.set("Sin diseños asignados")
+                tab.order_progress_percent.set("0%")
+                tab.order_progress_detail.set("Agregá diseños para iniciar el seguimiento.")
+                if capacity_range:
+                    tab.order_progress.set(f"0 de {capacity_range} diseños asignados")
+                tab.order_progress_detail.set(capacity_detail)
+                tab.order_progress_value.set(0)
             if hasattr(tab, "order_designs_summary"):
-                tab.order_designs_summary.set(f"{len(tab.order_design_state)} diseños · {completed} confirmados")
+                selected_count = len(getattr(tab, "selected_design_indexes", set()))
+                tab.order_designs_summary.set(
+                    f"{len(tab.order_design_state)} diseños · {selected_count} seleccionado(s)"
+                )
+            # Cuando se incorporan diseños, el panel los recibe en el inicio y
+            # conserva el ancho del panel, aunque el pedido sea angosto.
+            if getattr(tab, "order_designs_pin_to_top", False):
+                canvas = tab.order_designs_canvas
+                canvas.update_idletasks()
+                canvas.itemconfigure(tab.order_designs_window, width=max(1, canvas.winfo_width()))
+                canvas.configure(scrollregion=canvas.bbox("all"))
+                canvas.yview_moveto(0)
+                tab.order_designs_pin_to_top = False
         
         # Actualizar panel de costos desglosado
         financials = self.database.order_financials(tab.order_id)
         
         if hasattr(tab, "order_fin_vars"):
-            # Precio de venta
-            tab.order_fin_vars["fin_price"].set(f"${financials['budget_total']:,.2f}")
-            # Costos
-            tab.order_fin_vars["fin_cost_mp"].set(f"${financials['cost_mp']:,.2f}")
-            tab.order_fin_vars["fin_cost_mo"].set(f"${financials['cost_mo']:,.2f}")
-            tab.order_fin_vars["fin_cost_cf"].set(f"${financials['cost_cf']:,.2f}")
-            tab.order_fin_vars["fin_cost_total"].set(f"${financials['cost_total']:,.2f}")
-            # Margen
-            margin = financials['margin']
-            margin_pct = (margin / financials['budget_total'] * 100) if financials['budget_total'] > 0 else 0
-            tab.order_fin_vars["fin_margin"].set(f"${margin:,.2f} ({margin_pct:.1f}%)")
-            # Cobros
-            tab.order_fin_vars["fin_paid"].set(f"${financials['paid_amount']:,.2f}")
-            tab.order_fin_vars["fin_pending"].set(f"${financials['pending_amount']:,.2f}")
+            budget_total = float(financials["budget_total"] or 0)
+            paid_amount = float(financials["paid_amount"] or 0)
+            pending_amount = float(financials["pending_amount"] or 0)
+            tab.order_fin_vars["fin_price"].set(format_currency(budget_total))
+            tab.order_fin_vars["fin_cost_mp"].set(format_currency(financials["cost_mp"]))
+            tab.order_fin_vars["fin_cost_mo"].set(format_currency(financials["cost_mo"]))
+            tab.order_fin_vars["fin_cost_cf"].set(format_currency(financials["cost_cf"]))
+            commission_amount = float(financials["seller_commission_amount"] or 0)
+            commission_pct = float(financials["seller_commission_percent"] or 0)
+            tab.order_fin_vars["fin_commission"].set(
+                f"{format_currency(commission_amount)} ({commission_pct:.1f}%)"
+            )
+            tab.order_fin_vars["fin_cost_total"].set(format_currency(financials["cost_total"]))
+            margin = float(financials["margin"] or 0)
+            margin_pct = (margin / budget_total * 100) if budget_total > 0 else 0
+            tab.order_fin_vars["fin_margin"].set(f"{format_currency(margin)} ({margin_pct:.1f}%)")
+            tab.order_fin_vars["fin_paid"].set(format_currency(paid_amount))
+            tab.order_fin_vars["fin_pending"].set(format_currency(pending_amount))
+
+            if budget_total <= 0:
+                payment_status = "Sin presupuesto"
+                status_color = COLORS.disabled
+                pending_color = COLORS.muted
+                progress = 0
+                progress_text = "Definí el precio para iniciar el seguimiento"
+            elif pending_amount <= 0.009:
+                payment_status = "Pagado"
+                status_color = COLORS.success
+                pending_color = COLORS.success
+                progress = 100
+                progress_text = "Cobro completo"
+            elif paid_amount > 0:
+                payment_status = "Seña recibida"
+                status_color = COLORS.warning
+                pending_color = COLORS.error
+                progress = min(100.0, paid_amount / budget_total * 100)
+                progress_text = f"Cobrado {paid_amount / budget_total * 100:.0f}% del total"
+            else:
+                payment_status = "Pendiente"
+                status_color = COLORS.error
+                pending_color = COLORS.error
+                progress = 0
+                progress_text = "Todavía no se registraron cobros"
+
+            if hasattr(tab, "order_payment_status"):
+                tab.order_payment_status.set(payment_status.upper())
+                tab.order_payment_status_badge.configure(
+                    background=status_color,
+                    foreground=(
+                        COLORS.text
+                        if status_color in (COLORS.error, COLORS.disabled)
+                        else COLORS.background
+                    ),
+                )
+                tab.order_pending_label.configure(foreground=pending_color)
+                tab.order_payment_progress_value.set(progress)
+                tab.order_payment_progress_text.set(progress_text)
+                payments = [p for p in self.database.order_payments(tab.order_id) if not p.get("cancelled_at")]
+                if payments:
+                    latest = payments[0]
+                    paid_at = str(latest.get("paid_at") or latest.get("created_at") or "").replace("T", " ")
+                    try:
+                        paid_at = datetime.fromisoformat(paid_at).strftime("%d/%m %H:%M")
+                    except ValueError:
+                        paid_at = paid_at[:16]
+                    method = str(latest.get("method") or "Sin medio").strip()
+                    tab.order_last_payment.set(
+                        f"Último: {format_currency(latest.get('amount'))} · {method}"
+                        + (f" · {paid_at}" if paid_at else "")
+                    )
+                else:
+                    tab.order_last_payment.set("Sin cobros registrados")
         
         # Mantener la variable legacy por compatibilidad
         if hasattr(tab, "order_financials"):
@@ -3974,8 +9008,13 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 approved = sum(1 for plancha in planchas if plancha.get("approval_status") == "Aprobada")
                 requested = sum(1 for plancha in planchas if plancha.get("approval_status") == "Enviada")
                 changes = sum(1 for plancha in planchas if plancha.get("approval_status") == "Cambios solicitados")
+                saved_label = (
+                    "1 plancha ya guardada para impresión"
+                    if len(planchas) == 1
+                    else f"{len(planchas)} planchas ya guardadas para impresión"
+                )
                 tab.order_approval_summary.set(
-                    f"{approved}/{len(planchas)} planchas aprobadas"
+                    f"{saved_label} · {approved}/{len(planchas)} aprobadas"
                     + (f" · {requested} esperando respuesta" if requested else "")
                     + (f" · {changes} con cambios" if changes else "")
                 )
@@ -3996,10 +9035,42 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         
         if index in tab.selected_design_indexes:
             tab.selected_design_indexes.remove(index)
+            if getattr(tab, "active_order_design_index", None) == index:
+                tab.active_order_design_index = next(iter(tab.selected_design_indexes), None)
         else:
             tab.selected_design_indexes.add(index)
+            tab.active_order_design_index = index
         
         self.render_order_workspace(tab)
+
+    def _update_order_design_preview(self, tab) -> None:
+        """Muestra una previsualización pequeña del diseño seleccionado en el pedido."""
+        label = getattr(tab, "order_design_preview", None)
+        if label is None or not label.winfo_exists():
+            return
+        selected = getattr(tab, "selected_design_indexes", set())
+        index = getattr(tab, "active_order_design_index", None)
+        if index not in selected:
+            index = next(iter(selected), None)
+        if index is None or index >= len(tab.order_design_state):
+            label.configure(image="", text="Elegí un diseño")
+            label.image = None
+            return
+        design = tab.order_design_state[index]
+        path = Path(str(design.get("image_path", "") or ""))
+        try:
+            from PIL import Image, ImageTk
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            with Image.open(path) as source:
+                image = source.copy()
+            image.thumbnail((118, 118), Image.Resampling.LANCZOS)
+            photo = ImageTk.PhotoImage(image)
+            label.configure(image=photo, text="")
+            label.image = photo
+        except Exception:
+            label.configure(image="", text="Vista no disponible")
+            label.image = None
 
     def update_design_quantity(self, tab, index, new_quantity):
         """Actualiza la cantidad de un diseño."""
@@ -4063,6 +9134,11 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 
                 self.render_order_workspace(tab)
                 self.queue_order_autosave(tab.order_id)
+                # El menú contextual debe eliminar de forma efectiva, no
+                # depender de que se ejecute el autoguardado diferido. Esto
+                # evita que el diseño reaparezca al refrescar o reabrir el
+                # pedido antes de los 700 ms del debounce.
+                self.flush_order_autosave(tab.order_id)
                 self.database.add_order_event(tab.order_id, "Diseños", f"Se eliminó el diseño: {design_name}")
 
     def edit_order_job_from_products(self, order_id: int):
@@ -4077,7 +9153,8 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         
         try:
             # Extraer el índice del id del item (formato "prod:N")
-            index = int(selected[0].split(":", 1)[1])
+            selected_id = selected[0]
+            index = next((i for i, job in enumerate(tab.order_job_state) if str(job.get("id")) == selected_id), -1)
             if 0 <= index < len(tab.order_job_state):
                 self.edit_order_job_dialog(
                     tab, tab.order_job_state[index],
@@ -4085,6 +9162,185 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 )
         except (IndexError, ValueError):
             pass
+
+    def show_order_job_context_menu(self, event, order_id: int):
+        """Muestra acciones solo para el trabajo ubicado bajo el cursor."""
+        tab = self.order_tabs.get(order_id)
+        if not tab or not hasattr(tab, "order_products_tree"):
+            return "break"
+        tree = tab.order_products_tree
+        item_id = tree.identify_row(event.y)
+        if not item_id:
+            return "break"
+        tree.selection_set(item_id)
+        tree.focus(item_id)
+        menu = tk.Menu(self, tearoff=0)
+        configure_menu(menu)
+        if item_id.startswith("draft:"):
+            draft_index = int(item_id.split(":", 1)[1])
+            menu.add_command(
+                label="✏️ Editar cantidad",
+                command=lambda: self.edit_order_job_quantity(order_id, draft_index, is_draft=True),
+            )
+            menu.add_separator()
+            menu.add_command(
+                label="🗑 Eliminar producto",
+                command=lambda: self.delete_draft_order_product(order_id, draft_index),
+            )
+        else:
+            try:
+                job_id = int(item_id)
+            except ValueError:
+                return "break"
+            menu.add_command(
+                label="✏️ Editar cantidad",
+                command=lambda: self.edit_order_job_quantity(order_id, job_id, is_draft=False),
+            )
+            menu.add_separator()
+            menu.add_command(
+                label="🗑 Eliminar producto",
+                command=lambda: self.delete_order_job_from_products(order_id, job_id),
+            )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def edit_order_job_quantity(self, order_id: int, job_id_or_index: int, is_draft: bool):
+        """Edita la cantidad de un trabajo del pedido."""
+        tab = self.order_tabs.get(order_id)
+        if not tab:
+            return
+
+        # Obtener el trabajo actual
+        if is_draft:
+            draft_index = job_id_or_index
+            if 0 <= draft_index < len(tab.order_job_state):
+                job = tab.order_job_state[draft_index]
+            else:
+                return
+        else:
+            job_id = job_id_or_index
+            job = next((j for j in tab.order_job_state if j.get("id") == job_id), None)
+            if not job:
+                return
+
+        current_quantity = job.get("quantity", 1)
+
+        # Mostrar diálogo simple para editar cantidad
+        new_quantity = simpledialog.askinteger(
+            "Editar cantidad",
+            f"Ingrese la nueva cantidad para: {job.get('title', 'Producto')}",
+            parent=self,
+            minvalue=1,
+            maxvalue=10000,
+            initialvalue=current_quantity
+        )
+
+        if new_quantity is None:
+            return  # Usuario canceló
+
+        if new_quantity < 1:
+            messagebox.showwarning("Cantidad inválida", "La cantidad debe ser al menos 1", parent=self)
+            return
+
+        # Actualizar la cantidad
+        job["quantity"] = new_quantity
+
+        # Recalcular subtotal
+        from app.services.fotocopia_pricing_service import FotocopiaPricingService
+        fotocopia_pricing = FotocopiaPricingService(self.database.connection)
+        fotocopia_products = {
+            "Fotocopia B/N Simple": "fotocopia_bn_simple",
+            "Fotocopia B/N Doble Faz": "fotocopia_bn_doble",
+            "Fotocopia Color Simple": "fotocopia_color_simple",
+            "Fotocopia Color Doble Faz": "fotocopia_color_doble",
+            "Impresion Fotografica (1 Unidad)": "impresion_fotografica_1_unidad",
+            "Folletos Fotográficos (4 unidades)": "folletos_fotograficos_4_unidades",
+            "Tarjetas Presentacion Fotograficas (10 Unidades)": "tarjetas_presentacion_fotograficas_10_unidades",
+        }
+
+        product_type = fotocopia_products.get(job.get("title", "").strip())
+        if product_type:
+            # Recalcular para fotocopias
+            try:
+                result = fotocopia_pricing.calculate_for_product(
+                    product_type,
+                    physical_sheets=new_quantity,
+                    copies=1,
+                    is_urgent=False,
+                )
+                if result:
+                    job["subtotal"] = result.final_price
+            except Exception:
+                pass
+        else:
+            # Recalcular para otros productos usando suggest_price
+            try:
+                material = job.get("material", "").strip()
+                size = job.get("size", "").strip()
+                discount = max(0, min(100, float(job.get("discount_percent", 0) or 0)))
+                
+                if material and size:
+                    rule = self.database.suggest_price(material, size, new_quantity)
+                    if rule and rule.get("suggested_subtotal"):
+                        subtotal_base = float(rule["suggested_subtotal"])
+                        importe_descuento = subtotal_base * discount / 100
+                        job["subtotal"] = subtotal_base - importe_descuento
+            except Exception:
+                pass
+
+        # Guardar cambios y actualizar UI
+        self.render_order_workspace(tab)
+        self.queue_order_autosave(order_id)
+        self.database.add_order_event(order_id, "Trabajos", f"Se editó la cantidad a {new_quantity} para: {job.get('title', 'Producto')}.")
+        self.status.set(f"Cantidad actualizada a {new_quantity}.")
+
+    def delete_order_job_from_products(self, order_id: int, job_id: int):
+        """Confirma y elimina un producto guardado mediante su ID real."""
+        tab = self.order_tabs.get(order_id)
+        if not tab:
+            return
+        if not messagebox.askyesno("Eliminar trabajo", "¿Eliminar este trabajo del pedido?", parent=self):
+            return
+        try:
+            self.database.delete_order_job(order_id, job_id)
+        except ValueError as error:
+            messagebox.showinfo("Trabajos", str(error), parent=self)
+            return
+        # Un autoguardado pendiente contiene el trabajo anterior; cancelarlo evita restaurarlo.
+        if tab.order_save_after is not None:
+            self.after_cancel(tab.order_save_after)
+        tab.order_save_after = None
+        tab.order_dirty = False
+        tab.order_job_state = self.database.order_jobs(order_id)
+        refreshed_order = self.database.order(order_id)
+        if refreshed_order:
+            for key in ("material", "size", "quantity", "price", "discount_percent", "extra_services"):
+                if key in tab.order_values:
+                    tab.order_values[key].set(str(refreshed_order.get(key) or ""))
+        self.render_order_workspace(tab)
+        self.refresh_orders()
+        self.status.set("Producto eliminado y totales del pedido actualizados.")
+
+    def delete_draft_order_product(self, order_id: int, index: int):
+        """Remove a product that has not yet been persisted by autosave."""
+        tab = self.order_tabs.get(order_id)
+        if not tab or not (0 <= index < len(tab.order_job_state)):
+            return
+        if len(tab.order_job_state) <= 1:
+            messagebox.showwarning("Productos", "El pedido debe conservar al menos un producto.", parent=self)
+            return
+        product = tab.order_job_state[index]
+        name = product.get("title") or "este producto"
+        if not messagebox.askyesno("Eliminar producto", f"¿Eliminar {name} del pedido?", parent=self):
+            return
+        tab.order_job_state.pop(index)
+        self.render_order_workspace(tab)
+        self.queue_order_autosave(order_id)
+        self.database.add_order_event(order_id, "Trabajos", f"Se quitó el producto: {name}.")
+        self.status.set("Producto eliminado del pedido.")
 
     def _selected_order_job_index(self, tab) -> int | None:
         if not tab or not hasattr(tab, "order_job_tree"):
@@ -4158,6 +9414,37 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             tab.order_design_state[index]["quantity"] = quantity
         self.render_order_workspace(tab)
         self.queue_order_autosave(order_id)
+
+    def assign_order_designs_to_job(self, order_id: int):
+        """Asocia explícitamente los diseños elegidos con una línea del pedido."""
+        tab = self.order_tabs.get(order_id)
+        if not tab or not getattr(tab, "selected_design_indexes", set()):
+            messagebox.showinfo("Vincular trabajo", "Seleccioná uno o más diseños del pedido.", parent=self)
+            return
+        jobs = [job for job in tab.order_job_state if job.get("id") is not None]
+        if not jobs:
+            messagebox.showinfo("Vincular trabajo", "Guardá al menos un trabajo antes de vincular diseños.", parent=self)
+            return
+        detail = "\n".join(
+            f"#{job['id']} · {job.get('title') or 'Trabajo'} · {job.get('quantity', 0)} u."
+            for job in jobs
+        )
+        job_id = simpledialog.askinteger(
+            "Vincular trabajo", f"Elegí el número de trabajo:\n\n{detail}", parent=self, minvalue=1,
+        )
+        if job_id is None:
+            return
+        valid = {int(job["id"]) for job in jobs}
+        if int(job_id) not in valid:
+            messagebox.showerror("Vincular trabajo", "Ese trabajo no pertenece al pedido.", parent=self)
+            return
+        for index in tab.selected_design_indexes:
+            if 0 <= index < len(tab.order_design_state):
+                tab.order_design_state[index]["order_job_id"] = int(job_id)
+        self.queue_order_autosave(order_id)
+        self.flush_order_autosave(order_id)
+        self.render_order_workspace(tab)
+        self.status.set(f"Diseños vinculados al trabajo #{job_id}.")
 
     def set_order_design_status(self, order_id: int, status: str):
         tab = self.order_tabs.get(order_id)
@@ -4508,25 +9795,485 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         tab = self.order_tabs.get(order_id)
         if tab:
             self.flush_order_autosave(order_id)
-        amount = simpledialog.askfloat("Registrar cobro", "Importe recibido:", minvalue=0.01, parent=self)
-        if amount is None:
+        financials = self.database.order_financials(order_id)
+        total = float(financials.get("budget_total") or 0)
+        paid = float(financials.get("paid_amount") or 0)
+        pending = float(financials.get("pending_amount") or 0)
+
+        dialog = tk.Toplevel(self)
+        dialog.title(f"Registrar cobro · Pedido #{order_id}")
+        dialog.configure(background=COLORS.background)
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        header = tk.Frame(dialog, background=COLORS.panel)
+        header.pack(fill="x")
+        tk.Label(
+            header, text="REGISTRAR COBRO", background=COLORS.panel,
+            foreground=COLORS.text, font=(IDENTITY_FONT, 16, "bold"),
+        ).pack(anchor="w", padx=18, pady=(15, 2))
+        tk.Label(
+            header, text=f"Pedido #{order_id} · completá los datos del pago",
+            background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 9),
+        ).pack(anchor="w", padx=18, pady=(0, 14))
+
+        summary = tk.Frame(
+            dialog, background=COLORS.panel_elevated,
+            highlightthickness=1, highlightbackground=COLORS.border,
+        )
+        summary.pack(fill="x", padx=18, pady=(16, 0))
+        for column in range(3):
+            summary.columnconfigure(column, weight=1)
+        for column, (label, value, color) in enumerate((
+            ("TOTAL", total, COLORS.text),
+            ("COBRADO", paid, COLORS.success),
+            ("SALDO", pending, COLORS.error if pending else COLORS.success),
+        )):
+            tk.Label(
+                summary, text=label, background=COLORS.panel_elevated,
+                foreground=COLORS.muted, font=(UI_FONT, 8, "bold"),
+            ).grid(row=0, column=column, sticky="w", padx=11, pady=(9, 1))
+            tk.Label(
+                summary, text=format_currency(value), background=COLORS.panel_elevated,
+                foreground=color, font=(IDENTITY_FONT, 12, "bold"),
+            ).grid(row=1, column=column, sticky="w", padx=11, pady=(0, 9))
+
+        form_panel = tk.Frame(dialog, background=COLORS.background)
+        form_panel.pack(fill="x", padx=18, pady=16)
+        form_panel.columnconfigure(0, weight=1)
+        amount_var = tk.StringVar(value=f"{pending:.2f}" if pending > 0 else "")
+        method_var = tk.StringVar(value="")
+
+        tk.Label(
+            form_panel, text="Importe recibido *", background=COLORS.background,
+            foreground=COLORS.text, font=(UI_FONT, 9, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        amount_row = ttk.Frame(form_panel)
+        amount_row.grid(row=1, column=0, sticky="ew", pady=(5, 12))
+        amount_row.columnconfigure(0, weight=1)
+        amount_entry = ttk.Entry(amount_row, textvariable=amount_var, font=(IDENTITY_FONT, 15, "bold"))
+        amount_entry.grid(row=0, column=0, sticky="ew")
+        if pending > 0:
+            ttk.Button(
+                amount_row, text="Usar saldo", style="Secondary.TButton",
+                command=lambda: amount_var.set(f"{pending:.2f}"),
+            ).grid(row=0, column=1, padx=(7, 0))
+
+        tk.Label(
+            form_panel, text="Medio de pago", background=COLORS.background,
+            foreground=COLORS.text, font=(UI_FONT, 9, "bold"),
+        ).grid(row=2, column=0, sticky="w")
+        method_entry = ttk.Combobox(
+            form_panel, textvariable=method_var,
+            values=("Efectivo", "Transferencia", "Tarjeta", "Mercado Pago", "Cheque"),
+        )
+        method_entry.grid(row=3, column=0, sticky="ew", pady=(5, 12))
+
+        tk.Label(
+            form_panel, text="Detalle o referencia", background=COLORS.background,
+            foreground=COLORS.text, font=(UI_FONT, 9, "bold"),
+        ).grid(row=4, column=0, sticky="w")
+        note_box = tk.Text(
+            form_panel, height=3, wrap="word", background=COLORS.field,
+            foreground=COLORS.text, insertbackground=COLORS.text,
+            relief="flat", highlightthickness=1, highlightbackground=COLORS.border,
+            font=(UI_FONT, 9),
+        )
+        note_box.grid(row=5, column=0, sticky="ew", pady=(5, 0))
+
+        actions = ttk.Frame(dialog)
+        actions.pack(fill="x", padx=18, pady=(0, 17))
+
+        def parse_amount() -> float:
+            """Parse amount supporting Latin American (punto=miles, coma=decimal) and US (coma=miles, punto=decimal) formats.
+            
+            Examples:
+                10.200 → 10200.00 (Latin: miles)
+                10,200 → 10200.00 (Latin: miles with coma)
+                10.20 → 10.20 (decimal)
+                10,20 → 10.20 (Latin: decimal)
+                1.000,50 → 1000.50 (Latin: full format)
+                1,000.50 → 1000.50 (US: full format)
+            """
+            raw = amount_var.get().strip().replace("$", "").replace(" ", "")
+            
+            if "," in raw and "." in raw:
+                # Ambos separadores presentes: determinar formato por posición
+                if raw.rfind(",") > raw.rfind("."):
+                    # Formato latinoamericano: 1.000,50 (punto=miles, coma=decimal)
+                    raw = raw.replace(".", "").replace(",", ".")
+                else:
+                    # Formato anglosajón: 1,000.50 (coma=miles, punto=decimal)
+                    raw = raw.replace(",", "")
+            elif "," in raw:
+                # Solo comas: en contexto latinoamericano puede ser miles o decimal
+                # Si tiene 3 dígitos después de la coma y más de 1 dígito antes, es miles
+                # Ejemplos: 10,200 → miles, 10,20 → decimal, 10,2 → decimal
+                if raw.count(",") == 1:
+                    parts = raw.split(",")
+                    if len(parts) == 2 and len(parts[1]) == 3 and len(parts[0]) >= 1:
+                        # Formato: X,XXX es miles (10,200 → 10200)
+                        raw = raw.replace(",", "")
+                    else:
+                        # Formato: X,XX o X,X es decimal (10,50 → 10.50)
+                        raw = raw.replace(",", ".")
+                else:
+                    # Múltiples comas: separador de miles (1,000,000)
+                    raw = raw.replace(",", "")
+            elif "." in raw:
+                # Solo puntos: determinar si es miles o decimal
+                if raw.count(".") > 1:
+                    # Múltiples puntos: separador de miles (1.000.000)
+                    raw = raw.replace(".", "")
+                else:
+                    # Un solo punto: verificar si es miles (X.XXX) o decimal (X.XX)
+                    parts = raw.split(".")
+                    if len(parts) == 2 and len(parts[1]) == 3 and len(parts[0]) >= 1:
+                        # Verificar que no sea 0.XXX (que sería decimal)
+                        if not (len(parts[0]) == 1 and parts[0] == "0"):
+                            # Formato: X.XXX es miles (10.200 → 10200)
+                            raw = raw.replace(".", "")
+                    # Si no cumple la condición, se deja como decimal
+            
+            return round(float(raw), 2)
+
+        def save_payment():
+            try:
+                amount = parse_amount()
+            except (TypeError, ValueError):
+                messagebox.showwarning(
+                    "Registrar cobro", "Ingresá un importe válido.",
+                    parent=dialog,
+                )
+                amount_entry.focus_set()
+                return
+            if amount <= 0:
+                messagebox.showwarning(
+                    "Registrar cobro", "El importe debe ser mayor que cero.",
+                    parent=dialog,
+                )
+                amount_entry.focus_set()
+                return
+            method = method_var.get().strip()
+            note = note_box.get("1.0", "end-1c").strip()
+            try:
+                self.database.register_order_payment(order_id, amount, method, note)
+            except ValueError as error:
+                messagebox.showwarning("Registrar cobro", str(error), parent=dialog)
+                return
+            try:
+                self._event_bus.publish_payment_received(order_id, amount, method)
+            except Exception:
+                pass
+            dialog.destroy()
+            current_tab = self.order_tabs.get(order_id)
+            if current_tab:
+                self.render_order_workspace(current_tab)
+            self.refresh_orders()
+            self.status.set(
+                f"Cobro de {format_currency(amount)} registrado en el pedido #{order_id}."
+            )
+
+        ttk.Button(
+            actions, text="Cancelar", command=dialog.destroy,
+            style="Secondary.TButton",
+        ).pack(side="right")
+        ttk.Button(
+            actions, text="Guardar cobro", command=save_payment,
+            style="Primary.TButton",
+        ).pack(side="right", padx=(0, 7))
+        amount_entry.bind("<Return>", lambda _event: save_payment())
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        self.center_window(dialog)
+        amount_entry.focus_set()
+        amount_entry.selection_range(0, "end")
+
+    def show_order_payments(self, order_id: int):
+        """Muestra cobros activos y anulados conservando sus referencias."""
+        dialog = tk.Toplevel(self)
+        dialog.title(f"Historial de cobros · Pedido #{order_id}")
+        dialog.configure(background=COLORS.background)
+        dialog.transient(self)
+        dialog.geometry("1120x470")
+        dialog.minsize(660, 400)
+
+        heading = tk.Frame(dialog, background=COLORS.panel)
+        heading.pack(fill="x")
+        tk.Label(
+            heading, text="HISTORIAL DE COBROS", background=COLORS.panel,
+            foreground=COLORS.text, font=(IDENTITY_FONT, 16, "bold"),
+        ).pack(anchor="w", padx=18, pady=(14, 2))
+        summary_var = tk.StringVar()
+        tk.Label(
+            heading, textvariable=summary_var, background=COLORS.panel,
+            foreground=COLORS.muted, font=(UI_FONT, 9),
+        ).pack(anchor="w", padx=18, pady=(0, 13))
+
+        table_holder = ttk.Frame(dialog)
+        table_holder.pack(fill="both", expand=True, padx=18, pady=16)
+        columns = ("date", "amount", "method", "note", "state", "reason", "cancelled")
+        tree = ttk.Treeview(table_holder, columns=columns, show="headings", selectmode="browse")
+        for key, label, width, anchor in (
+            ("date", "Fecha", 145, "w"),
+            ("amount", "Importe", 110, "e"),
+            ("method", "Medio", 140, "w"),
+            ("note", "Detalle / referencia", 300, "w"),
+            ("state", "Estado", 80, "w"),
+            ("reason", "Motivo de anulación", 180, "w"),
+            ("cancelled", "Fecha de anulación", 145, "w"),
+        ):
+            tree.heading(key, text=label)
+            tree.column(key, width=width, minwidth=80, anchor=anchor)
+        scrollbar = ttk.Scrollbar(table_holder, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        actions = ttk.Frame(dialog)
+        actions.pack(fill="x", padx=18, pady=(0, 16))
+        delete_button = ttk.Button(
+            actions, text="Anular cobro seleccionado", style="Danger.TButton",
+            state="disabled",
+        )
+        delete_button.pack(side="left")
+        ttk.Button(
+            actions, text="Ver actividad completa",
+            command=lambda: self.show_order_activity(order_id),
+        ).pack(side="left", padx=7)
+        ttk.Button(
+            actions, text="Cerrar", command=dialog.destroy,
+            style="Secondary.TButton",
+        ).pack(side="right")
+
+        def refresh_history():
+            for item_id in tree.get_children():
+                tree.delete(item_id)
+            payments = self.database.order_payments(order_id)
+            financials = self.database.order_financials(order_id)
+            summary_var.set(
+                f"{len(payments)} cobro(s) · Cobrado {format_currency(financials['paid_amount'])}"
+                f" · Saldo {format_currency(financials['pending_amount'])}"
+            )
+            for payment in payments:
+                paid_at = str(
+                    payment.get("paid_at") or payment.get("created_at") or ""
+                ).replace("T", " ")
+                tree.insert(
+                    "", "end", iid=str(payment["id"]),
+                    values=(
+                        paid_at[:16],
+                        format_currency(payment.get("amount")),
+                        payment.get("method") or "Sin especificar",
+                        payment.get("note") or "—",
+                        "Anulado" if payment.get("cancelled_at") else "Activo",
+                        payment.get("cancellation_reason") or "—",
+                        str(payment.get("cancelled_at") or "—").replace("T", " ")[:16],
+                    ),
+                )
+            delete_button.configure(state="disabled")
+
+        def delete_selected():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showinfo(
+                    "Anular cobro", "Seleccioná el cobro que querés anular.",
+                    parent=dialog,
+                )
+                return
+            if self.cancel_order_payment(order_id, int(selected[0]), parent=dialog):
+                refresh_history()
+
+        delete_button.configure(command=delete_selected)
+        tree.bind(
+            "<<TreeviewSelect>>",
+            lambda _event: delete_button.configure(
+                state="normal" if tree.selection() and not next((p for p in self.database.order_payments(order_id) if str(p['id']) == tree.selection()[0]), {}).get('cancelled_at') else "disabled"
+            ),
+        )
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        refresh_history()
+        self.center_window(dialog)
+
+    def cancel_latest_order_payment(self, order_id: int):
+        """Cancel the newest payment while preserving a trace in order activity."""
+        payments = [p for p in self.database.order_payments(order_id) if not p.get("cancelled_at")]
+        if not payments:
+            messagebox.showinfo("Cancelar cobro", "Este pedido no tiene cobros registrados.", parent=self)
             return
-        method = simpledialog.askstring("Registrar cobro", "Medio de pago (opcional):", parent=self) or ""
-        note = simpledialog.askstring("Registrar cobro", "Detalle (opcional):", parent=self) or ""
+        self.cancel_order_payment(order_id, int(payments[0]["id"]))
+
+    def cancel_order_payment(self, order_id: int, payment_id: int, parent=None) -> bool:
+        """Anula un cobro elegido y actualiza todas las vistas relacionadas."""
+        payments = self.database.order_payments(order_id)
+        payment = next(
+            (current for current in payments if int(current.get("id") or 0) == int(payment_id)),
+            None,
+        )
+        if not payment or payment.get("cancelled_at"):
+            messagebox.showinfo(
+                "Anular cobro", "El cobro seleccionado ya no está activo.",
+                parent=parent or self,
+            )
+            return False
+        amount = float(payment.get("amount") or 0)
+        method = str(payment.get("method") or "").strip()
+        detail = f" de {method}" if method else ""
+        if not messagebox.askyesno(
+            "Anular cobro",
+            f"¿Anular el cobro de {format_currency(amount)}{detail}?\n\n"
+            "El saldo pendiente se actualizará y la corrección quedará registrada "
+            "en la actividad del pedido.",
+            parent=parent or self,
+        ):
+            return False
+        reason = simpledialog.askstring("Anular cobro", "Motivo de la anulación:", parent=parent or self)
+        if reason is None:
+            return False
+        if not reason.strip():
+            messagebox.showwarning("Anular cobro", "Indicá el motivo de la anulación.", parent=parent or self)
+            return False
         try:
-            self.database.register_order_payment(order_id, amount, method, note)
+            self.database.cancel_order_payment(order_id, int(payment_id), reason)
         except ValueError as error:
-            messagebox.showwarning("Registrar cobro", str(error), parent=self)
-            return
-        # Publicar evento de pago
-        try:
-            self._event_bus.publish_payment_received(order_id, amount, method)
-        except Exception:
-            pass
+            messagebox.showwarning("Anular cobro", str(error), parent=parent or self)
+            return False
+        tab = self.order_tabs.get(order_id)
         if tab:
             self.render_order_workspace(tab)
         self.refresh_orders()
-        self.status.set(f"Cobro de ${amount:,.2f} registrado en el pedido #{order_id}.")
+        self.status.set(
+            f"Cobro de {format_currency(amount)} anulado en el pedido #{order_id}."
+        )
+        return True
+
+    def generate_order_budget(self, order_id: int):
+        """Create one customer-ready budget from every product in the order."""
+        tab = self.order_tabs.get(order_id)
+        jobs = list(getattr(tab, "order_job_state", []) or []) if tab else self.database.order_jobs(order_id)
+        if not jobs:
+            messagebox.showinfo("Generar presupuesto", "Agregá al menos un trabajo al pedido antes de generar el presupuesto.", parent=self)
+            return
+
+        def money(value: float) -> str:
+            """Format currency for the customer without unnecessary cents."""
+            amount = round(float(value or 0), 2)
+            if abs(amount - round(amount)) < 0.005:
+                return f"${round(amount):,}".replace(",", ".")
+            return f"${amount:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+        def has_amount(value: float) -> bool:
+            return abs(float(value or 0)) >= 0.005
+
+        lines = ["📋 *PRESUPUESTO DOCCIONE*", ""]
+        total = 0.0
+        total_list = 0.0
+        total_quantity_discount = 0.0
+        total_urgency = 0.0
+        total_manual_discount = 0.0
+        for number, job in enumerate(jobs, start=1):
+            quantity = max(1, int(job.get("quantity") or 1))
+            subtotal = float(job.get("subtotal") or 0)
+            discount = max(0.0, min(100.0, float(job.get("discount_percent") or 0)))
+            # ``subtotal`` ya guarda el descuento y el servicio de prioridad
+            # aplicados al editar el trabajo; no se debe descontar otra vez.
+            urgency_amount = max(0.0, float(job.get("extra_services") or 0))
+            final_total = subtotal
+            total += final_total
+            total_urgency += urgency_amount
+            material = str(job.get("material") or "").strip()
+            product = str(job.get("title") or (material.split(" - ", 1)[0] if " - " in material else material) or "Producto").strip()
+            material_label = (material.split(" - ", 1)[1] if " - " in material else material).strip()
+            quantity_discount = self.database.quantity_discount_details(
+                material, str(job.get("size") or ""), quantity,
+            )
+            tier_total = (
+                float(quantity_discount["tier_total"])
+                if quantity_discount
+                else max(0.0, subtotal - urgency_amount) / (1 - discount / 100)
+                if discount < 100
+                else 0.0
+            )
+            manual_discount_amount = round(tier_total * discount / 100, 2)
+            total_manual_discount += manual_discount_amount
+            if quantity_discount:
+                total_list += float(quantity_discount["list_total"])
+                total_quantity_discount += float(quantity_discount["savings"])
+            else:
+                total_list += tier_total
+            lines.append(f"{number}. {product}")
+            if material_label:
+                lines.append(f"   Material: {material_label}")
+            size = str(job.get("size") or "").strip()
+            if size:
+                lines.append(f"   Tamaño: {size}")
+            unit_label = "unidad" if quantity == 1 else "unidades"
+            lines.extend([
+                f"   Cantidad: {quantity} {unit_label}",
+                f"   Precio unitario: {money(tier_total / quantity)}",
+                f"   Subtotal: {money(final_total)}",
+            ])
+            lines.append("")
+        has_adjustments = any((
+            has_amount(total_quantity_discount),
+            has_amount(total_manual_discount),
+            has_amount(total_urgency),
+        ))
+        lines.append("────────────────────")
+        if has_adjustments:
+            lines.append(f"SUBTOTAL: {money(total_list)}")
+        if has_amount(total_quantity_discount):
+            lines.append(f"DESCUENTO POR CANTIDAD: -{money(total_quantity_discount)}")
+        if has_amount(total_manual_discount):
+            lines.append(f"DESCUENTO ADICIONAL: -{money(total_manual_discount)}")
+        if has_amount(total_urgency):
+            lines.append(f"RECARGO POR URGENCIA: {money(total_urgency)}")
+        if has_adjustments:
+            lines.append("────────────────────")
+        lines.extend([
+            f"*TOTAL: {money(total)}*",
+            "",
+            "────────────────────",
+            "",
+            "⏳ Plazo de producción: se confirma al aprobar el pedido.",
+            "",
+            "El presupuesto queda sujeto a disponibilidad y confirmación del pedido.",
+            "",
+            "Doccione",
+            "Producción gráfica personalizada",
+        ])
+        content = "\n".join(lines)
+
+        modal = tk.Toplevel(self)
+        modal.title("Presupuesto del pedido")
+        modal.configure(background=COLORS.background)
+        modal.transient(self)
+        modal.grab_set()
+        modal.geometry("680x590")
+        frame = tk.Frame(modal, background=COLORS.panel_elevated, highlightthickness=1, highlightbackground=COLORS.border)
+        frame.pack(fill="both", expand=True, padx=18, pady=18)
+        tk.Label(frame, text="PRESUPUESTO DEL PEDIDO", background=COLORS.panel_elevated,
+                 foreground=COLORS.text, font=(IDENTITY_FONT, 16, "bold")).pack(anchor="w", padx=16, pady=(14, 3))
+        tk.Label(frame, text=f"Incluye {len(jobs)} producto(s) · Total {money(total)}", background=COLORS.panel_elevated,
+                 foreground=COLORS.muted, font=(UI_FONT, 10)).pack(anchor="w", padx=16, pady=(0, 10))
+        text_box = tk.Text(frame, wrap="word", background=COLORS.field, foreground=COLORS.text,
+                           insertbackground=COLORS.text, relief="flat", highlightthickness=1,
+                           highlightbackground=COLORS.border, font=(UI_FONT, 10))
+        text_box.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+        text_box.insert("1.0", content)
+        text_box.configure(state="disabled")
+        actions = tk.Frame(modal, background=COLORS.background)
+        actions.pack(fill="x", padx=18, pady=(0, 16))
+
+        def copy_to_clipboard():
+            modal.clipboard_clear()
+            modal.clipboard_append(content)
+            modal.update()
+            self.status.set("Presupuesto completo copiado al portapapeles.")
+
+        ttk.Button(actions, text="Copiar al portapapeles", command=copy_to_clipboard, style="Secondary.TButton").pack(side="left")
+        ttk.Button(actions, text="Cerrar", command=modal.destroy, style="Secondary.TButton").pack(side="right")
+        self.center_window(modal)
 
     def apply_suggested_order_price(self, order_id: int):
         tab = self.order_tabs.get(order_id)
@@ -4548,11 +10295,17 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             price = float(rule.get("suggested_subtotal") or rule.get("price") or 0)
             discount = float(rule.get("discount_percent") or 0)
             detail = rule.get("calculation_detail") or "Precio configurado"
-            if not messagebox.askyesno("Aplicar precio sugerido", f"{detail}\nSubtotal sugerido: ${price:,.2f}\nDescuento: {discount:g}%\n¿Aplicarlo a {job.get('title') or 'este trabajo'}?", parent=self):
+            if not messagebox.askyesno("Aplicar precio sugerido", f"{detail}\nPrecio sugerido: ${price:,.2f}\n¿Aplicarlo a {job.get('title') or 'este trabajo'}?", parent=self):
                 return
-            job["subtotal"], job["discount_percent"] = price, discount
+            job["subtotal"] = price  # El descuento individual ya no se usa
             if rule.get("extra_service"):
                 job["extra_services"] = rule["extra_service"]
+            self.stock_cost_price.save_order_snapshot(
+                order_job_id=int(job.get("id") or order_id),
+                price_rule_id=int(rule.get("id")) if rule.get("id") is not None else None,
+                production_quantity=max(1, int(job.get("quantity", 1) or 1)),
+                sale_total=float(price or 0.0),
+            )
             self.render_order_workspace(tab)
             self.database.add_order_event(order_id, "Presupuesto", f"Se aplicó una propuesta de precio a {job.get('title') or 'un trabajo'}.", {"price_rule": rule.get("id")})
             self.queue_order_autosave(order_id)
@@ -4577,351 +10330,22 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         tab.order_values["discount_percent"].set(f"{discount:g}")
         if rule.get("extra_service"):
             tab.order_values["extra_services"].set(rule["extra_service"])
+        self.stock_cost_price.save_order_snapshot(
+            order_job_id=order_id,
+            price_rule_id=int(rule.get("id")) if rule.get("id") is not None else None,
+            production_quantity=max(1, int(quantity or 1)),
+            sale_total=float(price or 0.0),
+        )
         self.database.add_order_event(order_id, "Presupuesto", "Se aplicó una propuesta de precio configurable.", {"price_rule": rule.get("id")})
         self.queue_order_autosave(order_id)
 
     def configure_price_rules(self):
-        dialog = tk.Toplevel(self)
-        dialog.title("Precios configurables")
-        dialog.configure(background=COLORS.background)
-        dialog.transient(self)
-        dialog.geometry("1120x620")
-        dialog.minsize(920, 500)
-        price_style = ttk.Style(dialog)
-        price_style.configure(
-            "Price.Treeview",
-            background=COLORS.panel,
-            fieldbackground=COLORS.panel,
-            foreground=COLORS.text,
-            rowheight=30,
-            borderwidth=0,
-            font=(UI_FONT, 10),
-        )
-        price_style.configure(
-            "Price.Treeview.Heading",
-            background=COLORS.panel_elevated,
-            foreground=COLORS.text,
-            relief="flat",
-            font=(UI_FONT, 10, "bold"),
-            padding=(8, 7),
-        )
-        price_style.map(
-            "Price.Treeview",
-            background=[("selected", COLORS.wine)],
-            foreground=[("selected", COLORS.text)],
-        )
-        header = tk.Frame(dialog, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
-        header.pack(fill="x", padx=16, pady=(16, 10))
-        tk.Label(header, text="PRECIOS CONFIGURABLES", background=COLORS.panel, foreground=COLORS.text,
-                 font=(IDENTITY_FONT, 17, "bold")).pack(anchor="w", padx=16, pady=(13, 2))
-        tk.Label(header, text="Las reglas proponen el subtotal; nunca modifican un pedido sin tu confirmación.",
-                 background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 10)).pack(anchor="w", padx=16, pady=(0, 13))
-        holder = tk.Frame(dialog, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
-        holder.pack(fill="both", expand=True, padx=16, pady=(0, 10))
-        _COLS = ("product", "material", "size", "quantity", "mode", "price",
-                 "model", "cost_total", "margin", "status", "detail", "discount", "extra")
-        tree = ttk.Treeview(holder, columns=_COLS, show="headings", selectmode="browse")
-        _COL_DEFS = (
-            ("product",    "Producto",    160, "w"),
-            ("material",   "Material",    140, "w"),
-            ("size",       "Tamaño",       70, "center"),
-            ("quantity",   "Desde",        55, "center"),
-            ("mode",       "Cálculo",      90, "center"),
-            ("price",      "Precio venta", 100, "center"),
-            ("model",      "Modelo de costos", 160, "w"),
-            ("cost_total", "Costo total",  90, "center"),
-            ("margin",     "Margen",       120, "center"),
-            ("status",     "Estado",       100, "center"),
-            ("detail",     "Desglose",     260, "w"),
-            ("discount",   "Desc.",        55, "center"),
-            ("extra",      "Servicio",    130, "w"),
-        )
-        for key, title, width, anchor in _COL_DEFS:
-            tree.heading(key, text=title)
-            tree.column(key, width=width, minwidth=max(40, width - 20), anchor=anchor)
-        tree.configure(style="Price.Treeview")
-        scroll = ttk.Scrollbar(holder, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=scroll.set)
-        tree.pack(side="left", fill="both", expand=True, padx=(1, 0), pady=1)
-        scroll.pack(side="right", fill="y", padx=(0, 1), pady=1)
-
-        def refresh_rules():
-            tree.delete(*tree.get_children())
-            for rule in self.database.price_rule_presentations():
-                mode = {"unitario": "Por unidad", "pack": "Por pack", "fijo": "Precio fijo"}.get(
-                    str(rule.get("price_mode") or "fijo").casefold(), "Precio fijo")
-                material_value = str(rule.get("material") or "Cualquiera")
-                if " - " in material_value:
-                    product_value, material_display = material_value.split(" - ", 1)
-                else:
-                    product_value, material_display = material_value, material_value
-                qty = int(rule.get("min_quantity") or 1)
-                price = float(rule.get("price") or 0)
-                cost_total = float(rule.get("cost_total") or 0)
-                margin_value = float(rule.get("margin") or 0)
-                margin_pct = f"{float(rule.get('margin_pct') or 0):.1f}%"
-                margin_str = f"${margin_value:,.2f} ({margin_pct})"
-                warning = rule.get("warning")
-                detail = rule.get("detail") or "Sin detalle"
-                tree.insert("", "end", iid=str(rule["id"]), values=(
-                    product_value,
-                    material_display or "Cualquiera",
-                    rule.get("size") or "Cualquiera",
-                    qty,
-                    mode,
-                    f"${price:,.2f}",
-                    str(rule.get("model_name") or "—"),
-                    f"${cost_total:,.2f}",
-                    margin_str,
-                    str(rule.get("status") or "Sin datos"),
-                    detail,
-                    f"{float(rule.get('discount_percent') or 0):g}%",
-                    rule.get("extra_service") or "—",
-                ))
-
-        def _open_rule_editor(rule: dict | None = None):
-            """Editor unificado para crear o modificar una regla de precio."""
-            is_new = rule is None
-            rule = rule or {}
-            material_value = str(rule.get("material", ""))
-            if " - " in material_value:
-                product_default, material_default = material_value.split(" - ", 1)
-            else:
-                product_default, material_default = material_value, ""
-
-            editor = tk.Toplevel(dialog)
-            editor.title("Nueva regla de precio" if is_new else "Modificar regla de precio")
-            editor.configure(background=COLORS.background)
-            editor.transient(dialog)
-            editor.grab_set()
-            editor.geometry("640x720")
-            editor.minsize(580, 640)
-
-            def _f(key, default="0"):
-                return f"{float(rule.get(key) or 0):g}" if not is_new else default
-
-            v = {k: tk.StringVar() for k in (
-                "product", "material", "size", "quantity", "price",
-                "discount", "extra", "mode", "pack",
-                "cost_model_id",
-                "mp_fixed", "mp_unit",
-                "mo_fixed", "mo_unit",
-                "cf_fixed", "cf_unit",
-            )}
-            v["product"].set(product_default)
-            v["material"].set(material_default)
-            v["size"].set(str(rule.get("size", "")))
-            v["quantity"].set(str(rule.get("min_quantity", 1)))
-            v["price"].set(_f("price"))
-            v["discount"].set(_f("discount_percent"))
-            v["extra"].set(str(rule.get("extra_service", "")))
-            v["mode"].set(str(rule.get("price_mode") or "fijo"))
-            v["pack"].set(str(rule.get("pack_quantity", 1)))
-            v["cost_model_id"].set(str(rule.get("cost_model_id") or ""))
-
-            margin_var = tk.StringVar(value="—")
-
-            def _recalc_margin(*_):
-                try:
-                    qty   = max(1, int(v["quantity"].get() or 1))
-                    price = float(v["price"].get().replace(",", ".") or 0)
-                    margin = round(price - 0, 2)
-                    margin_var.set(f"${margin:,.2f}  (sin modelo)" if price else "—")
-                except (ValueError, ZeroDivisionError):
-                    margin_var.set("—")
-
-            for key in ("price", "quantity"):
-                v[key].trace_add("write", _recalc_margin)
-
-            # ── Layout del editor ─────────────────────────────────────────────
-            canvas_e = tk.Canvas(editor, background=COLORS.background, highlightthickness=0)
-            scrollbar_e = ttk.Scrollbar(editor, orient="vertical", command=canvas_e.yview)
-            canvas_e.configure(yscrollcommand=scrollbar_e.set)
-            form = tk.Frame(canvas_e, background=COLORS.background)
-            canvas_e.create_window((0, 0), window=form, anchor="nw")
-            form.bind("<Configure>", lambda e: canvas_e.configure(scrollregion=canvas_e.bbox("all")))
-            canvas_e.pack(side="left", fill="both", expand=True)
-            scrollbar_e.pack(side="right", fill="y")
-            form.columnconfigure(1, weight=1)
-            form.columnconfigure(3, weight=1)
-
-            row = 0
-            def _lbl(text, r, c, **kw):
-                tk.Label(form, text=text, background=COLORS.background,
-                         foreground=COLORS.muted, font=(UI_FONT, 9), **kw
-                         ).grid(row=r, column=c, sticky="w", padx=(14, 6), pady=3)
-            def _entry(var, r, c, width=18, **kw):
-                e = ttk.Entry(form, textvariable=var, width=width, **kw)
-                e.grid(row=r, column=c, sticky="ew", padx=(0, 14), pady=3)
-                return e
-            def _section(text, r):
-                tk.Label(form, text=text, background=COLORS.background,
-                         foreground=COLORS.wine_active, font=(IDENTITY_FONT, 10, "bold")
-                         ).grid(row=r, column=0, columnspan=4, sticky="w", padx=14, pady=(14, 4))
-                tk.Frame(form, height=1, background=COLORS.border
-                         ).grid(row=r+1, column=0, columnspan=4, sticky="ew", padx=14)
-
-            # Sección: Identificación
-            _section("IDENTIFICACIÓN DEL PRODUCTO", row); row += 2
-            _lbl("Producto",        row, 0); _entry(v["product"],  row, 1)
-            _lbl("Material",        row, 2)
-            mat_cb = ttk.Combobox(form, textvariable=v["material"],
-                                  values=self.database.price_materials(), width=18)
-            mat_cb.grid(row=row, column=3, sticky="ew", padx=(0, 14), pady=3)
-            row += 1
-            _lbl("Tamaño",          row, 0)
-            sz_cb = ttk.Combobox(form, textvariable=v["size"],
-                                 values=self.database.price_sizes(), width=18)
-            sz_cb.grid(row=row, column=1, sticky="ew", padx=(0, 14), pady=3)
-            _lbl("Desde cantidad",  row, 2); _entry(v["quantity"], row, 3)
-            row += 1
-
-            # Sección: Precio de venta
-            _section("PRECIO DE VENTA", row); row += 2
-            _lbl("Modo de cálculo", row, 0)
-            ttk.Combobox(form, textvariable=v["mode"],
-                         values=("fijo", "unitario", "pack"),
-                         state="readonly", width=18
-                         ).grid(row=row, column=1, sticky="ew", padx=(0, 14), pady=3)
-            _lbl("Unidades por pack", row, 2); _entry(v["pack"],     row, 3)
-            row += 1
-            _lbl("Precio ($)",      row, 0); _entry(v["price"],    row, 1)
-            _lbl("Descuento (%)",   row, 2); _entry(v["discount"], row, 3)
-            row += 1
-            _lbl("Servicio / detalle", row, 0)
-            ttk.Entry(form, textvariable=v["extra"], width=18
-                      ).grid(row=row, column=1, columnspan=3, sticky="ew", padx=(0, 14), pady=3)
-            row += 1
-
-            # Sección: Estructura de costos
-            _section("MODELO DE COSTOS", row); row += 2
-            _lbl("Modelo de costos", row, 0)
-            model_names = self.database.cost_model_names()
-            model_combo = ttk.Combobox(form, textvariable=v["cost_model_id"], values=model_names, width=28, state="readonly")
-            model_combo.grid(row=row, column=1, sticky="ew", padx=(0, 14), pady=3)
-            row += 1
-
-            selected_model = None
-            if v["cost_model_id"].get():
-                selected_model = self.database.cost_model(int(v["cost_model_id"].get()))
-
-            model_summary_var = tk.StringVar(value=selected_model.get("description", "Sin modelo seleccionado") if selected_model else "Sin modelo seleccionado")
-            tk.Label(form, textvariable=model_summary_var, background=COLORS.background, foreground=COLORS.muted, font=(UI_FONT, 9), wraplength=560, justify="left").grid(row=row, column=0, columnspan=4, sticky="w", padx=14, pady=(4, 8))
-            row += 1
-
-            def _refresh_model_summary(*_):
-                model_id = v["cost_model_id"].get().strip()
-                if not model_id:
-                    model_summary_var.set("Sin modelo seleccionado")
-                    return
-                try:
-                    model = self.database.cost_model(int(model_id))
-                except ValueError:
-                    model_summary_var.set("Modelo no válido")
-                    return
-                if not model:
-                    model_summary_var.set("Modelo no encontrado")
-                    return
-                details = []
-                for component in model.get("components") or []:
-                    details.append(f"• {component.get('name')}: {component.get('value_type')} = {component.get('value')}")
-                model_summary_var.set(model.get("description") or "Sin descripción") + ("\n" + "\n".join(details) if details else "")
-
-            v["cost_model_id"].trace_add("write", _refresh_model_summary)
-            _refresh_model_summary()
-
-            tk.Frame(form, height=1, background=COLORS.border).grid(row=row, column=0, columnspan=4, sticky="ew", padx=14, pady=(6, 2))
-            row += 1
-            tk.Label(form, text="Margen estimado (para la cantidad mínima):", background=COLORS.background, foreground=COLORS.muted, font=(UI_FONT, 9)).grid(row=row, column=0, columnspan=2, sticky="w", padx=14, pady=4)
-            margin_lbl = tk.Label(form, textvariable=margin_var, background=COLORS.background, foreground=COLORS.wine_active, font=(IDENTITY_FONT, 11, "bold"))
-            margin_lbl.grid(row=row, column=2, columnspan=2, sticky="w", padx=14, pady=4)
-            row += 1
-
-            _recalc_margin()
-
-            # ── Botones ───────────────────────────────────────────────────────
-            btn_frame = tk.Frame(form, background=COLORS.background)
-            btn_frame.grid(row=row, column=0, columnspan=4, sticky="ew", padx=14, pady=(16, 14))
-
-            def _save():
-                try:
-                    def _fv(key): return float(v[key].get().replace(",", ".") or 0)
-                    stored_material = v["product"].get().strip()
-                    if v["material"].get().strip():
-                        stored_material = (f"{stored_material} - {v['material'].get().strip()}"
-                                           if stored_material else v["material"].get().strip())
-                    kwargs = dict(
-                        material=stored_material,
-                        size=v["size"].get(),
-                        min_quantity=int(v["quantity"].get() or 1),
-                        price=_fv("price"),
-                        extra_service=v["extra"].get(),
-                        discount_percent=_fv("discount"),
-                        price_mode=v["mode"].get(),
-                        pack_quantity=int(v["pack"].get() or 1),
-                        cost_model_id=(int(v["cost_model_id"].get()) if v["cost_model_id"].get().strip() else None),
-                    )
-                    if is_new:
-                        self.database.save_price_rule(**kwargs)
-                    else:
-                        updated = self.database.update_price_rule(int(rule["id"]), **kwargs)
-                        if not updated:
-                            messagebox.showerror("Precios", "No se pudo actualizar la regla.", parent=editor)
-                            return
-                except ValueError:
-                    messagebox.showwarning("Precios", "Revisá que los valores numéricos sean válidos.", parent=editor)
-                    return
-                editor.destroy()
-                refresh_rules()
-                if not is_new:
-                    tree.selection_set(str(rule["id"]))
-                    tree.focus(str(rule["id"]))
-
-            ttk.Button(btn_frame, text="Cancelar", command=editor.destroy,
-                       style="Secondary.TButton").pack(side="right")
-            ttk.Button(btn_frame, text="Guardar regla" if is_new else "Guardar cambios",
-                       command=_save, style="Primary.TButton").pack(side="right", padx=(0, 8))
-
-        def add_rule():
-            _open_rule_editor(rule=None)
-
-        def modify_rule(_event=None):
-            selected = tree.selection()
-            if not selected:
-                messagebox.showinfo("Precios", "Elegí una regla para modificar.", parent=dialog)
-                return
-            rule = self.database.price_rule(int(selected[0]))
-            if not rule:
-                refresh_rules()
-                return
-            _open_rule_editor(rule=rule)
-
-        def remove_rule():
-            selected = tree.selection()
-            if not selected:
-                return
-            if messagebox.askyesno("Eliminar regla", "¿Eliminar esta regla de precios?", parent=dialog):
-                self.database.remove_price_rule(int(selected[0]))
-                refresh_rules()
-
-        def remove_all_rules():
-            if messagebox.askyesno("Eliminar todos los precios", "¿Eliminar todas las reglas de precios? Esta acción no se puede deshacer.", parent=dialog):
-                self.database.remove_all_price_rules()
-                refresh_rules()
-
-        tree.bind("<Double-1>", modify_rule)
-        actions = tk.Frame(dialog, background=COLORS.background)
-        actions.pack(fill="x", padx=16, pady=(0, 16))
-        ttk.Button(actions, text="Nueva regla", command=add_rule, style="Primary.TButton").pack(side="left")
-        ttk.Button(actions, text="Modificar", command=modify_rule, style="Secondary.TButton").pack(side="left", padx=7)
-        ttk.Button(actions, text="Eliminar", command=remove_rule, style="Danger.TButton").pack(side="left")
-        ttk.Button(actions, text="Eliminar todo", command=remove_all_rules, style="Danger.TButton").pack(side="left", padx=7)
-        ttk.Button(actions, text="Cerrar", command=dialog.destroy, style="Secondary.TButton").pack(side="right")
-        refresh_rules()
+        """Editor de precios configurables."""
+        self.show_commercial_management("prices")
 
     def configure_cost_rules(self):
         """Editor de costos con pestañas: Costos Fijos y Costos Variables."""
-        self._open_costs_dialog()
+        self.show_commercial_management("costs")
 
     def _open_costs_dialog(self):
         """Diálogo principal de costos con dos pestañas independientes."""
@@ -5104,23 +10528,6 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 if status_filter == "Inactivos" and active:
                     continue
 
-                components = self.database.variable_cost_model_components(m["id"])
-                total_cost = 0.0
-                for comp in components:
-                    if not comp.get("active", 1):
-                        continue
-                    qty = float(comp.get("quantity") or 0)
-                    val = float(comp.get("unit_value") or 0)
-                    waste = float(comp.get("waste_pct") or 0)
-                    mode = str(comp.get("calc_mode") or "per_unit")
-                    if mode == "percentage":
-                        pass
-                    else:
-                        raw = qty * val
-                        if waste > 0:
-                            raw *= (1.0 + waste / 100.0)
-                        total_cost += raw
-
                 sale_price = 0.0
                 sale_price_str = "—"
                 margin_str = "—"
@@ -5131,6 +10538,28 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 ).fetchall() if product_name else []
                 if price_rows:
                     sale_price = float(price_rows[0][0])
+
+                model_components = []
+                for index, comp in enumerate(self.database.variable_cost_model_components(m["id"])):
+                    mode = str(comp.get("calc_mode") or "per_unit")
+                    mode = {"per_plancha": "per_plate", "per_sqm": "per_square_meter", "per_ml": "per_milliliter", "per_print": "per_impression", "fixed": "fixed_production"}.get(mode, mode)
+                    base = PERCENTAGE_BASE_KEYS.get(str(comp.get("percentage_base") or "sale_price"), str(comp.get("percentage_base") or "sale_price"))
+                    if mode not in CalculationMode._value2member_map_:
+                        mode = "per_unit"
+                    if base not in PercentageBase._value2member_map_:
+                        base = "sale_price"
+                    model_components.append(VariableCostComponent(
+                        name=str(comp.get("name") or "Componente"),
+                        calculation_mode=CalculationMode(mode),
+                        quantity=Decimal(str(comp.get("quantity") or 0)),
+                        unit_value=Decimal(str(comp.get("unit_value") or 0)),
+                        waste_pct=Decimal(str(comp.get("waste_pct") or 0)),
+                        percentage_base=PercentageBase(base),
+                        order=int(comp.get("sort_order") or index),
+                        active=bool(comp.get("active", 1)),
+                    ))
+                total_cost = float(VariableCostModel(components=model_components).recalculate_all(sale_price=Decimal(str(sale_price))))
+                if price_rows:
                     margin = sale_price - total_cost
                     margin_pct = (margin / sale_price * 100) if sale_price > 0 else 0
                     sale_price_str = f"${sale_price:,.2f}"
@@ -5441,14 +10870,34 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         notebook.add(simulator_tab, text="Simulador")
         notebook.add(stats_tab, text="Estadísticas")
 
-        definition_canvas = tk.Canvas(definition_tab, background=COLORS.background, highlightthickness=0)
-        definition_scrollbar = ttk.Scrollbar(definition_tab, orient="vertical", command=definition_canvas.yview)
+        # La definición y la vista previa son dos paneles independientes.  Antes
+        # ambos se empaquetaban directamente en la pestaña: el canvas expandía
+        # su ancho natural y dejaba a la grilla de componentes el resto del
+        # espacio, produciendo una vista partida y una gran área vacía.
+        definition_body = tk.Frame(definition_tab, background=COLORS.background)
+        definition_body.pack(fill="both", expand=True)
+        definition_body.columnconfigure(0, weight=4, minsize=400)
+        definition_body.columnconfigure(1, weight=6, minsize=420)
+        definition_body.rowconfigure(0, weight=1)
+
+        definition_left = tk.Frame(definition_body, background=COLORS.background)
+        definition_left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        definition_left.rowconfigure(0, weight=1)
+        definition_left.columnconfigure(0, weight=1)
+        definition_right = tk.Frame(definition_body, background=COLORS.background)
+        definition_right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        definition_right.rowconfigure(0, weight=1)
+        definition_right.columnconfigure(0, weight=1)
+
+        definition_canvas = tk.Canvas(definition_left, background=COLORS.background, highlightthickness=0)
+        definition_scrollbar = ttk.Scrollbar(definition_left, orient="vertical", command=definition_canvas.yview)
         definition_canvas.configure(yscrollcommand=definition_scrollbar.set)
         definition_form = tk.Frame(definition_canvas, background=COLORS.background)
-        definition_canvas.create_window((0, 0), window=definition_form, anchor="nw")
+        definition_window = definition_canvas.create_window((0, 0), window=definition_form, anchor="nw")
         definition_form.bind("<Configure>", lambda e: definition_canvas.configure(scrollregion=definition_canvas.bbox("all")))
-        definition_canvas.pack(side="left", fill="both", expand=True)
-        definition_scrollbar.pack(side="right", fill="y")
+        definition_canvas.bind("<Configure>", lambda e: definition_canvas.itemconfigure(definition_window, width=e.width))
+        definition_canvas.grid(row=0, column=0, sticky="nsew")
+        definition_scrollbar.grid(row=0, column=1, sticky="ns")
 
         definition_form.columnconfigure(0, weight=1)
         row = 0
@@ -5510,21 +10959,24 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             percent_entry = ttk.Entry(controls_frame, textvariable=percent_var, width=8, font=(UI_FONT, 11), justify="right")
             fixed_entry = ttk.Entry(controls_frame, textvariable=fixed_var, width=8, font=(UI_FONT, 11), justify="right")
             unit_entry = ttk.Entry(controls_frame, textvariable=unit_var, width=8, font=(UI_FONT, 11), justify="right")
+            unit_label = tk.Label(controls_frame, background=COLORS.panel_elevated, foreground=COLORS.text, font=(UI_FONT, 11))
 
             def _refresh_visibility(*_):
                 mode = internal_var.get()
                 percent_entry.pack_forget()
                 fixed_entry.pack_forget()
                 unit_entry.pack_forget()
+                unit_label.pack_forget()
                 if mode == "percent":
                     percent_entry.pack(side="left", padx=(8, 0))
-                    tk.Label(controls_frame, text="%", background=COLORS.panel_elevated, foreground=COLORS.text, font=(UI_FONT, 11)).pack(side="left", padx=(4, 0))
+                    unit_label.configure(text="%")
                 elif mode == "fixed":
                     fixed_entry.pack(side="left", padx=(8, 0))
-                    tk.Label(controls_frame, text="$", background=COLORS.panel_elevated, foreground=COLORS.text, font=(UI_FONT, 11)).pack(side="left", padx=(4, 0))
+                    unit_label.configure(text="$")
                 else:
                     unit_entry.pack(side="left", padx=(8, 0))
-                    tk.Label(controls_frame, text=_unit_label(mode), background=COLORS.panel_elevated, foreground=COLORS.text, font=(UI_FONT, 10)).pack(side="left", padx=(4, 0))
+                    unit_label.configure(text=_unit_label(mode), font=(UI_FONT, 10))
+                unit_label.pack(side="left", padx=(4, 0))
 
             def _sync_mode(*_):
                 internal_var.set(MODE_KEYS.get(display_var.get(), "percent"))
@@ -5539,7 +10991,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
 
         tk.Frame(costs_frame, height=1, background=COLORS.border).grid(row=5, column=0, columnspan=3, sticky="ew", padx=14, pady=14)
 
-        component_tree = ttk.Treeview(definition_tab, columns=("name", "mode", "value", "unit", "amount"), show="headings", height=8)
+        component_tree = ttk.Treeview(definition_right, columns=("name", "mode", "value", "unit", "amount"), show="headings", height=8)
         component_tree.heading("name", text="Componente")
         component_tree.heading("mode", text="Modo")
         component_tree.heading("value", text="Valor")
@@ -5550,8 +11002,10 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         component_tree.column("value", width=120, anchor="center")
         component_tree.column("unit", width=100, anchor="center")
         component_tree.column("amount", width=140, anchor="e")
-        component_tree.pack(fill="both", expand=True)
-        ttk.Button(definition_tab, text="Actualizar vista", command=_recalc, style="Secondary.TButton").pack(anchor="e", padx=16, pady=(10, 0))
+        component_tree.grid(row=0, column=0, sticky="nsew")
+        preview_actions = tk.Frame(definition_right, background=COLORS.background)
+        preview_actions.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        ttk.Button(preview_actions, text="Actualizar vista", command=_recalc, style="Secondary.TButton").pack(side="right")
 
         simulator_panel = tk.Frame(simulator_tab, background=COLORS.background)
         simulator_panel.pack(fill="both", expand=True, padx=16, pady=16)
@@ -5735,19 +11189,19 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         CALC_MODE_LABELS = {
             "per_unit": "Por unidad",
             "per_sheet": "Por hoja",
-            "per_plancha": "Por plancha",
+            "per_plate": "Por plancha",
             "per_meter": "Por metro",
-            "per_sqm": "Por metro cuadrado",
-            "per_ml": "Por mililitro",
+            "per_square_meter": "Por metro cuadrado",
+            "per_milliliter": "Por mililitro",
             "per_gram": "Por gramo",
-            "per_print": "Por impresión",
+            "per_impression": "Por impresión",
             "per_minute": "Por minuto",
             "per_hour": "Por hora",
-            "fixed": "Fijo por producción",
+            "fixed_production": "Fijo por producción",
             "percentage": "Porcentaje",
         }
         CALC_MODE_KEYS = {label: key for key, label in CALC_MODE_LABELS.items()}
-        PERCENTAGE_BASES = ["Precio de venta", "Materia prima", "Subtotal seleccionado", "Total de otros componentes"]
+        PERCENTAGE_BASES = ["Precio de venta", "Materia prima", "Mano de obra", "Subtotal componentes anteriores", "Subtotal seleccionado"]
 
         name_var = tk.StringVar(value=str(model_data.get("name", "")))
         product_var = tk.StringVar(value=str(model_data.get("product_name", "")))
@@ -5760,6 +11214,38 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         margin_pct_var = tk.StringVar(value="0.00%")
 
         component_rows: list[dict] = []
+
+        def _calculate_component_amounts() -> dict[int, float]:
+            """Calcula la misma simulación que el dominio, incluidos porcentajes."""
+            try:
+                sale_price = Decimal(sale_price_var.get().replace(",", ".") or "0")
+            except Exception:
+                sale_price = Decimal("0")
+            components = []
+            for idx, row in enumerate(component_rows):
+                if not row.get("active", True):
+                    continue
+                mode = str(row.get("calc_mode") or "per_unit")
+                legacy_modes = {"per_plancha": "per_plate", "per_sqm": "per_square_meter", "per_ml": "per_milliliter", "per_print": "per_impression", "fixed": "fixed_production"}
+                mode = legacy_modes.get(mode, mode)
+                base = str(row.get("percentage_base") or "sale_price")
+                base = PERCENTAGE_BASE_KEYS.get(base, base)
+                if mode not in CalculationMode._value2member_map_:
+                    mode = "per_unit"
+                if base not in PercentageBase._value2member_map_:
+                    base = "sale_price"
+                components.append(VariableCostComponent(
+                    name=str(row.get("name") or "Componente"),
+                    calculation_mode=CalculationMode(mode),
+                    quantity=Decimal(str(row.get("quantity") or 0)),
+                    unit_value=Decimal(str(row.get("unit_value") or 0)),
+                    waste_pct=Decimal(str(row.get("waste_pct") or 0)),
+                    percentage_base=PercentageBase(base),
+                    order=idx,
+                ))
+            model = VariableCostModel(components=components)
+            model.recalculate_all(sale_price=max(sale_price, Decimal("0")))
+            return {component.order: float(component.calculated_amount) for component in components}
 
         def _load_existing_components():
             nonlocal component_rows
@@ -5806,9 +11292,9 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         editor_notebook.pack(fill="both", expand=True, padx=16, pady=(0, 8))
 
         definition_tab = ttk.Frame(editor_notebook)
+        components_tab = ttk.Frame(editor_notebook)
         editor_notebook.add(definition_tab, text="  Información general  ")
-        editor_notebook.add(ttk.Frame(editor_notebook), text="  Componentes  ")
-        components_tab = editor_notebook.children[list(editor_notebook.children.keys())[-1]]
+        editor_notebook.add(components_tab, text="  Componentes  ")
 
         # ── Tab: Información general ────────────────────────────────────────
 
@@ -5875,9 +11361,18 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         comp_tree.configure(yscrollcommand=comp_scroll.set)
         comp_tree.pack(side="left", fill="both", expand=True, padx=(1, 0), pady=1)
         comp_scroll.pack(side="right", fill="y", padx=(0, 1), pady=1)
+        empty_components = tk.Label(
+            comp_tree_frame,
+            text="Todavía no hay componentes\nUsá “Agregar componente” para definir el costo variable.",
+            background=COLORS.panel,
+            foreground=COLORS.muted,
+            font=(UI_FONT, 10),
+            justify="center",
+        )
 
         def _refresh_comp_tree():
             comp_tree.delete(*comp_tree.get_children())
+            amounts = _calculate_component_amounts()
             for idx, row in enumerate(component_rows):
                 if not row.get("active", True):
                     continue
@@ -5886,13 +11381,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 val = float(row.get("unit_value") or 0)
                 waste = float(row.get("waste_pct") or 0)
                 calc_mode = row.get("calc_mode", "per_unit")
-                if calc_mode == "percentage":
-                    amount = 0.0
-                else:
-                    raw = qty * val
-                    if waste > 0:
-                        raw *= (1.0 + waste / 100.0)
-                    amount = round(raw, 2)
+                amount = round(amounts.get(idx, 0.0), 2)
                 row["amount"] = amount
                 comp_tree.insert("", "end", iid=str(idx), values=(
                     row.get("name", ""),
@@ -5904,6 +11393,12 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                     row.get("unit", ""),
                     f"${amount:,.2f}",
                 ))
+            if comp_tree.get_children():
+                empty_components.place_forget()
+            else:
+                # La tabla conserva su espacio para crecer, pero la pantalla
+                # inicial indica con claridad cómo comenzar.
+                empty_components.place(relx=0.5, rely=0.5, anchor="center")
             _recalc_summary()
 
         def _recalc_summary():
@@ -5912,7 +11407,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 sale_price = float(sale_price_var.get().replace(",", ".") or 0)
             except (ValueError, TypeError):
                 pass
-            total = sum(r.get("amount", 0) for r in component_rows if r.get("active", True))
+            total = sum(_calculate_component_amounts().values())
             total_cost_var.set(f"${total:,.2f}")
             margin_val = sale_price - total
             margin_var.set(f"${margin_val:,.2f}")
@@ -5994,7 +11489,8 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             c_unit_value = tk.StringVar(value=f"{float(comp.get('unit_value') or 0):g}")
             c_waste = tk.StringVar(value=f"{float(comp.get('waste_pct') or 0):g}")
             c_unit = tk.StringVar(value=comp.get("unit", ""))
-            c_pct_base = tk.StringVar(value=comp.get("percentage_base", "Precio de venta"))
+            stored_base = str(comp.get("percentage_base") or "sale_price")
+            c_pct_base = tk.StringVar(value=PERCENTAGE_BASE_LABELS.get(stored_base, stored_base))
 
             form = tk.Frame(dlg, background=COLORS.panel,
                            highlightthickness=1, highlightbackground=COLORS.border)
@@ -6110,7 +11606,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                     "unit_value": val_val,
                     "waste_pct": waste_val,
                     "unit": c_unit.get().strip(),
-                    "percentage_base": c_pct_base.get().strip() if c_mode.get() == "Porcentaje" else "",
+                    "percentage_base": PERCENTAGE_BASE_KEYS.get(c_pct_base.get().strip(), "sale_price") if c_mode.get() == "Porcentaje" else "",
                     "active": True,
                 }
                 dlg.destroy()
@@ -6159,7 +11655,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 foreground="#2D9B66", font=(IDENTITY_FONT, 11, "bold")).grid(row=0, column=5, sticky="w", padx=(6, 14), pady=8)
 
         tk.Label(summary_frame, textvariable=margin_pct_var, background=COLORS.panel_elevated,
-                foreground="#2D9B66", font=(UI_FONT, 9)).grid(row=1, column=5, sticky="w", padx=(6, 14), pady=(0, 8))
+                foreground="#2D9B66", font=(UI_FONT, 9)).grid(row=0, column=6, sticky="w", padx=(0, 14), pady=8)
 
         sale_price_var.trace_add("write", lambda *_: _recalc_summary())
 
@@ -6237,8 +11733,70 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         for key, title, width in (("date", "Fecha", 150), ("type", "Tipo", 115), ("message", "Detalle", 355)):
             tree.heading(key, text=title)
             tree.column(key, width=width, anchor="w")
+        mockup_events = {}
         for event in events:
-            tree.insert("", "end", values=(event.get("created_at", "").replace("T", " "), event.get("event_type", ""), event.get("message", "")))
+            item_id = tree.insert("", "end", values=(event.get("created_at", "").replace("T", " "), event.get("event_type", ""), event.get("message", "")))
+            if event.get("event_type") == "order.mockups.mobile":
+                mockup_events[item_id] = event
+
+        def open_mockups(_event=None):
+            selected = tree.selection()
+            if not selected or selected[0] not in mockup_events:
+                return
+            event = mockup_events[selected[0]]
+            try:
+                payload = json.loads(event.get("data_json") or "{}")
+                raw_entries = payload.get("mockups") or [
+                    {"path": value} for value in payload.get("paths", [])
+                ]
+                entries = [value for value in raw_entries if isinstance(value, dict) and value.get("path")]
+            except (json.JSONDecodeError, TypeError):
+                entries = []
+            if not entries:
+                return
+            preview = tk.Toplevel(dialog)
+            preview.title("Mockups de referencia")
+            preview.configure(background=COLORS.canvas)
+            preview.transient(dialog)
+            tk.Label(preview, text="MOCKUPS DE REFERENCIA", background=COLORS.canvas, foreground=COLORS.text, font=(IDENTITY_FONT, 12, "bold")).pack(anchor="w", padx=16, pady=(16, 6))
+            for entry in entries:
+                mockup_path = Path(str(entry["path"]))
+                card = tk.Frame(preview, background=COLORS.panel, padx=10, pady=8)
+                card.pack(fill="x", padx=16, pady=4)
+                size_cm = entry.get("size_cm")
+                size_label = f" · {size_cm:g} cm" if isinstance(size_cm, (int, float)) else ""
+                surface = str(entry.get("surface_label") or entry.get("surface") or "Otra")
+                approval = str(entry.get("approval_label") or entry.get("approval") or "Pendiente")
+                tk.Label(
+                    card,
+                    text=f"{surface}{size_label} · {approval}",
+                    background=COLORS.panel,
+                    foreground=COLORS.text,
+                    font=(IDENTITY_FONT, 10, "bold"),
+                ).pack(anchor="w")
+                details = " · ".join(
+                    value for value in (
+                        str(entry.get("design_name") or "").strip(),
+                        str(entry.get("material") or "").strip(),
+                    ) if value
+                )
+                comment = str(entry.get("comment") or "").strip()
+                if details or comment:
+                    tk.Label(
+                        card,
+                        text="\n".join(value for value in (details, comment) if value),
+                        justify="left",
+                        wraplength=560,
+                        background=COLORS.panel,
+                        foreground=COLORS.muted,
+                    ).pack(anchor="w", pady=(2, 5))
+                ttk.Button(
+                    card,
+                    text=f"Abrir {mockup_path.name}",
+                    command=lambda value=mockup_path: os.startfile(str(value)),
+                ).pack(anchor="w")
+
+        tree.bind("<Double-1>", open_mockups)
         scrollbar = ttk.Scrollbar(dialog, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=scrollbar.set)
         tree.pack(side="left", fill="both", expand=True, padx=(16, 0), pady=(0, 16))
@@ -6345,6 +11903,50 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             self.status.set("Se detectó un guardado de Photoshop. Revisá y confirmá la copia editada.")
         self.after(1800, lambda current=order_id: self.poll_order_preparations(current))
 
+    def link_order_to_parent(self, order_id: int):
+        """Asocia un pedido de stickers con el pedido comercial principal."""
+        current = self.database.order(order_id)
+        if not current:
+            return
+        parent_id = simpledialog.askinteger(
+            "Vincular pedido principal",
+            "Número del pedido general del mismo cliente:\n\n"
+            "El pedido actual mantendrá sus propios diseños y producción.",
+            parent=self,
+            minvalue=1,
+        )
+        if parent_id is None:
+            return
+        try:
+            parent = self.database.order(parent_id)
+            if not parent:
+                raise ValueError("El pedido indicado no existe o está archivado.")
+            if (current.get("client_id") and parent.get("client_id")
+                    and int(current["client_id"]) != int(parent["client_id"])):
+                if not messagebox.askyesno(
+                    "Clientes diferentes",
+                    "Los pedidos pertenecen a clientes diferentes. ¿Querés vincularlos igualmente?",
+                    parent=self,
+                ):
+                    return
+            self.database.set_order_parent(order_id, parent_id)
+        except (TypeError, ValueError) as error:
+            messagebox.showerror("Vincular pedido", str(error), parent=self)
+            return
+        self.refresh_orders()
+        self.status.set(f"Pedido #{order_id} vinculado al pedido principal #{parent_id}.")
+
+    def unlink_order_from_parent(self, order_id: int):
+        if not messagebox.askyesno(
+            "Desvincular pedido",
+            "¿Quitar el vínculo con el pedido principal? Los pedidos no se modificarán.",
+            parent=self,
+        ):
+            return
+        self.database.set_order_parent(order_id, None)
+        self.refresh_orders()
+        self.status.set(f"Pedido #{order_id} desvinculado del pedido principal.")
+
     def refresh_order_workspace(self, order_id: int):
         tab = self.order_tabs.get(order_id)
         if not tab or tab.order_dirty:
@@ -6369,16 +11971,134 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             tab.order_design_state.append({
                 "image_path": image["path"], "name": image.get("caption") or image.get("name") or Path(image["path"]).name,
                 "tags": image.get("tags") or "", "category": image.get("category") or "", "quantity": 1,
-                "size_cm": 5.9, "rotation": 0, "status": "Pendiente",
+                "size_cm": 5.0, "rotation": 0, "status": "Pendiente",
             })
             existing.add(image["path"])
             added += 1
         if not added:
             self.status.set("Los diseños seleccionados ya estaban vinculados al pedido.")
             return
+        tab.order_designs_pin_to_top = True
         self.render_order_workspace(tab)
         self.queue_order_autosave(order_id)
         self.status.set(f"Se vincularon {added} diseños al pedido #{order_id}.")
+
+    def show_add_designs_catalog(self, order_id: int):
+        """Abre la misma cuadrícula visual de Biblioteca para un pedido.
+
+        La selección es temporal: no altera los seleccionados globales de la
+        Biblioteca hasta que se confirma la acción de agregar al pedido.
+        """
+        dialog = tk.Toplevel(self)
+        dialog.title(f"Catálogo de diseños · Pedido #{order_id}")
+        dialog.configure(background=COLORS.background)
+        dialog.geometry("1080x720")
+        dialog.minsize(780, 520)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        selected: dict[str, dict] = {}
+        query_var = tk.StringVar()
+        summary_var = tk.StringVar(value="Elegí diseños con Ctrl + clic.")
+
+        header = tk.Frame(dialog, background=COLORS.panel, highlightthickness=1,
+                          highlightbackground=COLORS.border)
+        header.pack(fill="x", padx=12, pady=(12, 0))
+        tk.Label(header, text="CATÁLOGO DE DISEÑOS", background=COLORS.panel,
+                 foreground=COLORS.text, font=(IDENTITY_FONT, 16, "bold")).pack(
+            anchor="w", padx=14, pady=(10, 1))
+        tk.Label(header, text="La misma biblioteca visual; seleccioná uno o varios diseños para este pedido.",
+                 background=COLORS.panel, foreground=COLORS.muted,
+                 font=(UI_FONT, 9)).pack(anchor="w", padx=14, pady=(0, 10))
+
+        tools = tk.Frame(dialog, background=COLORS.background)
+        tools.pack(fill="x", padx=12, pady=10)
+        ttk.Entry(tools, textvariable=query_var, width=42).pack(side="left")
+        gallery_holder = tk.Frame(dialog, background=COLORS.background)
+        gallery_holder.pack(fill="both", expand=True)
+
+        def update_summary() -> None:
+            count = len(selected)
+            summary_var.set(
+                "Elegí diseños con Ctrl + clic."
+                if not count else f"{count} diseño(s) listo(s) para agregar al pedido."
+            )
+            add_button.configure(state="normal" if count else "disabled")
+
+        def toggle(image: dict) -> None:
+            path = str(image["path"])
+            if path in selected:
+                selected.pop(path)
+            else:
+                selected[path] = image.copy()
+            update_summary()
+
+        catalog = Gallery(
+            gallery_holder,
+            lambda image: self.preview_image(image),
+            lambda image: self.add_tag(image),
+            lambda image, name: self.remove_tag(image, name),
+            lambda: None,
+            on_toggle_selection=toggle,
+            is_selected=lambda image: str(image["path"]) in selected,
+            drag_paths=lambda image: [str(image["path"])],
+        )
+        catalog.pack(fill="both", expand=True)
+
+        def search() -> None:
+            images = self.database.plancha_browser_images(
+                query=query_var.get().strip(), mode="Todo", limit=1000,
+                order_id=order_id,
+            )
+            catalog.show_images(images)
+            update_summary()
+
+        ttk.Button(tools, text="Buscar", command=search,
+                   style="Secondary.TButton").pack(side="left", padx=(7, 0))
+        query_var.trace_add("write", lambda *_args: dialog.after_idle(search))
+
+        footer = tk.Frame(dialog, background=COLORS.panel)
+        footer.pack(fill="x", padx=12, pady=(0, 12))
+        tk.Label(footer, textvariable=summary_var, background=COLORS.panel,
+                 foreground=COLORS.muted, font=(UI_FONT, 9)).pack(side="left", padx=12, pady=10)
+
+        def add_selected() -> None:
+            tab = self.order_tabs.get(order_id)
+            if not tab:
+                self.open_order_workspace(order_id)
+                tab = self.order_tabs.get(order_id)
+            if not tab:
+                return
+            existing = {design.get("image_path") for design in tab.order_design_state}
+            added = 0
+            for image in selected.values():
+                path = str(image["path"])
+                if path in existing:
+                    continue
+                tab.order_design_state.append({
+                    "image_path": path,
+                    "name": image.get("caption") or image.get("name") or Path(path).stem,
+                    "tags": image.get("tags") or "", "category": image.get("category") or "",
+                    "quantity": 1, "size_cm": 5.0, "rotation": 0, "status": "Pendiente",
+                })
+                existing.add(path)
+                added += 1
+            if not added:
+                messagebox.showinfo("Agregar diseños", "Los diseños elegidos ya están en el pedido.", parent=dialog)
+                return
+            tab.order_designs_pin_to_top = True
+            self.render_order_workspace(tab)
+            self.queue_order_autosave(order_id)
+            self.status.set(f"Se agregaron {added} diseño(s) al pedido #{order_id}.")
+            dialog.destroy()
+
+        ttk.Button(footer, text="Cancelar", command=dialog.destroy,
+                   style="Secondary.TButton").pack(side="right", padx=(6, 12), pady=7)
+        add_button = ttk.Button(footer, text="Agregar al pedido", command=add_selected,
+                                style="Primary.TButton", state="disabled")
+        add_button.pack(side="right", pady=7)
+        self.center_window(dialog)
+        search()
 
     def show_add_designs_dialog(self, order_id: int):
         """Muestra una ventana para buscar y agregar diseños al pedido."""
@@ -6478,6 +12198,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 category=category,
                 collection=collection,
                 limit=100,
+                order_id=order_id,
             )
             
             # Actualizar tabla - solo mostrar categoría, etiquetas y colección
@@ -6674,7 +12395,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                     "tags": tags_str,
                     "category": category,
                     "quantity": 1,
-                    "size_cm": 5.9,
+                    "size_cm": 5.0,
                     "rotation": 0,
                     "status": "Pendiente",
                 })
@@ -6682,6 +12403,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 added += 1
             
             if added > 0:
+                tab.order_designs_pin_to_top = True
                 self.render_order_workspace(tab)
                 self.queue_order_autosave(order_id)
                 self.status.set(f"Se agregaron {added} diseños al pedido #{order_id}.")
@@ -6711,9 +12433,11 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             return
         
         # Ordenar diseños: 5cm primero, luego el resto por tamaño
+        from app.planchas.model import packing_mode_for_order_designs
+        packing_mode = packing_mode_for_order_designs(designs)
         designs_sorted = sorted(designs, key=lambda d: (
-            0 if float(d.get("size_cm", 5.9)) == 5.0 else 1,  # 5cm primero
-            float(d.get("size_cm", 5.9))  # Luego ordenar por tamaño ascendente
+            0 if float(d.get("size_cm", 5.0)) == 5.0 else 1,  # 5cm primero
+            float(d.get("size_cm", 5.0))  # Luego ordenar por tamaño ascendente
         ))
         
         paths = [design["image_path"] for design in designs_sorted]
@@ -6724,57 +12448,1007 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         
         # Reordenar images según el orden de paths y agregar cantidad y tamaño del pedido
         path_to_image = {img["path"]: img for img in images}
-        path_to_design = {design["image_path"]: design for design in designs_sorted}
         
         images_sorted = []
-        for path in paths:
+        untraced_designs = 0
+        for design in designs_sorted:
+            path = design["image_path"]
             if path in path_to_image:
                 img = path_to_image[path].copy()  # Copiar para no modificar el original
-                design = path_to_design.get(path, {})
                 # Agregar cantidad y tamaño desde el diseño del pedido
                 img["order_quantity"] = int(design.get("quantity", 1) or 1)
-                img["order_size_cm"] = float(design.get("size_cm", 5.9) or 5.9)
+                img["order_size_cm"] = float(design.get("size_cm", 5.0) or 5.0)
+                img["order_id"] = order_id
+                order_job_id = design.get("order_job_id")
+                img["order_job_id"] = order_job_id
+                img["order_design_line_id"] = str(design.get("design_line_id") or "")
+                img["order_packing_mode"] = packing_mode
+                if order_job_id is not None:
+                    img["order_copy_numbers"] = self.database.available_requested_copy_numbers(
+                        order_id=order_id,
+                        order_job_id=int(order_job_id),
+                        image_path=path,
+                        nominal_size_cm=img["order_size_cm"],
+                        rotation=int(design.get("rotation", 0) or 0),
+                        requested_quantity=img["order_quantity"],
+                        design_line_id=img["order_design_line_id"],
+                    )
+                    img["order_quantity"] = len(img["order_copy_numbers"])
+                    if not img["order_copy_numbers"]:
+                        continue
+                else:
+                    untraced_designs += 1
                 images_sorted.append(img)
+
+        if untraced_designs:
+            self.status.set(
+                f"Pedido #{order_id}: {untraced_designs} diseño(s) sin trazabilidad a un trabajo. "
+                "Se abrirán como contenido legado y no sumarán cantidades productivas."
+            )
+        if not images_sorted:
+            messagebox.showinfo(
+                "Armado de planchas",
+                "No quedan unidades disponibles para preparar. Las unidades activas ya están reservadas o producidas.",
+                parent=self,
+            )
+            return
         
+        if self._order_uses_continuous_print_creator(order_id):
+            # El creador de Impresiones fotográficas permite distribuir las
+            # fotos por hoja o usar Collage inteligente con vista paginada.
+            self._ensure_production_module()
+            self.tabs.select(self.production_tab)
+            self.production_notebook.select(self._poster_printing_tab)
+            self._open_poster_printing([Path(image["path"]) for image in images_sorted])
+            return
+
+        self._send_selected_to_production_constructor(
+            images_sorted, workspace_format="a4", order_id=order_id, packing_mode=packing_mode,
+        )
+
+    def _order_uses_continuous_print_creator(self, order_id: int) -> bool:
+        """Indica si un pedido debe abrir el editor de casillas fotográficas."""
+        import unicodedata
+
+        order = self.database.order(order_id) or {}
+        jobs = self.database.order_jobs(order_id)
+        values = [order.get("material"), order.get("order_concept")]
+        for job in jobs:
+            values.extend((job.get("title"), job.get("material")))
+        text = " ".join(str(value or "") for value in values).lower()
+        text = "".join(char for char in unicodedata.normalize("NFD", text)
+                       if unicodedata.category(char) != "Mn")
+        return order_production_route(order, jobs) != "plancha"
+
+    def _order_uses_photo_print_creator(self, order_id: int) -> bool:
+        """Compatibilidad para llamadas anteriores al circuito fotográfico."""
+        return self._order_uses_continuous_print_creator(order_id)
+
+    def open_embedded_plancha(self, images, **kwargs):
+        """Abre el constructor como una pestaña de la app, no como otra ventana."""
         from app.planchas.editor import PlanchaEditor
-        PlanchaEditor(self, images_sorted, database=self.database, library_images=self.database.search(limit=10000), order_id=order_id)
+
+        previous_tab = self.tabs.select()
+        tab = ttk.Frame(self.tabs)
+        self.tabs.add(tab, text="Constructor de planchas")
+        self.tabs.select(tab)
+
+        def return_to_app(discard: bool = False):
+            # Cambiar de módulo no descarta el trabajo en curso: la pestaña
+            # queda disponible para retomar el armado exactamente donde quedó.
+            if discard and tab.winfo_exists():
+                self.tabs.forget(tab)
+                tab.destroy()
+            if previous_tab and self.tabs.winfo_exists():
+                self.tabs.select(previous_tab)
+            self.after_idle(self.queue_production_refresh)
+
+        editor = PlanchaEditor(self, images, host=tab, on_close=return_to_app, **kwargs)
+        editor.pack(fill="both", expand=True)
+        return editor
+
+    def show_production_planchas(self, filter_value: str | None = None, *, plancha_ids=None):
+        """Lleva el foco a la lista de planchas y muestra los cambios recientes."""
+        if not hasattr(self, "tabs") or not hasattr(self, "production_tab"):
+            return
+        self._production_order_plancha_ids = set(plancha_ids) if plancha_ids is not None else None
+        self._ensure_production_module()
+        self.tabs.select(self.production_tab)
+        if hasattr(self, "production_notebook") and hasattr(self, "production_planchas_tab"):
+            self.production_notebook.select(self.production_planchas_tab)
+        if filter_value and hasattr(self, "production_filter"):
+            self.production_filter.set(filter_value)
+        if plancha_ids is not None:
+            self.production_filter.set("Todas")
+            if hasattr(self, "production_search_var"):
+                self.production_search_var.set("")
+        self.queue_production_refresh(delay=0)
+
+    def prepare_order_production(self, order_id: int, job_ids: list[int]):
+        tab = self.order_tabs.get(order_id)
+        if tab and tab.order_dirty:
+            self.flush_order_autosave(order_id)
+            if tab.order_dirty:
+                messagebox.showwarning("Preparar producción", "Guardá los cambios del pedido antes de preparar una tanda.", parent=self)
+                return
+        self.open_production_batch_dialog(order_id=order_id, job_ids=job_ids)
+
+    def open_production_batch_dialog(self, *, order_id: int | None = None, job_ids=()):
+        """Selecciona líneas de demanda y confirma una tanda sin reservar en la vista previa."""
+        from app.services.production_batch_service import ProductionBatchService
+
+        service = ProductionBatchService(self.database)
+        dialog = tk.Toplevel(self)
+        dialog.title("Preparar tanda · Producción")
+        dialog.geometry("1180x720")
+        dialog.minsize(900, 580)
+        dialog.configure(background=COLORS.background)
+        dialog.transient(self)
+        quantities: dict[str, int] = {}
+
+        header = tk.Frame(dialog, background=COLORS.background)
+        header.pack(fill="x", padx=16, pady=(14, 8))
+        tk.Label(header, text="Preparar tanda", background=COLORS.background,
+                 foreground=COLORS.text, font=(IDENTITY_FONT, 17, "bold")).pack(anchor="w")
+        tk.Label(header, text="Seleccioná líneas compatibles. Doble clic en Cantidad para preparar sólo una parte.",
+                 background=COLORS.background, foreground=COLORS.muted,
+                 font=(UI_FONT, 10)).pack(anchor="w", pady=(2, 0))
+
+        notebook = ttk.Notebook(dialog)
+        notebook.pack(fill="both", expand=True, padx=16, pady=(0, 10))
+        available_tab = tk.Frame(notebook, background=COLORS.background)
+        batches_tab = tk.Frame(notebook, background=COLORS.background)
+        notebook.add(available_tab, text="Trabajos disponibles")
+        notebook.add(batches_tab, text="Tandas guardadas")
+
+        columns = ("order", "client", "product", "material", "available", "selected",
+                   "delivery", "urgency", "status")
+        tree = ttk.Treeview(available_tab, columns=columns, show="headings", selectmode="extended")
+        headings = {
+            "order": "Pedido", "client": "Cliente", "product": "Producto",
+            "material": "Material", "available": "Sin preparar", "selected": "Cantidad",
+            "delivery": "Prometida", "urgency": "Urgencia", "status": "Disponibilidad",
+        }
+        widths = {"order": 70, "client": 130, "product": 170, "material": 120, "available": 85,
+                  "selected": 75, "delivery": 95, "urgency": 70, "status": 260}
+        for column in columns:
+            tree.heading(column, text=headings[column])
+            tree.column(column, width=widths[column], minwidth=55, stretch=column in {"client", "product", "status"})
+        scroll = ttk.Scrollbar(available_tab, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.pack(side="left", fill="both", expand=True, padx=(0, 4))
+        scroll.pack(side="right", fill="y")
+
+        candidates = []
+        candidate_map = {}
+        line_to_job = {}
+
+        def load_candidates():
+            selected_jobs = set(tree.selection())
+            tree.delete(*tree.get_children())
+            candidates[:] = [item for item in service.job_candidates() if order_id is None or item.order_id == order_id]
+            candidate_map.clear()
+            candidate_map.update({item.selection_key: item for item in candidates})
+            line_to_job.clear()
+            line_to_job.update({line.design_line_id: item for item in candidates for line in item.lines})
+            for item in candidates:
+                previous = quantities.get(item.selection_key, item.available)
+                quantities[item.selection_key] = min(max(1, previous), item.available) if item.available else 0
+                status = item.blocked_reason or ("Disponible" if item.available else "Sin unidades disponibles")
+                tree.insert("", "end", iid=item.selection_key, values=(
+                    item.order_number, item.client, item.product, item.material, item.available,
+                    quantities[item.selection_key], item.delivery_date or "—", item.urgency, status,
+                ), tags=(("blocked",) if item.blocked_reason or not item.available else ()))
+                if item.selection_key in selected_jobs or (not selected_jobs and item.order_job_id in job_ids):
+                    tree.selection_add(item.selection_key)
+        load_candidates()
+        tree.tag_configure("blocked", foreground=COLORS.muted)
+
+        def edit_quantity(_event=None):
+            selected = tree.selection()
+            if len(selected) != 1:
+                return
+            selection_key = selected[0]
+            candidate = candidate_map[selection_key]
+            if candidate.blocked_reason or candidate.available < 1:
+                messagebox.showinfo("Tanda", candidate.blocked_reason or "No quedan unidades disponibles.", parent=dialog)
+                return
+            value = simpledialog.askinteger(
+                "Cantidad parcial", f"Unidades a preparar (máximo {candidate.available}):",
+                initialvalue=quantities[selection_key], minvalue=1, maxvalue=candidate.available, parent=dialog,
+            )
+            if value is None:
+                return
+            quantities[selection_key] = value
+            values = list(tree.item(selection_key, "values"))
+            values[5] = value
+            tree.item(selection_key, values=values)
+            invalidate_preview()
+        tree.bind("<Double-1>", edit_quantity)
+
+        footer = tk.Frame(dialog, background=COLORS.background)
+        footer.pack(fill="x", padx=16, pady=(0, 14))
+        preview_state = {"preview": None}
+        preview_summary = tk.StringVar(value="2. Generá una vista previa; todavía no se reservarán cantidades.")
+        tk.Label(footer, textvariable=preview_summary, background=COLORS.background,
+                 foreground=COLORS.muted, justify="left", anchor="w",
+                 font=(UI_FONT, 9), wraplength=700).pack(fill="x", pady=(0, 8))
+
+        def invalidate_preview(_event=None):
+            preview_state["preview"] = None
+            preview_summary.set("La selección cambió. Generá una nueva vista previa antes de guardar.")
+            try:
+                save_batch_button.configure(state="disabled")
+            except NameError:
+                pass
+
+        def prepare_preview():
+            selected = list(tree.selection())
+            if not selected:
+                messagebox.showinfo("Preparar tanda", "Seleccioná al menos un trabajo.", parent=dialog)
+                return
+            requested = {candidate_map[key].order_job_id: quantities[key] for key in selected}
+            try:
+                if order_id is not None:
+                    from app.services.order_production_service import OrderProductionService
+                    preview = OrderProductionService(self.database).preview(order_id, requested)
+                else:
+                    preview = service.preview_jobs(requested)
+            except ValueError as error:
+                messagebox.showwarning("Preparar tanda", str(error), parent=dialog)
+                return
+            lines = []
+            for index, group in enumerate(preview.groups, start=1):
+                lines.append(
+                    f"Grupo {index}: {group.material} · {group.workspace_format.upper()} · {group.packing_mode}\n"
+                    f"  {sum(row['quantity'] for row in group.selections)} unidades · {len(group.projects)} plancha(s)"
+                )
+                for row in group.selections:
+                    candidate = line_to_job[row["design_line_id"]]
+                    lines.append(f"    Pedido #{candidate.order_id} · {candidate.product}: {row['quantity']}")
+            if preview.excluded:
+                lines.append("\nExcluidos:")
+                for row in preview.excluded:
+                    candidate = line_to_job.get(str(row.get("design_line_id")))
+                    if candidate is None and row.get("order_job_id") is not None:
+                        candidate = next((item for item in candidates if item.order_job_id == int(row["order_job_id"])), None)
+                    label = f"Pedido #{candidate.order_id} · {candidate.product}" if candidate else str(row.get("design_line_id"))
+                    lines.append(f"  {label}: {row['reason']}")
+            if not preview.groups:
+                messagebox.showwarning("Vista previa de tanda", "\n".join(lines) or "No hay elementos preparables.", parent=dialog)
+                return
+            preview_state["preview"] = preview
+            preview_summary.set("\n".join(lines) + "\n\nVista previa lista. Aún no se reservaron cantidades.")
+            save_batch_button.configure(state="normal")
+
+        def save_batch():
+            preview = preview_state["preview"]
+            if preview is None:
+                messagebox.showinfo("Guardar tanda", "Generá primero una vista previa vigente.", parent=dialog)
+                return
+            try:
+                batch_id = service.save(preview)
+            except Exception as error:
+                messagebox.showerror("No se guardó la tanda", str(error), parent=dialog)
+                return
+            messagebox.showinfo("Tanda guardada", f"Tanda #{batch_id} guardada con {preview.plancha_count} plancha(s).", parent=dialog)
+            preview_state["preview"] = None
+            save_batch_button.configure(state="disabled")
+            self.notify_production_change()
+            load_batches()
+            notebook.select(batches_tab)
+
+        ttk.Button(footer, text="Cerrar", command=dialog.destroy, style="Secondary.TButton").pack(side="right")
+        save_batch_button = ttk.Button(footer, text="3. Guardar tanda", command=save_batch,
+                                       style="Primary.TButton", state="disabled")
+        save_batch_button.pack(side="right", padx=(0, 8))
+        ttk.Button(footer, text="2. Generar vista previa", command=prepare_preview,
+                   style="Secondary.TButton").pack(side="right", padx=(0, 8))
+        ttk.Button(footer, text="1. Elegir cantidad", command=edit_quantity,
+                   style="Secondary.TButton").pack(side="left")
+        tree.bind("<<TreeviewSelect>>", invalidate_preview)
+
+        def configure_unit():
+            selected = tree.selection()
+            if len(selected) != 1:
+                messagebox.showinfo("Configurar unidad", "Elegí un único trabajo.", parent=dialog)
+                return
+            candidate = candidate_map[selected[0]]
+            chooser = tk.Toplevel(dialog)
+            chooser.title("Configurar unidad")
+            chooser.configure(background=COLORS.background)
+            chooser.transient(dialog)
+            chooser.grab_set()
+            value = tk.StringVar(value=candidate.lines[0].unit_kind or "item")
+            content = ttk.Frame(chooser, padding=18)
+            content.pack(fill="both", expand=True)
+            ttk.Label(content, text=f"Unidad productiva · {candidate.product}", style="Title.TLabel").pack(anchor="w")
+            ttk.Radiobutton(content, text="Unidades / stickers", variable=value, value="item").pack(anchor="w", pady=(14, 0))
+            ttk.Label(content, text="Cada copia solicitada reserva y produce un sticker individual.", style="Muted.TLabel").pack(anchor="w", padx=(22, 0))
+            ttk.Radiobutton(content, text="Hojas / planchas", variable=value, value="sheet").pack(anchor="w", pady=(12, 0))
+            ttk.Label(content, text="Cada unidad solicitada corresponde a una hoja o plancha física completa.", style="Muted.TLabel").pack(anchor="w", padx=(22, 0))
+            actions = ttk.Frame(content)
+            actions.pack(fill="x", pady=(18, 0))
+            ttk.Button(actions, text="Cancelar", command=chooser.destroy).pack(side="right")
+
+            def apply_unit():
+                try:
+                    service.configure_job_unit(candidate.order_job_id, value.get())
+                except ValueError as error:
+                    messagebox.showerror("Configurar unidad", str(error), parent=chooser)
+                    return
+                chooser.destroy()
+                load_candidates()
+                invalidate_preview()
+                self.notify_production_change()
+            ttk.Button(actions, text="Aplicar", command=apply_unit, style="Primary.TButton").pack(side="right", padx=(0, 8))
+            self.center_window(chooser)
+        ttk.Button(footer, text="Configurar unidad", command=configure_unit,
+                   style="Secondary.TButton").pack(side="left", padx=(8, 0))
+
+        batch_columns = ("id", "name", "status", "planchas", "created")
+        batch_tree = ttk.Treeview(batches_tab, columns=batch_columns, show="headings", selectmode="browse")
+        for column, label, width in (("id", "Tanda", 80), ("name", "Nombre", 280), ("status", "Estado", 110),
+                                     ("planchas", "Planchas", 90), ("created", "Creada", 170)):
+            batch_tree.heading(column, text=label)
+            batch_tree.column(column, width=width, stretch=column == "name")
+        batch_tree.pack(fill="both", expand=True, padx=8, pady=8)
+
+        def load_batches():
+            batch_tree.delete(*batch_tree.get_children())
+            related = None
+            if order_id is not None:
+                from app.services.order_production_service import OrderProductionService
+                related = {b["id"] for b in OrderProductionService(self.database).snapshot(order_id)["batches"]}
+            for row in service.batches():
+                if related is not None and row["id"] not in related:
+                    continue
+                batch_tree.insert("", "end", iid=str(row["id"]), values=(
+                    f"#{row['id']}", row["name"], row["status"], row["plancha_count"], row["created_at"],
+                ))
+
+        batch_actions = tk.Frame(batches_tab, background=COLORS.background)
+        batch_actions.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(batch_actions, text="Abrir planchas", command=lambda: (dialog.destroy(), self.show_production_planchas()),
+                   style="Primary.TButton").pack(side="right")
+
+        def cancel_selected():
+            selected = batch_tree.selection()
+            if not selected:
+                return
+            if not messagebox.askyesno(
+                "Cancelar tanda", "Se liberarán sólo las reservas no impresas. El historial producido se conservará.",
+                parent=dialog,
+            ):
+                return
+            summary = service.cancel(int(selected[0]))
+            messagebox.showinfo(
+                "Tanda cancelada",
+                f"Reservas liberadas: {summary['released_units']} unidad(es).\n"
+                f"Producción que permanece registrada: {summary['preserved_units']} unidad(es).\n"
+                f"Planchas retiradas de producción (historial conservado): {summary['removed_planchas']}.\n"
+                f"Planchas conservadas por historial: {summary['preserved_planchas']}.",
+                parent=dialog,
+            )
+            load_batches()
+            self.notify_production_change()
+        ttk.Button(batch_actions, text="Cancelar tanda", command=cancel_selected,
+                   style="Secondary.TButton").pack(side="right", padx=(0, 8))
+        load_batches()
+        self._production_batch_refresh = lambda: (load_candidates(), load_batches())
+        dialog.bind("<Destroy>", lambda event: setattr(self, "_production_batch_refresh", None)
+                    if event.widget is dialog else None, add="+")
+        self.center_window(dialog)
 
     def build_production_module(self, parent):
-        """Panel de Producción: tabla de planchas + ficha lateral con detalle."""
-        # --- Header ---
-        header = tk.Frame(parent, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
+        """Panel de Producción: Notebook con Tablero por etapas y tabla de planchas."""
+        # --- Crear Notebook para múltiples vistas de producción ---
+        production_notebook = ttk.Notebook(parent)
+        production_notebook.pack(fill="both", expand=True)
+        self.production_notebook = production_notebook
+        
+        # --- Tab 1: Tablero por etapas ---
+        board_tab = tk.Frame(production_notebook, background=COLORS.background)
+        production_notebook.add(board_tab, text="Etapas")
+        
+        # Importar y crear tablero
+        try:
+            from app.ui.production_board import ProductionBoardView
+            self.production_board = ProductionBoardView(
+                board_tab, self.database, on_prepare_batch=self.open_production_batch_dialog,
+                on_open_print=lambda: self.show_production_planchas("Pendientes de imprimir"),
+                on_open_finish=lambda: self.show_production_planchas("Pendientes de terminar"),
+                on_resolve_block=self.open_order_workspace,
+            )
+            self.production_board.pack(fill="both", expand=True)
+            
+            # Binding para manejar selección de pedido desde el tablero
+            self.production_board.bind("<<OrderSelected>>", self._on_board_order_selected)
+            # Binding para abrir detalle del pedido con doble click
+            self.production_board.bind("<<OrderOpenDetail>>", self._on_board_order_open_detail)
+            # Binding para abrir workspace del pedido
+            self.production_board.bind("<<OpenOrderWorkspace>>", self._on_open_order_workspace)
+            
+            # Suscribirse a eventos de cambio de etapa para auto-refrescar el tablero
+            def _on_stage_changed(event_uuid, event_type, title, message, priority):
+                if event_type == "stage.changed":
+                    self._sync_production_board()
+            self._event_bus.on_event(_on_stage_changed)
+        except Exception as e:
+            error_label = tk.Label(
+                board_tab,
+                text=f"Error al cargar tablero de producción:\n{e}",
+                background=COLORS.background,
+                foreground=COLORS.error,
+                font=(UI_FONT, 10),
+            )
+            error_label.pack(expand=True)
+        
+        # --- Tab 2: Creador de planchas (espacio de trabajo persistente) ---
+        constructor_tab = tk.Frame(production_notebook, background=COLORS.background)
+        production_notebook.add(constructor_tab, text="Creador de planchas")
+        self.production_constructor_tab = constructor_tab
+        # Estas fichas contienen bancos de trabajo, por eso usan una altura y
+        # un relleno propios: no deben competir visualmente con las pestañas
+        # principales de Producción.
+        constructor_style = ttk.Style(self)
+        constructor_style.configure("Constructor.TNotebook", background=COLORS.background, borderwidth=0)
+        constructor_style.configure("Constructor.TNotebook.Tab", padding=(7, 4), font=(UI_FONT, 9, "bold"))
+        constructor_notebook = ttk.Notebook(constructor_tab, style="Constructor.TNotebook")
+        constructor_notebook.pack(fill="both", expand=True)
+        self.production_constructor_notebook = constructor_notebook
+        self.production_constructor_editors = {}
+        # La última ficha no representa una plancha: es el acceso permanente
+        # para crear otro banco de trabajo.
+        add_bank_tab = tk.Frame(constructor_notebook, background=COLORS.background)
+        constructor_notebook.add(add_bank_tab, text="＋")
+        self.production_constructor_add_tab = add_bank_tab
+        constructor_drag = {"source": None, "active": False}
+
+        def workspace_tab_index(widget):
+            """Índice de una ficha de banco, o None para el botón +."""
+            try:
+                index = constructor_notebook.index(widget)
+            except tk.TclError:
+                return None
+            return index if widget is not add_bank_tab else None
+
+        def new_bank_identity():
+            number = 1
+            used = set(self.production_constructor_editors)
+            while f"bank:{number}" in used:
+                number += 1
+            return f"bank:{number}", f"Banco {number}"
+
+        def create_production_constructor(
+            key="new", label="Plancha Doccione", order_id=None, *, project=None, preserve_layout=False,
+        ):
+            existing = self.production_constructor_editors.get(key)
+            if existing and existing.winfo_exists():
+                constructor_notebook.select(existing.master)
+                self.production_constructor_editor = existing
+                return existing, True
+
+            host = tk.Frame(constructor_notebook, background=COLORS.background)
+            # Insertar siempre antes de + para que el control quede al final.
+            constructor_notebook.insert(constructor_notebook.index(add_bank_tab), host, text=label)
+
+            def return_from_constructor(discard: bool = False):
+                if discard:
+                    self.production_constructor_editors.pop(key, None)
+                    if host.winfo_exists():
+                        constructor_notebook.forget(host)
+                        host.destroy()
+                    if not self.production_constructor_editors:
+                        self.after_idle(create_production_constructor)
+                production_notebook.select(board_tab)
+
+            from app.planchas.editor import PlanchaEditor
+            editor = PlanchaEditor(
+                self, [], host=host, on_close=return_from_constructor,
+                database=self.database, library_images=self.database.search(limit=10000),
+                order_id=order_id, project=project, preserve_layout=preserve_layout,
+                auto_paginate=False,
+            )
+            editor.pack(fill="both", expand=True)
+            self.production_constructor_editors[key] = editor
+            self.production_constructor_editor = editor
+            constructor_notebook.select(host)
+            return editor, False
+
+        def create_blank_bank():
+            mode = self.ask_plancha_mode()
+            if not mode:
+                return
+            if mode == "new_order":
+                # El pedido se crea con su ficha propia y luego puede armarse
+                # desde allí, para conservar su cliente y sus diseños ligados.
+                self.new_order_dialog()
+                return
+            if mode == "regular":
+                # El modo regular se aloja en otra ficha del mismo creador.
+                key, label = new_bank_identity()
+                host = tk.Frame(constructor_notebook, background=COLORS.background)
+                constructor_notebook.insert(constructor_notebook.index(add_bank_tab), host, text=label)
+                from app.planchas.template_editor import RegularTemplateEditor
+                editor = RegularTemplateEditor(
+                    self, [], host=host, database=self.database,
+                    library_images=self.database.search(limit=10000),
+                )
+                editor.pack(fill="both", expand=True)
+                self.production_constructor_editors[key] = editor
+                self.production_constructor_editor = editor
+                constructor_notebook.select(host)
+                self._save_plancha_workspace_state()
+                return
+            if mode == "mixed":
+                # Las planchas mixtas tienen su propio editor y no deben
+                # reutilizar el banco A4/A5/Franja del Studio.
+                self._open_mixed_plancha_window()
+                return
+            key, label = new_bank_identity()
+            workspace_format = mode.split(":", 1)[1] if mode.startswith("free:") else "a4"
+            editor, _ = create_production_constructor(key, label)
+            from app.planchas.model import A5_PRINT_MARGIN_CM, PRINT_MARGIN_CM
+            editor.project.workspace_format = workspace_format
+            editor.project.project_type = "sticker_free"
+            editor.project.margin_cm = A5_PRINT_MARGIN_CM if workspace_format == "a5" else PRINT_MARGIN_CM
+            editor.workspace_button.configure(text={"a4": "A4", "a5": "A5", "franja": "1/5"}[workspace_format])
+            editor.format_heading.set(f"PLANCHA {editor.project.workspace_label.upper()}")
+            if hasattr(editor, "productive_resize_controls"):
+                editor.productive_resize_controls.pack(fill="x", pady=(4, 0))
+            editor.render()
+            self._save_plancha_workspace_state()
+
+        # Estado inicial: no creamos un editor vacío que después quede
+        # persistido. Esta ficha ofrece crear el primer banco de trabajo.
+        tk.Label(
+            add_bank_tab, text="No hay bancos de trabajo abiertos",
+            background=COLORS.background, foreground=COLORS.text,
+            font=(IDENTITY_FONT, 14, "bold"),
+        ).pack(pady=(70, 8))
+        tk.Label(
+            add_bank_tab,
+            text="Creá un banco nuevo para empezar a armar una plancha.",
+            background=COLORS.background, foreground=COLORS.muted,
+            font=(UI_FONT, 10),
+        ).pack()
+        ttk.Button(
+            add_bank_tab, text="Crear nuevo banco", command=create_blank_bank,
+            style="Primary.TButton",
+        ).pack(pady=(18, 0))
+        ttk.Button(
+            add_bank_tab, text="Recuperar último banco",
+            command=lambda: restore_saved_plancha_workspaces(),
+            style="Secondary.TButton",
+        ).pack(pady=(8, 0))
+
+        def rename_constructor_bank(event=None):
+            try:
+                tab_index = constructor_notebook.index(f"@{event.x},{event.y}") if event else constructor_notebook.index("current")
+                host = constructor_notebook.nametowidget(constructor_notebook.tabs()[tab_index])
+            except (tk.TclError, IndexError):
+                return "break"
+            if host is add_bank_tab:
+                return "break"
+            current = constructor_notebook.tab(host, "text")
+            name = simpledialog.askstring(
+                "Renombrar banco de planchas", "Nombre del banco:", initialvalue=current, parent=self,
+            )
+            if name is not None and name.strip():
+                constructor_notebook.tab(host, text=name.strip())
+                self._save_plancha_workspace_state()
+            return "break"
+
+        def delete_constructor_bank(host):
+            if host is add_bank_tab:
+                return
+            key = next(
+                (candidate for candidate, editor in self.production_constructor_editors.items()
+                 if editor.winfo_exists() and editor.master is host),
+                None,
+            )
+            if key is None:
+                return
+            name = constructor_notebook.tab(host, "text")
+            if not messagebox.askyesno(
+                "Eliminar banco de planchas",
+                f"¿Eliminar «{name}»?\n\nSe quita este banco de la vista. Las planchas ya exportadas no se borran.",
+                parent=self,
+            ):
+                return
+            self.production_constructor_editors.pop(key, None)
+            constructor_notebook.forget(host)
+            host.destroy()
+            self._save_plancha_workspace_state()
+
+        def show_constructor_bank_menu(event):
+            try:
+                tab_index = constructor_notebook.index(f"@{event.x},{event.y}")
+                host = constructor_notebook.nametowidget(constructor_notebook.tabs()[tab_index])
+            except (tk.TclError, IndexError):
+                return "break"
+            if host is add_bank_tab:
+                return "break"
+            constructor_notebook.select(host)
+            menu = tk.Menu(constructor_notebook, tearoff=False)
+            menu.add_command(label="Renombrar", command=lambda: rename_constructor_bank(event))
+            menu.add_separator()
+            menu.add_command(label="Eliminar banco", command=lambda: delete_constructor_bank(host))
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+            return "break"
+
+        def start_constructor_tab_drag(event):
+            try:
+                index = constructor_notebook.index(f"@{event.x},{event.y}")
+                host = constructor_notebook.nametowidget(constructor_notebook.tabs()[index])
+            except (tk.TclError, IndexError):
+                return
+            constructor_drag.update(source=host if host is not add_bank_tab else None, active=False)
+
+        def move_constructor_tab_drag(event):
+            if constructor_drag["source"] is not None:
+                constructor_drag["active"] = True
+
+        def finish_constructor_tab_drag(event):
+            source = constructor_drag["source"]
+            moved = constructor_drag["active"]
+            constructor_drag.update(source=None, active=False)
+            try:
+                target_index = constructor_notebook.index(f"@{event.x},{event.y}")
+                target = constructor_notebook.nametowidget(constructor_notebook.tabs()[target_index])
+            except (tk.TclError, IndexError):
+                return
+            if source is None and target is add_bank_tab and not moved:
+                create_blank_bank()
+                return "break"
+            if source is None or not moved:
+                return
+            # Soltar sobre + deja el banco como último banco, antes del botón.
+            destination = constructor_notebook.index(add_bank_tab) if target is add_bank_tab else target_index
+            if workspace_tab_index(source) is not None:
+                constructor_notebook.insert(destination, source)
+                constructor_notebook.select(source)
+                self._save_plancha_workspace_state()
+            return "break"
+
+        constructor_notebook.bind("<ButtonPress-1>", start_constructor_tab_drag, add="+")
+        constructor_notebook.bind("<B1-Motion>", move_constructor_tab_drag, add="+")
+        constructor_notebook.bind("<ButtonRelease-1>", finish_constructor_tab_drag, add="+")
+        constructor_notebook.bind("<Double-Button-1>", rename_constructor_bank, add="+")
+        constructor_notebook.bind("<Button-3>", show_constructor_bank_menu, add="+")
+
+        self._create_production_plancha_workspace = create_production_constructor
+
+        def restore_saved_plancha_workspaces():
+            """Restaura en fichas los armados editables guardados antes de cerrar."""
+            from app.planchas.model import PlanchaItem, PlanchaProject
+
+            if self.production_constructor_editors:
+                return
+
+            try:
+                state = json.loads(self._plancha_workspace_state_path().read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                state = {}
+            restored_workspaces = state.get("workspaces") or []
+            for saved in restored_workspaces:
+                try:
+                    projects = [
+                        PlanchaProject(
+                            [PlanchaItem.from_dict(item) for item in project.get("items", [])],
+                            project.get("margin_cm", 0.15), project.get("gap_cm", 0.05),
+                            project.get("layout_mode", "classic"), project.get("workspace_format", "a4"),
+                            project.get("project_type", "legacy"), project.get("manual_from_mixed", False),
+                        )
+                        for project in saved.get("projects", [])
+                    ]
+                    if not projects or not any(project.items for project in projects):
+                        continue
+                    saved_key = saved.get("key") or "new"
+                    saved_label = saved.get("label") or "Plancha Doccione"
+                    # Nombre automático anterior: se compacta sin modificar
+                    # los nombres que la persona haya elegido.
+                    match = re.fullmatch(r"Banco de planchas (\d+)", saved_label)
+                    if match:
+                        saved_label = f"Banco {match.group(1)}"
+                    editor, _ = create_production_constructor(
+                        saved_key, saved_label, saved.get("order_id"),
+                        project=projects[0], preserve_layout=True,
+                    )
+                    editor.all_projects = projects
+                    editor.current_project_index = min(int(saved.get("current_index") or 0), len(projects) - 1)
+                    editor.project = projects[editor.current_project_index]
+                    if editor.project.project_type == "sticker_mixed":
+                        editor.enable_sticker_mixed_mode()
+                    editor.plancha_number = editor.current_project_index + 1
+                    editor.max_planchas = len(projects)
+                    editor.render()
+                    editor.update_plancha_navigation()
+                except (TypeError, ValueError, KeyError):
+                    continue
+
+            if self.production_constructor_editors:
+                active_editor = self.production_constructor_editors.get(state.get("active_key"))
+                if active_editor and active_editor.winfo_exists():
+                    constructor_notebook.select(active_editor.master)
+                return
+
+            grouped = {}
+            for row in self.database.production_planchas():
+                if (row.get("production_status") or "") not in {"borrador", "guardada"}:
+                    continue
+                path = Path(row.get("project_path") or "")
+                if not path.is_file():
+                    continue
+                key = row.get("plancha_set_id") or f"saved:{row['id']}"
+                grouped.setdefault(key, []).append(row)
+
+            for key, rows in grouped.items():
+                rows.sort(key=lambda row: int(row.get("plancha_number") or 1))
+                try:
+                    projects = [PlanchaProject.load(row["project_path"]) for row in rows]
+                except (OSError, ValueError, KeyError):
+                    continue
+                if not any(project.items for project in projects):
+                    continue
+                first = rows[0]
+                order_id = first.get("order_id")
+                client = first.get("order_client") or ""
+                label = f"Pedido #{order_id} - {client}" if order_id else (first.get("name") or "Plancha Doccione")
+                workspace_key = f"order:{order_id}" if order_id else f"saved:{key}"
+                editor, _ = create_production_constructor(
+                    workspace_key, label, order_id, project=projects[0], preserve_layout=True,
+                )
+                editor.all_projects = projects
+                editor.project = projects[0]
+                editor.current_project_index = 0
+                editor.plancha_number = 1
+                editor.max_planchas = len(projects)
+                editor.plancha_id = first.get("id")
+                editor.project_path = first.get("project_path") or ""
+                editor.render()
+                editor.update_plancha_navigation()
+
+        # Restaurar tableros grandes abre miniaturas y puede bloquear Tk al
+        # iniciar. Se recuperan bajo demanda desde la ficha del Creador.
+
+        # --- Tab 3: Planchas (vista existente) ---
+        planchas_tab = tk.Frame(production_notebook, background=COLORS.background)
+        production_notebook.add(planchas_tab, text="Planchas")
+        self.production_planchas_tab = planchas_tab
+
+        # --- Tab 4: Presupuestos de fotocopias ---
+        # Reutiliza el editor de producción continua ya disponible, sin
+        # duplicar su lógica ni crear una segunda cola de impresión.
+        printing_tab = tk.Frame(production_notebook, background=COLORS.background)
+        production_notebook.add(printing_tab, text="Presupuestos Fotocopias")
+
+        printing_header = tk.Frame(
+            printing_tab, background=COLORS.panel, highlightthickness=1,
+            highlightbackground=COLORS.border,
+        )
+        printing_header.pack(fill="x", padx=10, pady=(10, 8))
+        printing_header_content = tk.Frame(printing_header, background=COLORS.panel)
+        printing_header_content.pack(fill="x", padx=14, pady=11)
+        tk.Label(
+            printing_header_content, text="Presupuestos de fotocopias", background=COLORS.panel,
+            foreground=COLORS.wine_active, font=(IDENTITY_FONT, 14, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            printing_header_content,
+            text="Analizá un PDF página por página y calculá el presupuesto según color, simple faz o doble faz.",
+            background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 10),
+        ).pack(anchor="w", pady=(2, 0))
+
+        ttk.Button(
+            printing_header_content, text="Cotizar PDF",
+            command=self._open_pdf_print_quote, style="Secondary.TButton",
+        ).pack(side="right", padx=(12, 0))
+
+        printing_content = tk.Frame(printing_tab, background=COLORS.background)
+        printing_content.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        continuous_card = tk.Frame(
+            printing_content, background=COLORS.panel, highlightthickness=1,
+            highlightbackground=COLORS.border, width=380, height=190,
+        )
+        continuous_card.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        continuous_card.pack_propagate(False)
+        tk.Label(
+            continuous_card, text="IMPRESIÓN CONTINUA", background=COLORS.panel,
+            foreground=COLORS.wine_active, font=(IDENTITY_FONT, 12, "bold"),
+        ).pack(anchor="w", padx=16, pady=(16, 5))
+        tk.Label(
+            continuous_card,
+            text="Combiná planchas terminadas en una tira y enviá el resultado a imprimir.",
+            background=COLORS.panel, foreground=COLORS.muted, justify="left",
+            wraplength=335, font=(UI_FONT, 10),
+        ).pack(anchor="w", padx=16)
+        ttk.Button(
+            continuous_card, text="Abrir impresión continua",
+            command=self._open_continuous_from_production, style="Primary.TButton",
+        ).pack(anchor="w", padx=16, pady=(18, 0))
+
+        poster_card = tk.Frame(
+            printing_content, background=COLORS.panel, highlightthickness=1,
+            highlightbackground=COLORS.border, width=380, height=190,
+        )
+        poster_card.pack(side="left", fill="both", expand=True, padx=5)
+        poster_card.pack_propagate(False)
+        tk.Label(
+            poster_card, text="PÓSTERS", background=COLORS.panel,
+            foreground=COLORS.wine_active, font=(IDENTITY_FONT, 12, "bold"),
+        ).pack(anchor="w", padx=16, pady=(16, 5))
+        tk.Label(
+            poster_card,
+            text="Pegá, arrastrá o elegí archivos. Ajustalos a 1, 2, 4, 8 o 16 por hoja A4.",
+            background=COLORS.panel, foreground=COLORS.muted, justify="left",
+            wraplength=335, font=(UI_FONT, 10),
+        ).pack(anchor="w", padx=16)
+        ttk.Button(
+            poster_card, text="Preparar pósters",
+            command=self._open_poster_printing, style="Primary.TButton",
+        ).pack(anchor="w", padx=16, pady=(18, 0))
+
+        queue_card = tk.Frame(
+            printing_content, background=COLORS.panel, highlightthickness=1,
+            highlightbackground=COLORS.border, width=380, height=190,
+        )
+        queue_card.pack(side="left", fill="both", expand=True, padx=(5, 0))
+        queue_card.pack_propagate(False)
+        tk.Label(
+            queue_card, text="COLA DE IMPRESIÓN", background=COLORS.panel,
+            foreground=COLORS.wine_active, font=(IDENTITY_FONT, 12, "bold"),
+        ).pack(anchor="w", padx=16, pady=(16, 5))
+        tk.Label(
+            queue_card,
+            text="Revisá, enviá y seguí el estado de las planchas preparadas para imprimir.",
+            background=COLORS.panel, foreground=COLORS.muted, justify="left",
+            wraplength=335, font=(UI_FONT, 10),
+        ).pack(anchor="w", padx=16)
+        ttk.Button(
+            queue_card, text="Abrir cola de impresión",
+            command=self.open_print_queue_window, style="Secondary.TButton",
+        ).pack(anchor="w", padx=16, pady=(18, 0))
+
+        # El contenido anterior agrupaba acciones no relacionadas. Las nuevas
+        # fichas las exponen por separado y la cola queda con su flujo continuo.
+        printing_content.pack_forget()
+
+        posters_tab = tk.Frame(production_notebook, background=COLORS.background)
+        production_notebook.add(posters_tab, text="Impresiones Fotográficas")
+        self._poster_printing_tab = posters_tab
+        continuous_tab = tk.Frame(production_notebook, background=COLORS.background)
+        production_notebook.add(continuous_tab, text="Impresión continua")
+        self._continuous_production_tab = continuous_tab
+
+        def build_action_tab(tab, title, description, actions):
+            card = tk.Frame(tab, background=COLORS.panel, highlightthickness=1,
+                            highlightbackground=COLORS.border)
+            card.pack(fill="both", expand=True, padx=10, pady=10)
+            tk.Label(card, text=title, background=COLORS.panel, foreground=COLORS.wine_active,
+                     font=(IDENTITY_FONT, 15, "bold")).pack(anchor="w", padx=18, pady=(18, 5))
+            tk.Label(card, text=description, background=COLORS.panel, foreground=COLORS.muted,
+                     font=(UI_FONT, 10), justify="left", wraplength=680).pack(anchor="w", padx=18)
+            row = tk.Frame(card, background=COLORS.panel)
+            row.pack(anchor="w", padx=18, pady=(22, 0))
+            for index, (label, command, style) in enumerate(actions):
+                ttk.Button(row, text=label, command=command, style=style).pack(
+                    side="left", padx=(0 if index == 0 else 8, 0)
+                )
+
+        def open_posters_tab(event=None):
+            """La ficha abre directamente el editor de impresiones fotográficas."""
+            if production_notebook.select() == str(posters_tab):
+                self.after_idle(self._open_poster_printing)
+
+        production_notebook.bind("<<NotebookTabChanged>>", open_posters_tab, add="+")
+
+        def open_continuous_tab(event=None):
+            """La ficha abre directamente el editor de producción continua."""
+            if production_notebook.select() == str(continuous_tab):
+                self.after_idle(self._open_continuous_from_production)
+
+        production_notebook.bind("<<NotebookTabChanged>>", open_continuous_tab, add="+")
+        
+        # --- Header de Planchas ---
+        header = tk.Frame(planchas_tab, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
         header.pack(fill="x", padx=10, pady=(10, 8))
         header_content = tk.Frame(header, background=COLORS.panel)
         header_content.pack(fill="x", padx=14, pady=11)
-        tk.Label(header_content, text="PRODUCCIÓN · PLANCHAS", background=COLORS.panel, foreground=COLORS.wine_active,
-                 font=(IDENTITY_FONT, 12, "bold")).pack(side="left")
-        self.production_summary = tk.StringVar(value="Cargando planchas…")
-        tk.Label(header_content, textvariable=self.production_summary, background=COLORS.panel, foreground=COLORS.muted,
-                 font=(UI_FONT, 10)).pack(side="left", padx=14)
-        ttk.Button(header_content, text="Actualizar", command=lambda: self.refresh_production(), style="Secondary.TButton").pack(side="right")
-        ttk.Button(header_content, text="Producción continua", command=lambda: self._open_continuous_from_production(), style="Secondary.TButton").pack(side="right", padx=(0, 7))
-        ttk.Button(header_content, text="Abrir cola de impresión", command=lambda: self.open_print_queue_window(), style="Primary.TButton").pack(side="right", padx=(0, 7))
+        
+        # Title and subtitle on the left
+        title_frame = tk.Frame(header_content, background=COLORS.panel)
+        title_frame.pack(side="left")
+        tk.Label(title_frame, text="Planchas de producción", background=COLORS.panel, foreground=COLORS.wine_active,
+                 font=(IDENTITY_FONT, 14, "bold")).pack(anchor="w")
+        tk.Label(title_frame, text="Gestioná las planchas creadas desde los pedidos.", background=COLORS.panel, foreground=COLORS.muted,
+                 font=(UI_FONT, 10)).pack(anchor="w", pady=(2, 0))
+        
+        # Buttons on the right
+        buttons_frame = tk.Frame(header_content, background=COLORS.panel)
+        buttons_frame.pack(side="right")
+        ttk.Button(buttons_frame, text="Importar plancha PNG", command=self._production_import_png, style="Primary.TButton").pack(side="right", padx=(0, 7))
+        ttk.Button(buttons_frame, text="Enviar a Impresión continua", command=self._open_continuous_from_production, style="Secondary.TButton").pack(side="right", padx=(0, 7))
+        ttk.Button(buttons_frame, text="Optimizar A4", command=self._open_a4_optimizer, style="Secondary.TButton").pack(side="right", padx=(0, 7))
+        ttk.Button(buttons_frame, text="Actualizar", command=lambda: self.queue_production_refresh(), style="Secondary.TButton").pack(side="right")
 
-        # --- PanedWindow: tabla (izq) + ficha (der) ---
-        self._production_pane = ttk.PanedWindow(parent, orient="horizontal")
-        self._production_pane.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        # --- Cuadrícula operativa: resumen arriba, tabla amplia y preview ---
+        production_layout = tk.Frame(planchas_tab, background=COLORS.background)
+        production_layout.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        production_layout.grid_rowconfigure(1, weight=1)
+        production_layout.grid_columnconfigure(0, weight=3)
+        production_layout.grid_columnconfigure(1, weight=2)
+        top_left = tk.Frame(production_layout, background=COLORS.background)
+        top_left.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        table_area = tk.Frame(production_layout, background=COLORS.background)
+        table_area.grid(row=1, column=0, sticky="nsew")
 
-        # --- Left pane: filtro + treeview ---
-        left_pane = tk.Frame(self._production_pane, background=COLORS.background)
-        self._production_pane.add(left_pane, weight=3)
+        # --- Left pane: cola operativa ---
+        # La lista es el punto de entrada del operador: priorizamos nombre,
+        # pedido y estado por sobre columnas que ya se ven en el detalle.
+        left_pane = tk.Frame(top_left, background=COLORS.background, width=180)
+        left_pane.pack(side="left", fill="y", padx=(0, 6))
+
+        # Resumen de la cola: se actualiza junto con la tabla.
+        summary_frame = tk.Frame(left_pane, background=COLORS.background)
+        summary_frame.pack(fill="x", pady=(0, 6))
+        self._production_summary_vars = {
+            "total": tk.StringVar(value="0 planchas"),
+            "ready": tk.StringVar(value="0 listas"),
+            "queue": tk.StringVar(value="0 en cola"),
+            "alerts": tk.StringVar(value="0 alertas"),
+        }
+        for index, (key, title, color) in enumerate((
+            ("total", "TOTAL", COLORS.text),
+            ("ready", "LISTAS", COLORS.success),
+            ("queue", "EN COLA", COLORS.info),
+            ("alerts", "ALERTAS", COLORS.error),
+        )):
+            card = tk.Frame(summary_frame, background=COLORS.panel, highlightthickness=1,
+                            highlightbackground=COLORS.border)
+            card.pack(side="left", fill="x", expand=True, padx=(0 if index == 0 else 3, 3 if index < 3 else 0))
+            tk.Label(card, text=title, background=COLORS.panel, foreground=COLORS.muted,
+                     font=(UI_FONT, 8, "bold")).pack(anchor="w", padx=9, pady=(7, 0))
+            tk.Label(card, textvariable=self._production_summary_vars[key], background=COLORS.panel,
+                     foreground=color, font=(UI_FONT, 10, "bold")).pack(anchor="w", padx=9, pady=(1, 7))
 
         # Filtro por estado
         filter_frame = tk.Frame(left_pane, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
         filter_frame.pack(fill="x", pady=(0, 4))
         filter_inner = tk.Frame(filter_frame, background=COLORS.panel)
         filter_inner.pack(fill="x", padx=14, pady=6)
-        tk.Label(filter_inner, text="Filtrar:", background=COLORS.panel, foreground=COLORS.muted,
-                 font=(UI_FONT, 10)).pack(side="left")
+        
+        ttk.Label(filter_inner, text="Estado:", background=COLORS.panel, foreground=COLORS.muted,
+                  font=(UI_FONT, 9)).pack(anchor="w", pady=(0, 4))
+        
         self.production_filter = tk.StringVar(value="Todas")
-        filter_values = ["Todas", "Guardadas", "Listas", "En cola", "Impresas", "Con errores"]
-        for label in filter_values:
-            ttk.Radiobutton(filter_inner, text=label, variable=self.production_filter, value=label,
-                           command=lambda: self.refresh_production()).pack(side="left", padx=(8, 0))
+        filter_values = ["Todas", "Pendientes de imprimir", "Pendientes de terminar",
+                         "Guardadas", "Listas", "En cola", "Impresas", "Con errores"]
+        
+        # Create dropdown combobox
+        self._production_filter_combo = ttk.Combobox(filter_inner, textvariable=self.production_filter, 
+                                                   values=filter_values, state="readonly", font=(UI_FONT, 10))
+        self._production_filter_combo.pack(fill="x")
+        self._production_filter_combo.bind("<<ComboboxSelected>>", lambda e: self._set_production_filter(self.production_filter.get()))
+        
+        # Search field
+        search_frame = tk.Frame(left_pane, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
+        search_frame.pack(fill="x", pady=(4, 0))
+        search_inner = tk.Frame(search_frame, background=COLORS.panel)
+        search_inner.pack(fill="x", padx=14, pady=8)
+        
+        ttk.Label(search_inner, text="Buscar:", 
+                 background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 9)).pack(anchor="w", pady=(0, 4))
+        
+        self.production_search_var = tk.StringVar(value="")
+        search_entry = ttk.Entry(search_inner, textvariable=self.production_search_var)
+        search_entry.pack(side="left", fill="x", expand=True)
+        search_entry.bind("<KeyRelease>", lambda e: self.queue_production_refresh())
 
         # Estilo del treeview con fila más alta para preview
         production_style = ttk.Style(parent)
@@ -6800,69 +13474,212 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             background=[("selected", COLORS.wine)],
             foreground=[("selected", COLORS.text)],
         )
-        columns = ("preview", "order", "plancha", "material", "state", "prints", "delivery")
-        self.production_tree = ttk.Treeview(left_pane, columns=columns, show="headings", style="Production.Treeview", selectmode="browse")
+        columns = ("preview", "plancha", "format", "order", "state")
+        self.production_tree = ttk.Treeview(table_area, columns=columns, show="tree headings", style="Production.Treeview", selectmode="browse")
+        self.production_tree.heading("#0", text="Trabajo")
+        self.production_tree.column("#0", width=150, minwidth=120, stretch=True, anchor="w")
         headings = {
-            "preview": ("", 70), "order": ("Pedido", 160), "plancha": ("Plancha", 185),
-            "material": ("Material", 120), "state": ("Estado", 120),
-            "prints": ("Impresiones", 90), "delivery": ("Entrega", 105),
+            "preview": ("", 42), "plancha": ("Plancha / cliente", 190), "format": ("Formato", 72),
+            "order": ("Pedido · entrega", 135), "state": ("Estado", 100),
         }
         for key in columns:
             title, width = headings[key]
             self.production_tree.heading(key, text=title)
-            self.production_tree.column(key, width=width, anchor="center" if key in {"preview", "state", "prints", "delivery"} else "w")
-        scroll = ttk.Scrollbar(left_pane, orient="vertical", command=lambda *a: self.production_tree.yview(*a))
+            self.production_tree.column(key, width=width, minwidth=width, stretch=key == "plancha",
+                                        anchor="center" if key in {"preview", "state"} else "w")
+        self.production_tree.tag_configure("status-ready", foreground=COLORS.success)
+        self.production_tree.tag_configure("status-queue", foreground=COLORS.info)
+        self.production_tree.tag_configure("status-printed", foreground=COLORS.muted)
+        self.production_tree.tag_configure("status-alert", foreground=COLORS.error)
+        self.production_tree.tag_configure("format-a4", foreground="#38bdf8")
+        self.production_tree.tag_configure("format-a5", foreground="#22c55e")
+        self.production_tree.tag_configure("format-franja", foreground="#d6c45b")
+        # Las impresiones fotográficas comparten el circuito de continua, pero
+        # necesitan distinguirse de las planchas de vinilo en producción.
+        self.production_tree.tag_configure("photo-print", foreground="#c084fc")
+        scroll = ttk.Scrollbar(table_area, orient="vertical", command=lambda *a: self.production_tree.yview(*a))
         self.production_tree.configure(yscrollcommand=scroll.set)
         self.production_tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
+        
+        # Empty state frame
+        self._production_empty_frame = tk.Frame(table_area, background=COLORS.background)
+        empty_label = tk.Label(self._production_empty_frame, text="Todavía no hay planchas",
+                              background=COLORS.background, foreground=COLORS.muted,
+                              font=(IDENTITY_FONT, 14, "bold"), wraplength=250, justify="center")
+        empty_label.pack(pady=(40, 8), padx=12)
+        empty_sublabel = tk.Label(self._production_empty_frame, 
+                                  text="Las planchas creadas desde los pedidos aparecerán aquí.",
+                                  background=COLORS.background, foreground=COLORS.muted,
+                                  font=(UI_FONT, 10), wraplength=250, justify="center")
+        empty_sublabel.pack(pady=(0, 16), padx=12)
+        ttk.Button(self._production_empty_frame, text="Ir a Pedidos",
+                  command=lambda: self.switch_to_module("pedidos"),
+                  style="Primary.TButton").pack()
+        
+        # Dynamic wraplength update
+        def update_empty_wrap(event):
+            width = max(120, event.width - 24)
+            empty_label.configure(wraplength=width)
+            empty_sublabel.configure(wraplength=width)
+        self._production_empty_frame.bind("<Configure>", update_empty_wrap, add="+")
 
-        # --- Right pane: ficha de detalle ---
-        detail_outer = tk.Frame(self._production_pane, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
-        self._production_pane.add(detail_outer, weight=1)
+        # --- Center pane: datos y estado (34%) ---
+        center_pane = tk.Frame(top_left, background=COLORS.panel, width=280)
+        center_pane.pack(side="left", fill="both", expand=True)
+        # El resumen debe ser una franja compacta; la tabla es la zona que
+        # necesita crecer verticalmente para trabajar con los conjuntos.
+        center_pane.configure(height=210)
+        center_pane.grid_propagate(False)
+        
+        # Configure grid layout
+        center_pane.rowconfigure(0, weight=1)
+        center_pane.rowconfigure(1, weight=0)
+        center_pane.columnconfigure(0, weight=1)
 
-        detail_canvas = tk.Canvas(detail_outer, background=COLORS.panel, highlightthickness=0, bd=0)
-        detail_scroll = ttk.Scrollbar(detail_outer, orient="vertical", command=detail_canvas.yview)
-        detail_inner = tk.Frame(detail_canvas, background=COLORS.panel)
-        detail_inner.bind("<Configure>", lambda e: detail_canvas.configure(scrollregion=detail_canvas.bbox("all")))
-        detail_canvas.create_window((0, 0), window=detail_inner, anchor="nw")
-        detail_canvas.configure(yscrollcommand=detail_scroll.set)
-        detail_scroll.pack(side="right", fill="y")
-        detail_canvas.pack(side="left", fill="both", expand=True)
-        self._production_detail_inner = detail_inner
-        self._production_detail_canvas = detail_canvas
-        # Soporte scroll con mouse wheel
-        def _on_detail_mousewheel(event):
-            detail_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        detail_canvas.bind("<MouseWheel>", _on_detail_mousewheel)
-        detail_inner.bind("<MouseWheel>", _on_detail_mousewheel)
+        # Content area (row 0) - directly in center_pane
+        center_content = tk.Frame(center_pane, background=COLORS.panel)
+        center_content.grid(row=0, column=0, sticky="nsew")
+        self._production_detail_inner = center_content
+
+        # --- Sección Datos del pedido ---
+        self._prod_detail_order_frame = self._build_detail_section(center_content, "DATOS DE LA PLANCHA")
+        self._prod_detail_order_labels = {}
+        
+        # Configure 4-column grid
+        self._prod_detail_order_frame.columnconfigure(0, weight=0)
+        self._prod_detail_order_frame.columnconfigure(1, weight=1)
+        self._prod_detail_order_frame.columnconfigure(2, weight=0)
+        self._prod_detail_order_frame.columnconfigure(3, weight=1)
+        
+        # 4-column layout
+        data_fields = [
+            ("order", "Pedido"), ("client", "Cliente"), ("name", "Plancha"),
+            ("material", "Material"), ("format", "Formato"), ("stickers", "Stickers"),
+            ("usuario", "Usuario"), ("delivery", "Entrega"), ("saved", "Guardado")
+        ]
+        
+        for i, (key, label) in enumerate(data_fields):
+            col_idx = i % 2
+            # First pair: columns 0,1; Second pair: columns 2,3
+            label_col = col_idx * 2
+            val_col = col_idx * 2 + 1
+            row_idx = i // 2
+            
+            tk.Label(self._prod_detail_order_frame, text=f"{label}:", background=COLORS.panel, foreground=COLORS.muted,
+                     font=(UI_FONT, 9), anchor="e").grid(row=row_idx, column=label_col, sticky="e", padx=(10 if label_col == 0 else 10, 6), pady=1)
+            val = tk.Label(self._prod_detail_order_frame, text="—", background=COLORS.panel, foreground=COLORS.text,
+                          font=(UI_FONT, 10, "bold"), anchor="w")
+            val.grid(row=row_idx, column=val_col, sticky="w", padx=(0, 10 if val_col == 3 else 0), pady=1)
+            self._prod_detail_order_labels[key] = val
+
+        # --- Sección Producción ---
+        self._prod_detail_prod_frame = self._build_detail_section(center_content, "ESTADO DE PRODUCCIÓN")
+        self._prod_detail_prod_labels = {}
+        for key, label in [("status", "Estado"), ("prints_ok", "Impresiones OK"), ("errors", "Errores"),
+                           ("reprints", "Reimpresiones"), ("last_print", "Última impresión"),
+                           ("mode", "Modo"), ("queue_pos", "Posición en cola")]:
+            row = tk.Frame(self._prod_detail_prod_frame, background=COLORS.panel)
+            row.pack(fill="x", padx=10, pady=1)
+            tk.Label(row, text=f"{label}:", background=COLORS.panel, foreground=COLORS.muted,
+                     font=(UI_FONT, 9), width=14, anchor="e").pack(side="left")
+            val = tk.Label(row, text="—", background=COLORS.panel, foreground=COLORS.text,
+                          font=(UI_FONT, 10, "bold"), anchor="w")
+            val.pack(side="left", padx=(6, 0))
+            self._prod_detail_prod_labels[key] = val
+
+        # --- Sección Historial ---
+        self._prod_detail_history_frame = self._build_detail_section(center_content, "ESTADO DE IMPRESIÓN")
+        self._prod_detail_history_label = tk.Label(self._prod_detail_history_frame, 
+                                                   text="Seleccioná una plancha para ver su estado de impresión.",
+                                                   background=COLORS.panel, foreground=COLORS.muted,
+                                                   font=(UI_FONT, 9), anchor="center")
+        self._prod_detail_history_label.pack(fill="x", padx=10, pady=8)
+
+        # --- Lower fixed action bar (row 1) ---
+        actions_area = tk.Frame(center_pane, background=COLORS.panel)
+        actions_area.grid(row=1, column=0, sticky="ew", padx=10, pady=(6, 10))
+        actions_area.columnconfigure(0, weight=1)
+        actions_area.columnconfigure(1, weight=1)
+        
+        btn_specs = [
+            ("open_editor", "Abrir editor", self._production_open_editor, "Primary.TButton"),
+            ("send_print", "Enviar a impresión", self._production_send_to_print, "Primary.TButton"),
+            ("reprint", "Reimprimir", self._production_reprint, "Secondary.TButton"),
+            ("register_error", "Registrar error", self._production_register_error, "Secondary.TButton"),
+            ("view_history", "Ver historial", self._production_view_history, "Secondary.TButton"),
+        ]
+        self._production_action_btns = {}
+        
+        # 2-column layout
+        self._production_action_btns["open_editor"] = ttk.Button(actions_area, text="Abrir editor", command=self._production_open_editor, style="Primary.TButton")
+        self._production_action_btns["open_editor"].grid(row=0, column=0, sticky="ew", padx=(0, 3), pady=3)
+        
+        self._production_action_btns["send_print"] = ttk.Button(actions_area, text="Enviar a impresión", command=self._production_send_to_print, style="Primary.TButton")
+        self._production_action_btns["send_print"].grid(row=0, column=1, sticky="ew", padx=(3, 0), pady=3)
+        
+        self._production_action_btns["reprint"] = ttk.Button(actions_area, text="Reimprimir", command=self._production_reprint, style="Secondary.TButton")
+        self._production_action_btns["reprint"].grid(row=1, column=0, sticky="ew", padx=(0, 3), pady=3)
+        
+        self._production_action_btns["register_error"] = ttk.Button(actions_area, text="Registrar error", command=self._production_register_error, style="Secondary.TButton")
+        self._production_action_btns["register_error"].grid(row=1, column=1, sticky="ew", padx=(3, 0), pady=3)
+        
+        self._production_action_btns["view_history"] = ttk.Button(actions_area, text="Ver historial", command=self._production_view_history, style="Secondary.TButton")
+        self._production_action_btns["view_history"].grid(row=2, column=0, columnspan=2, sticky="ew", pady=3)
+        self._production_action_btns["add_continuous"] = ttk.Button(
+            actions_area, text="✓ Confirmar plancha para impresión", command=self._production_add_to_continuous,
+            style="Primary.TButton",
+        )
+        self._production_action_btns["add_continuous"].grid(row=3, column=0, columnspan=2, sticky="ew", pady=3)
+        # En Planchas solo se confirma: edición y operaciones de impresión se
+        # hacen por doble clic o desde Impresión continua.
+        for key in ("open_editor", "send_print", "reprint", "register_error", "view_history"):
+            self._production_action_btns[key].grid_remove()
+        self._production_action_btns["add_continuous"].grid(row=0, column=0, columnspan=2, sticky="ew", pady=3)
+        self._prod_detail_history_frame._section_outer.pack_forget()
+
+        # --- Right pane: vista previa (33%) ---
+        right_pane = tk.Frame(production_layout, background=COLORS.panel, width=320)
+        right_pane.grid(row=0, column=1, rowspan=2, sticky="nsew")
 
         # --- Preview con tabs: Impresión / Cliente ---
         self._preview_mode = tk.StringVar(value="print")
-        preview_nb = ttk.Notebook(detail_inner)
-        preview_nb.pack(fill="x", padx=10, pady=(10, 2))
+        preview_nb = ttk.Notebook(right_pane)
+        preview_nb.pack(fill="both", expand=True, padx=10, pady=(10, 10))
 
-        # --- Tab Impresión ---
+        # --- Tab Vista de impresión ---
         print_tab = tk.Frame(preview_nb, background=COLORS.canvas)
-        preview_nb.add(print_tab, text=" Impresión ")
-        self._prod_detail_preview_label = tk.Label(print_tab, text="Seleccioná una plancha\npara ver sus datos",
+        preview_nb.add(print_tab, text=" Vista de impresión ")
+        
+        # Vista previa que ocupa toda la altura disponible
+        preview_container = tk.Frame(print_tab, background=COLORS.canvas)
+        preview_container.pack(fill="both", expand=True, padx=6, pady=6)
+        
+        self._prod_detail_preview_label = tk.Label(preview_container, text="Seleccioná una plancha para ver la vista previa.",
                                                     background=COLORS.canvas, foreground=COLORS.muted,
                                                     font=(UI_FONT, 10), anchor="center")
-        self._prod_detail_preview_label.pack(fill="both", expand=True, padx=2, pady=2, ipady=30)
+        self._prod_detail_preview_label.pack(fill="both", expand=True)
         self._prod_detail_preview_photo = None
         self._prod_detail_preview_zoom = tk.DoubleVar(value=1.0)
+        
+        # Zoom y botón debajo de la imagen
         preview_controls = tk.Frame(print_tab, background=COLORS.canvas)
-        preview_controls.pack(fill="x", padx=6, pady=(0, 4))
+        preview_controls.pack(fill="x", padx=6, pady=(0, 6))
+        
         ttk.Label(preview_controls, text="Zoom:", background=COLORS.canvas, foreground=COLORS.muted,
                   font=(UI_FONT, 9)).pack(side="left")
         zoom_slider = ttk.Scale(preview_controls, from_=0.3, to=3.0, variable=self._prod_detail_preview_zoom,
                                 orient="horizontal", command=lambda _: self._update_production_detail_preview())
         zoom_slider.pack(side="left", fill="x", expand=True, padx=(4, 4))
-        ttk.Button(preview_controls, text="Abrir PNG", command=self._production_view_png,
-                  style="Secondary.TButton").pack(side="right")
+        open_png_btn = ttk.Button(preview_controls, text="Abrir PNG", command=self._production_view_png,
+                  style="Secondary.TButton")
+        open_png_btn.pack(side="right")
+        self._prod_preview_zoom_slider = zoom_slider
+        self._prod_preview_open_btn = open_png_btn
 
-        # --- Tab Cliente ---
+        # --- Tab Vista para cliente ---
         client_tab = tk.Frame(preview_nb, background=COLORS.canvas)
-        preview_nb.add(client_tab, text=" Cliente ")
+        preview_nb.add(client_tab, text=" Vista para cliente ")
         self._preview_nb = preview_nb
 
         # Fondo selector
@@ -6870,14 +13687,13 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         bg_frame.pack(fill="x", padx=6, pady=(6, 2))
         ttk.Label(bg_frame, text="Fondo:", background=COLORS.panel, foreground=COLORS.muted,
                   font=(UI_FONT, 9)).pack(side="left", padx=(0, 4))
-        self._client_bg_type = tk.StringVar(value="white")
-        bg_options = [("Blanco", "white"), ("Gris claro", "gray"), ("Marca", "brand"), ("Imagen", "custom")]
-        for label, value in bg_options:
-            ttk.Radiobutton(bg_frame, text=label, variable=self._client_bg_type, value=value,
-                           command=self._on_client_bg_change).pack(side="left", padx=(2, 0))
+        # La vista para cliente siempre usa el fondo protegido de la marca.
+        # Alternativas lisas permitirían exportar los diseños sin protección.
+        self._client_bg_type = tk.StringVar(value="brand")
+        tk.Label(bg_frame, text="Fondo Doccione + marca no imprimible",
+                 background=COLORS.panel, foreground=COLORS.muted,
+                 font=(UI_FONT, 9, "bold")).pack(side="left", padx=(2, 0))
         self._client_bg_custom_path = tk.StringVar(value="")
-        ttk.Button(bg_frame, text="Elegir imagen…", command=self._pick_custom_bg,
-                  style="Secondary.TButton").pack(side="left", padx=(6, 0))
         self._client_custom_bg_label = tk.Label(bg_frame, text="", background=COLORS.panel,
                                                  foreground=COLORS.muted, font=(UI_FONT, 8))
         self._client_custom_bg_label.pack(side="left", padx=(4, 0))
@@ -6902,83 +13718,79 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                                               foreground=COLORS.muted, font=(UI_FONT, 8))
         self._client_status_label.pack(side="right")
 
-        ttk.Label(detail_inner, text="Proporción real A4 · tamaño físico según calibración del monitor",
-                  background=COLORS.panel, foreground=COLORS.disabled,
-                  font=(UI_FONT, 8)).pack(fill="x", padx=10, pady=(1, 0))
-
-        # --- Sección Datos del pedido ---
-        self._prod_detail_order_frame = self._build_detail_section(detail_inner, "DATOS DEL PEDIDO")
-        self._prod_detail_order_labels = {}
-        for key, label in [("order", "Pedido"), ("client", "Cliente"), ("name", "Plancha"),
-                           ("material", "Material"), ("format", "Formato"), ("stickers", "Stickers"),
-                           ("usuario", "Usuario"), ("delivery", "Entrega"), ("saved", "Guardado")]:
-            row = tk.Frame(self._prod_detail_order_frame, background=COLORS.panel)
-            row.pack(fill="x", padx=10, pady=1)
-            tk.Label(row, text=f"{label}:", background=COLORS.panel, foreground=COLORS.muted,
-                     font=(UI_FONT, 9), width=10, anchor="e").pack(side="left")
-            val = tk.Label(row, text="—", background=COLORS.panel, foreground=COLORS.text,
-                          font=(UI_FONT, 10, "bold"), anchor="w")
-            val.pack(side="left", padx=(6, 0))
-            self._prod_detail_order_labels[key] = val
-
-        # --- Sección Producción ---
-        self._prod_detail_prod_frame = self._build_detail_section(detail_inner, "ESTADO DE PRODUCCIÓN")
-        self._prod_detail_prod_labels = {}
-        for key, label in [("status", "Estado"), ("prints_ok", "Impresiones OK"), ("errors", "Errores"),
-                           ("reprints", "Reimpresiones"), ("last_print", "Última impresión"),
-                           ("mode", "Modo"), ("queue_pos", "Posición en cola")]:
-            row = tk.Frame(self._prod_detail_prod_frame, background=COLORS.panel)
-            row.pack(fill="x", padx=10, pady=1)
-            tk.Label(row, text=f"{label}:", background=COLORS.panel, foreground=COLORS.muted,
-                     font=(UI_FONT, 9), width=14, anchor="e").pack(side="left")
-            val = tk.Label(row, text="—", background=COLORS.panel, foreground=COLORS.text,
-                          font=(UI_FONT, 10, "bold"), anchor="w")
-            val.pack(side="left", padx=(6, 0))
-            self._prod_detail_prod_labels[key] = val
-
-        # --- Barra de acciones ---
-        actions_frame = tk.Frame(detail_inner, background=COLORS.panel)
-        actions_frame.pack(fill="x", padx=10, pady=(10, 10))
-        ttk.Label(actions_frame, text="ACCIONES", background=COLORS.panel, foreground=COLORS.muted,
-                  font=(IDENTITY_FONT, 9, "bold")).pack(anchor="w", pady=(0, 6))
-        action_btns = tk.Frame(actions_frame, background=COLORS.panel)
-        action_btns.pack(fill="x")
-        btn_specs = [
-            ("open_editor", "Abrir editor", self._production_open_editor, "Primary.TButton"),
-            ("send_print", "Enviar a impresión", self._production_send_to_print, "Primary.TButton"),
-            ("reprint", "Reimprimir", self._production_reprint, "Secondary.TButton"),
-            ("add_continuous", "Agregar a continua", self._production_add_to_continuous, "Secondary.TButton"),
-            ("register_error", "Registrar error", self._production_register_error, "Secondary.TButton"),
-            ("view_history", "Ver historial", self._production_view_history, "Secondary.TButton"),
-        ]
-        self._production_action_btns = {}
-        for i, (key, text, cmd, style) in enumerate(btn_specs):
-            row_idx = i // 2
-            col_idx = i % 2
-            btn = ttk.Button(action_btns, text=text, command=cmd, style=style)
-            btn.grid(row=row_idx, column=col_idx, sticky="ew", padx=2, pady=2)
-            self._production_action_btns[key] = btn
-        action_btns.columnconfigure(0, weight=1)
-        action_btns.columnconfigure(1, weight=1)
-
         # --- State ---
         self._production_preview_cache: dict[int, object] = {}
         self._production_plancha_data: dict[str, dict] = {}
         self._production_detail_current_preview_path: str = ""
+        self._production_refresh_after: str | None = None
+        self._production_thumb_cache: dict[str, object] = {}
+        self._production_loading_batch_after: str | None = None
 
         # --- Bindings ---
         self.production_tree.bind("<<TreeviewSelect>>", self._on_production_select)
         self.production_tree.bind("<Double-1>", self._on_production_double_click)
         self._production_menu = tk.Menu(self.production_tree, tearoff=0)
         self._production_menu.add_command(label="Abrir en editor", command=self._production_open_editor)
+        self._production_menu.add_command(label="Enlazar a pedido…", command=self._production_link_to_order)
         self._production_menu.add_command(label="Enviar a impresión", command=self._production_send_to_print)
         self._production_menu.add_separator()
         self._production_menu.add_command(label="Ver PNG final", command=self._production_view_png)
         self._production_menu.add_command(label="Reimprimir", command=self._production_reprint)
         self._production_menu.add_separator()
         self._production_menu.add_command(label="Agregar a producción continua", command=self._production_add_to_continuous)
+        self._production_menu.add_separator()
+        self._production_menu.add_command(label="Eliminar plancha", command=self._production_delete_plancha)
         self.production_tree.bind("<Button-3>", self._show_production_menu)
 
+        self.after_idle(self._deferred_refresh_production)
+
+    def _deferred_init_firebase(self):
+        """Inicializa Firebase tras mostrar la UI (~290 ms fuera del arranque)."""
+        try:
+            firebase_ok = initialize_firebase()
+            if firebase_ok:
+                self._notification_service.start_worker(interval_seconds=15)
+        except Exception:
+            pass
+
+    def _deferred_refresh_notifications(self):
+        """Carga el panel de notificaciones tras la construcción (~278 ms fuera del arranque)."""
+        try:
+            self.refresh_notifications()
+        except Exception as e:
+            try:
+                self.status.set(f"Aviso: no se pudieron cargar notificaciones: {e}")
+            except Exception:
+                pass
+
+    def _deferred_refresh_production(self):
+        """Callback único programado tras la construcción inicial."""
+        self._production_refresh_after = None
+        self.refresh_production()
+
+    def queue_production_refresh(self, delay: int = 60):
+        """Evita ejecutar refresh_production() más de una vez por ráfaga."""
+        if self._production_refresh_after is not None:
+            try:
+                self.after_cancel(self._production_refresh_after)
+            except tk.TclError:
+                pass
+        self._production_refresh_after = self.after(delay, self._flush_production_refresh)
+
+    def notify_production_change(self):
+        """Refresca tablero, planchas y el selector de tandas ya abierto."""
+        self.queue_production_refresh(delay=0)
+        self._sync_production_board()
+        for tab in getattr(self, "order_tabs", {}).values():
+            panel = getattr(tab, "production_panel", None)
+            if panel is not None and panel.winfo_exists():
+                panel.refresh()
+        callback = getattr(self, "_production_batch_refresh", None)
+        if callable(callback):
+            callback()
+
+    def _flush_production_refresh(self):
+        self._production_refresh_after = None
         self.refresh_production()
 
     def open_print_queue_window(self):
@@ -7139,6 +13951,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 return
             if messagebox.askyesno("Confirmar impresión", "¿La plancha terminó de imprimirse correctamente?", parent=dialog):
                 self.database.update_print_job(job["id"], "Impresa", "Confirmada desde Producción.")
+                self.notify_production_change()
                 # Publicar evento de producción completada
                 try:
                     order_id = job.get("order_id")
@@ -7158,9 +13971,22 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
         refresh_queue()
 
+    def _set_production_filter(self, filter_value):
+        """Set production filter and refresh."""
+        self._production_order_plancha_ids = None
+        self.production_filter.set(filter_value)
+        self.queue_production_refresh()
+
     def refresh_production(self):
         if not hasattr(self, "production_tree"):
             return
+        # Cancelar carga de miniaturas pendiente
+        if self._production_loading_batch_after is not None:
+            try:
+                self.after_cancel(self._production_loading_batch_after)
+            except tk.TclError:
+                pass
+            self._production_loading_batch_after = None
         # Guardar selección actual para restaurarla después
         prev_sel = self.production_tree.selection()
         prev_plancha_id = None
@@ -7172,27 +13998,58 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         self._production_plancha_data.clear()
         self.production_tree.delete(*self.production_tree.get_children())
         rows = self.database.production_planchas()
+        related_ids = getattr(self, "_production_order_plancha_ids", None)
+        if related_ids is not None:
+            rows = [row for row in rows if int(row["id"]) in related_ids]
         # Aplicar filtro
         filter_value = getattr(self, "production_filter", tk.StringVar(value="Todas")).get()
         status_map = {
             "Guardadas": "guardada", "Listas": "lista", "En cola": "en_cola",
             "Impresas": "impresa", "Con errores": None,
         }
-        if filter_value == "Con errores":
+        if filter_value in {"Pendientes de imprimir", "Pendientes de terminar"}:
+            assignment_state = "prepared" if filter_value == "Pendientes de imprimir" else "printed"
+            plancha_ids = {
+                int(row[0]) for row in self.database.connection.execute(
+                    "SELECT DISTINCT plancha_id FROM plancha_item_assignments WHERE state=?",
+                    (assignment_state,),
+                )
+            }
+            rows = [row for row in rows if int(row["id"]) in plancha_ids]
+        elif filter_value == "Con errores":
             rows = [r for r in rows if int(r.get("error_count") or 0) > 0]
         elif filter_value in status_map and status_map[filter_value]:
             rows = [r for r in rows if r.get("production_status") == status_map[filter_value]]
+        
+        # Aplicar búsqueda
+        search_query = getattr(self, "production_search_var", tk.StringVar(value="")).get().lower().strip()
+        if search_query:
+            rows = [r for r in rows if 
+                   search_query in str(r.get("order_id") or "").lower() or
+                   search_query in (r.get("order_client") or "").lower() or
+                   search_query in (r.get("name") or "").lower()]
 
         production_status_labels = {
+            "Cancelada": "Cancelada · reservas liberadas",
             "borrador": "Borrador", "guardada": "Guardada", "lista": "Lista",
             "en_cola": "En cola", "impresa": "Impresa",
             "disponible_para_continua": "Disponible", "usada_en_continua": "Usada en tira",
         }
 
         restored = False
+        previews_to_load: list[tuple[str, str, int]] = []
+        grouped_counts = {}
+        for row in rows:
+            set_id = (row.get("plancha_set_id") or "").strip()
+            if set_id:
+                grouped_counts[set_id] = grouped_counts.get(set_id, 0) + 1
+        group_nodes = {}
         for plancha in rows:
             plancha_id = int(plancha["id"])
-            order_label = f"#{plancha.get('order_id', '?')} · {plancha.get('order_client') or 'Sin cliente'}" if plancha.get("order_id") else "Sin pedido"
+            order_label = f"#{plancha.get('order_id', '?')}" if plancha.get("order_id") else "Sin pedido"
+            client_label = plancha.get("order_client") or "Sin cliente"
+            if plancha.get("person_phone"):
+                client_label = f"{client_label} · {plancha['person_phone']}"
             name = plancha.get("name") or f"Plancha #{plancha_id}"
             material = plancha.get("material") or "-"
             status = production_status_labels.get(plancha.get("production_status") or "borrador", "Borrador")
@@ -7200,23 +14057,67 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             error_count = int(plancha.get("error_count") or 0)
             prints_label = f"{print_count}OK" + (f" / {error_count}✗" if error_count else "")
             delivery = plancha.get("delivery_date") or "-"
+            plancha_label = name if client_label == "Sin cliente" else f"{name}\n{client_label}"
+            order_delivery_label = f"{order_label} · {delivery}"
+            if error_count:
+                row_tag = "status-alert"
+            elif plancha.get("production_status") == "lista":
+                row_tag = "status-ready"
+            elif plancha.get("production_status") == "en_cola":
+                row_tag = "status-queue"
+            elif plancha.get("production_status") == "impresa":
+                row_tag = "status-printed"
+            else:
+                row_tag = ""
             # Mini preview placeholder
             iid = f"plancha:{plancha_id}"
             preview_path = plancha.get("preview_path") or plancha.get("final_png_path") or ""
             has_preview = preview_path and Path(preview_path).exists()
             preview_marker = "" if has_preview else "–"
-            self.production_tree.insert("", "end", iid=iid, values=(
-                preview_marker, order_label, name, material, status, prints_label, delivery,
-            ))
+            format_key = (plancha.get("workspace_format") or "a4").lower()
+            format_labels = {"a4": "A4", "a5": "A5", "franja": "Franja"}
+            format_label = format_labels.get(format_key, format_key.upper())
+            format_tag = f"format-{format_key}"
+            # El color identifica el formato; las impresiones fotográficas
+            # tienen su propio color y los errores conservan prioridad.
+            tags = (row_tag,) if error_count else (
+                ("photo-print",) if self._is_photo_print_plancha(plancha) else (format_tag,)
+            )
+            set_id = (plancha.get("plancha_set_id") or "").strip()
+            parent = ""
+            tree_text = ""
+            if set_id:
+                parent = group_nodes.get(set_id, "")
+                if not parent:
+                    parent = f"group:{set_id}"
+                    group_nodes[set_id] = parent
+                    group_name = f"{order_label} · {client_label}"
+                    self.production_tree.insert(
+                        "", "end", iid=parent, text=f"{group_name} · {grouped_counts[set_id]} planchas",
+                        values=("", "Conjunto guardado", "", "", ""), open=False,
+                    )
+                tree_text = f"Plancha {int(plancha.get('plancha_number') or 1)}"
+            self.production_tree.insert(parent, "end", iid=iid, text=tree_text, values=(
+                preview_marker, plancha_label, format_label, order_delivery_label, status,
+            ), tags=tags)
             self._production_plancha_data[iid] = plancha
             if has_preview:
-                self._load_production_preview(iid, preview_path, plancha_id)
+                previews_to_load.append((iid, preview_path, plancha_id))
             # Restaurar selección previa si el item sigue en la tabla
             if prev_plancha_id == iid and not restored:
                 self.after_idle(lambda i=iid: (self.production_tree.selection_set(i),
                                                self.production_tree.see(i),
                                                self._refresh_production_detail()))
                 restored = True
+
+        # Show/hide empty state based on whether there are planchas
+        if hasattr(self, "_production_empty_frame"):
+            if not rows:
+                self.production_tree.pack_forget()
+                self._production_empty_frame.pack(fill="both", expand=True)
+            else:
+                self._production_empty_frame.pack_forget()
+                self.production_tree.pack(side="left", fill="both", expand=True)
 
         if not restored and hasattr(self, "_clear_production_detail"):
             self._clear_production_detail()
@@ -7226,29 +14127,81 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         queued = sum(1 for r in rows if r.get("production_status") == "en_cola")
         printed = sum(1 for r in rows if r.get("production_status") == "impresa")
         errors = sum(1 for r in rows if int(r.get("error_count") or 0) > 0)
-        if not total:
-            self.production_summary.set("No hay planchas guardadas. Creá una plancha desde un pedido para que aparezca acá.")
-        else:
-            self.production_summary.set(
-                f"Total: {total} · Listas: {lists} · En cola: {queued} · "
-                f"Impresas: {printed}" + (f" · Con errores: {errors}" if errors else "")
-            )
+        if hasattr(self, "_production_summary_vars"):
+            self._production_summary_vars["total"].set(f"{total} plancha{'s' if total != 1 else ''}")
+            self._production_summary_vars["ready"].set(f"{lists} lista{'s' if lists != 1 else ''}")
+            self._production_summary_vars["queue"].set(f"{queued} en cola")
+            self._production_summary_vars["alerts"].set(f"{errors} alerta{'s' if errors != 1 else ''}")
+        # Cargar miniaturas en lotes diferidos para no bloquear la UI
+        if previews_to_load:
+            self._production_previews_pending = previews_to_load
+            self._production_loading_batch_after = self.after_idle(self._load_production_previews_batch)
+
+    def _load_production_previews_batch(self):
+        """Carga 3 miniaturas por lote, programando el siguiente lote con un delay."""
+        self._production_loading_batch_after = None
+        pending = getattr(self, "_production_previews_pending", None)
+        if not pending:
+            return
+        if not self.winfo_exists():
+            return
+        batch_size = 3
+        batch = pending[:batch_size]
+        self._production_previews_pending = pending[batch_size:]
+        for iid, path, plancha_id in batch:
+            if not self.winfo_exists():
+                return
+            if not self.production_tree.exists(iid):
+                continue
+            self._load_production_preview(iid, path, plancha_id)
+        if self._production_previews_pending and self.winfo_exists():
+            self._production_loading_batch_after = self.after(8, self._load_production_previews_batch)
 
     def _load_production_preview(self, iid: str, path: str, plancha_id: int):
-        """Carga un mini thumbnail para la columna de preview de forma segura."""
+        """Carga un mini thumbnail para la columna de preview con caché."""
         try:
             from PIL import Image, ImageTk
+            # Clave de caché: ruta + tamaño de archivo + tamaño de thumbnail
+            try:
+                path_obj = Path(path)
+                mtime_ns = path_obj.stat().st_mtime_ns
+                size = path_obj.stat().st_size
+            except OSError:
+                return
+            # Clave de caché mejorada: ruta + mtime_ns + tamaño + tamaño de thumbnail
+            cache_key = f"{path}|{mtime_ns}|{size}|56x52"
+            
+            # Logging antes de cargar
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info("UI_PREVIEW_PATH=%s", path_obj.resolve())
+            logger.info("UI_PREVIEW_EXISTS=%s", path_obj.exists())
+            logger.info("UI_PREVIEW_MTIME_NS=%s", mtime_ns)
+            logger.info("UI_PREVIEW_SIZE=%s", size)
+            
+            cached = self._production_thumb_cache.get(cache_key)
+            if cached is not None:
+                logger.info("UI_PREVIEW_CACHE_HIT=%s", cache_key[:50])
+                self._production_preview_cache[plancha_id] = cached
+                self.production_tree.set(iid, "preview", "✓")
+                existing_tags = self.production_tree.item(iid, "tags")
+                self.production_tree.item(iid, tags=tuple(existing_tags) + (f"preview:{plancha_id}",))
+                return
             with Image.open(path) as img:
                 img = img.convert("RGBA")
                 thumb = img.copy()
                 thumb.thumbnail((56, 52), Image.Resampling.LANCZOS)
                 photo = ImageTk.PhotoImage(thumb)
-                self._production_preview_cache[plancha_id] = photo
-                self.production_tree.set(iid, "preview", "✓")
-                # Usar tag para mostrar el ítem como referencia visual
-                self.production_tree.item(iid, tags=(f"preview:{plancha_id}",))
-        except Exception:
-            pass
+            self._production_thumb_cache[cache_key] = photo
+            self._production_preview_cache[plancha_id] = photo
+            self.production_tree.set(iid, "preview", "✓")
+            existing_tags = self.production_tree.item(iid, "tags")
+            self.production_tree.item(iid, tags=tuple(existing_tags) + (f"preview:{plancha_id}",))
+            logger.info("UI_PREVIEW_LOADED=%s", path_obj.resolve())
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.exception("UI_PREVIEW_ERROR: path=%s", path)
 
     def _selected_production_plancha(self) -> dict | None:
         """Devuelve el dict de plancha seleccionado en la tabla de Producción."""
@@ -7261,7 +14214,40 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         iid = self.production_tree.identify_row(event.y)
         if iid:
             self.production_tree.selection_set(iid)
+            if iid.startswith("group:"):
+                group_menu = tk.Menu(self.production_tree, tearoff=0)
+                group_menu.add_command(
+                    label="Eliminar conjunto de planchas",
+                    command=lambda group=iid: self._production_delete_plancha_group(group),
+                )
+                group_menu.post(event.x_root, event.y_root)
+                return
             self._production_menu.post(event.x_root, event.y_root)
+
+    def _production_delete_plancha_group(self, group_iid: str):
+        """Elimina todos los registros del conjunto elegido desde su fila padre."""
+        set_id = group_iid.removeprefix("group:")
+        rows = [
+            row for row in self.database.production_planchas()
+            if (row.get("plancha_set_id") or "").strip() == set_id
+        ]
+        if not rows:
+            return
+        if not messagebox.askyesno(
+            "Eliminar conjunto de planchas",
+            f"¿Eliminar las {len(rows)} planchas de este conjunto?\n\n"
+            "Se quitarán de Producción. Los archivos originales no se modificarán.",
+            icon="warning", parent=self,
+        ):
+            return
+        try:
+            for row in rows:
+                self.database.delete_plancha_project(int(row["id"]))
+        except RuntimeError as error:
+            messagebox.showerror("Eliminar conjunto de planchas", str(error), parent=self)
+            return
+        self.status.set(f"Conjunto eliminado: {len(rows)} plancha(s).")
+        self.queue_production_refresh(delay=0)
 
     def _on_production_double_click(self, _event):
         self._production_open_editor()
@@ -7272,6 +14258,288 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             return
         self._open_plancha_editor(int(plancha["id"]))
 
+    def _production_link_to_order(self):
+        """Asocia una plancha guardada al pedido indicado por el operador."""
+        plancha = self._selected_production_plancha()
+        if not plancha:
+            return
+        self._production_link_to_order_picker(plancha)
+        return
+        current = plancha.get("order_id")
+        order_id = simpledialog.askinteger(
+            "Enlazar a pedido",
+            "Número de pedido a vincular:",
+            initialvalue=int(current) if current else None,
+            minvalue=1,
+            parent=self,
+        )
+        if order_id is None:
+            return
+        try:
+            self.database.link_plancha_to_order(int(plancha["id"]), order_id)
+        except ValueError as error:
+            messagebox.showerror("Enlazar a pedido", str(error), parent=self)
+            return
+        self.status.set(f"Plancha enlazada al pedido #{order_id}.")
+        self.queue_production_refresh(delay=0)
+
+    def _production_link_to_order_picker(self, plancha: dict):
+        """Muestra fichas de pedido en vez de solicitar un número manual."""
+        orders = self.database.orders()
+        if not orders:
+            messagebox.showinfo("Enlazar a pedido", "No hay fichas de pedido disponibles.", parent=self)
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title("Enlazar plancha a pedido")
+        dialog.configure(background=COLORS.panel)
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.geometry("700x390")
+        tk.Label(dialog, text="Elegí la ficha del pedido", background=COLORS.panel,
+                 foreground=COLORS.text, font=(IDENTITY_FONT, 14, "bold")).pack(anchor="w", padx=16, pady=(16, 10))
+        holder = tk.Frame(dialog, background=COLORS.panel)
+        holder.pack(fill="both", expand=True, padx=16)
+        tree = ttk.Treeview(holder, columns=("client", "status", "material", "designs"), show="headings", selectmode="browse")
+        for key, label, width in (("client", "Cliente", 250), ("status", "Estado", 150), ("material", "Material", 130), ("designs", "Diseños", 75)):
+            tree.heading(key, text=label)
+            tree.column(key, width=width, anchor="center" if key == "designs" else "w")
+        scroll = ttk.Scrollbar(holder, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        for order in orders:
+            tree.insert("", "end", iid=str(order["id"]), values=(
+                order.get("client_name") or order.get("client") or "Sin cliente",
+                order.get("status") or "-", order.get("material") or "-", order.get("design_count") or 0,
+            ))
+
+        def accept(_event=None):
+            chosen = tree.selection()
+            if not chosen:
+                messagebox.showinfo("Enlazar a pedido", "Elegí una ficha de pedido.", parent=dialog)
+                return
+            order_id = int(chosen[0])
+            try:
+                self.database.link_plancha_to_order(int(plancha["id"]), order_id)
+            except ValueError as error:
+                messagebox.showerror("Enlazar a pedido", str(error), parent=dialog)
+                return
+            dialog.grab_release()
+            dialog.destroy()
+            self.status.set(f"Plancha enlazada al pedido #{order_id}.")
+            self.queue_production_refresh(delay=0)
+
+        actions = tk.Frame(dialog, background=COLORS.panel)
+        actions.pack(fill="x", padx=16, pady=14)
+        ttk.Button(actions, text="Cancelar", command=lambda: (dialog.grab_release(), dialog.destroy())).pack(side="right")
+        ttk.Button(actions, text="Enlazar plancha", command=accept, style="Primary.TButton").pack(side="right", padx=(0, 8))
+        tree.bind("<Double-1>", accept)
+
+    def _production_delete_plancha(self):
+        """Elimina la plancha seleccionada después de una confirmación explícita."""
+        plancha = self._selected_production_plancha()
+        if not plancha:
+            return
+
+        name = plancha.get("name") or f"Plancha #{plancha['id']}"
+        if not messagebox.askyesno(
+            "Eliminar plancha",
+            f"¿Eliminar «{name}» de Producción?\n\n"
+            "También se eliminará su historial y cola de impresión. "
+            "Los archivos PNG y del proyecto no se borrarán del disco.",
+            parent=self,
+        ):
+            return
+
+        try:
+            deleted = self.database.delete_plancha_project(int(plancha["id"]))
+        except RuntimeError as error:
+            messagebox.showerror("Eliminar plancha", str(error), parent=self)
+            return
+
+        if deleted:
+            self.status.set(f"Plancha «{name}» eliminada de Producción.")
+            self.queue_production_refresh(delay=0)
+
+    def _production_import_png(self):
+        """Importa una plancha PNG directamente a producción.
+        
+        Esta funcionalidad permite:
+        - Importar planchas creadas en otros sistemas
+        - Re-importar planchas previamente exportadas
+        - Trabajar con planchas de diseñadores externos
+        """
+        path = filedialog.askopenfilename(
+            title="Importar plancha PNG",
+            filetypes=[("Imágenes PNG", "*.png"), ("Todas las imágenes", "*.png *.jpg *.jpeg")],
+            parent=self
+        )
+        if not path:
+            return
+        
+        try:
+            from PIL import Image
+            import shutil
+            import time
+            
+            # Validar que sea una imagen válida
+            with Image.open(path) as img:
+                width_px, height_px = img.size
+                # Convertir a cm usando 300 DPI (estándar de impresión)
+                width_cm = width_px / 300 * 2.54
+                height_cm = height_px / 300 * 2.54
+                
+                # Validar dimensiones aproximadas de A4 (con tolerancia)
+                is_a4_width = 20 <= width_cm <= 22
+                is_a4_height = 28 <= height_cm <= 31
+                
+                if not (is_a4_width and is_a4_height):
+                    if not messagebox.askyesno(
+                        "Dimensiones no estándar",
+                        f"La imagen tiene dimensiones {width_cm:.1f} × {height_cm:.1f} cm.\n\n"
+                        f"Se esperaba aproximadamente 21 × 29.7 cm (A4).\n\n"
+                        "¿Continuar de todos modos?",
+                        parent=self
+                    ):
+                        return
+            
+            # Preguntar si vincular a un pedido
+            link_to_order = messagebox.askyesnocancel(
+                "Vincular a pedido",
+                "¿Querés vincular esta plancha a un pedido existente?\n\n"
+                "Sí = Elegir pedido\n"
+                "No = Plancha sin pedido\n"
+                "Cancelar = No importar",
+                parent=self
+            )
+            
+            if link_to_order is None:  # Cancelar
+                return
+            
+            order_id = None
+            material = ""
+            
+            if link_to_order:  # Vincular a pedido
+                orders = self.database.orders()
+                if not orders:
+                    messagebox.showinfo("Sin pedidos", "No hay pedidos disponibles para vincular.", parent=self)
+                    return
+                
+                # Mostrar diálogo de selección de pedido
+                dialog = tk.Toplevel(self)
+                dialog.title("Seleccionar pedido")
+                dialog.configure(background=COLORS.panel)
+                dialog.transient(self)
+                dialog.grab_set()
+                dialog.geometry("700x390")
+                
+                tk.Label(dialog, text="Elegí el pedido para vincular la plancha", background=COLORS.panel,
+                         foreground=COLORS.text, font=(IDENTITY_FONT, 14, "bold")).pack(anchor="w", padx=16, pady=(16, 10))
+                
+                holder = tk.Frame(dialog, background=COLORS.panel)
+                holder.pack(fill="both", expand=True, padx=16)
+                
+                tree = ttk.Treeview(holder, columns=("client", "status", "material", "designs"), show="headings", selectmode="browse")
+                for key, label, width in (("client", "Cliente", 250), ("status", "Estado", 150), ("material", "Material", 130), ("designs", "Diseños", 75)):
+                    tree.heading(key, text=label)
+                    tree.column(key, width=width, anchor="center" if key == "designs" else "w")
+                
+                scroll = ttk.Scrollbar(holder, orient="vertical", command=tree.yview)
+                tree.configure(yscrollcommand=scroll.set)
+                tree.pack(side="left", fill="both", expand=True)
+                scroll.pack(side="right", fill="y")
+                
+                for order in orders:
+                    tree.insert("", "end", iid=str(order["id"]), values=(
+                        order.get("client_name") or order.get("client") or "Sin cliente",
+                        order.get("status") or "-", order.get("material") or "-", order.get("design_count") or 0,
+                    ))
+                
+                selected_order = {"value": None}
+                
+                def accept(_event=None):
+                    chosen = tree.selection()
+                    if not chosen:
+                        messagebox.showinfo("Seleccionar pedido", "Elegí un pedido de la lista.", parent=dialog)
+                        return
+                    selected_order["value"] = int(chosen[0])
+                    dialog.grab_release()
+                    dialog.destroy()
+                
+                actions = tk.Frame(dialog, background=COLORS.panel)
+                actions.pack(fill="x", padx=16, pady=14)
+                ttk.Button(actions, text="Cancelar", command=lambda: (dialog.grab_release(), dialog.destroy())).pack(side="right")
+                ttk.Button(actions, text="Seleccionar", command=accept, style="Primary.TButton").pack(side="right", padx=(0, 8))
+                tree.bind("<Double-1>", accept)
+                
+                dialog.wait_window()
+                
+                if selected_order["value"] is None:
+                    return
+                
+                order_id = selected_order["value"]
+                order = self.database.order(order_id)
+                material = (order or {}).get("material", "")
+            
+            # Copiar el archivo al directorio de planchas finales
+            root = Path(__file__).resolve().parents[2]
+            folder = root / "outputs" / "planchas_finales"
+            if order_id:
+                folder = root / "outputs" / "pedidos" / f"pedido_{order_id}" / "planchas_finales"
+            folder.mkdir(parents=True, exist_ok=True)
+            
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            source_filename = Path(path).stem
+            output = folder / f"plancha_importada_{source_filename}_{stamp}.png"
+            
+            # Copiar archivo
+            shutil.copy2(path, output)
+            
+            # Registrar en la base de datos
+            saved_at = time.strftime("%H:%M")
+            source_name = f"Pedido #{order_id}" if order_id else "Plancha importada"
+            
+            # Crear un proyecto vacío para representar la plancha importada
+            from app.planchas.model import PlanchaProject
+            empty_project = PlanchaProject([], workspace_format="a4")
+            
+            plancha_id = self.database.save_plancha_project(
+                order_id,
+                f"{source_name} · {Path(output).stem} · {saved_at}",
+                material,
+                json.dumps(empty_project.to_dict(), ensure_ascii=False),
+                "",  # No hay project_path porque fue importado
+                None,
+                "",  # person_name
+                "",  # person_phone
+                "a4",
+            )
+            
+            if plancha_id:
+                self.database.set_plancha_final_png(plancha_id, str(output))
+                self.database.update_plancha_production_status(plancha_id, "lista")
+                username = os.environ.get("USERNAME", "")
+                if username:
+                    self.database.set_plancha_usuario(plancha_id, username)
+            
+            self.status.set(f"Plancha PNG importada: {Path(output).name}")
+            self.queue_production_refresh(delay=0)
+            
+            messagebox.showinfo(
+                "Plancha importada",
+                f"La plancha PNG se importó exitosamente y está lista para producción.\n\n"
+                f"Ubicación: {output}\n\n"
+                f"Ya podés enviarla a la cola de impresión.",
+                parent=self
+            )
+            
+        except Exception as error:
+            messagebox.showerror(
+                "Error al importar",
+                f"No se pudo importar la plancha PNG:\n{error}",
+                parent=self
+            )
+
     def _open_plancha_editor(self, plancha_id: int):
         """Abre el editor de plancha existente por su ID."""
         saved = self.database.plancha_project(plancha_id)
@@ -7279,13 +14547,31 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             messagebox.showinfo("Producción", "No se encontró la plancha.", parent=self)
             return
         project_path = saved.get("project_path") or ""
-        if not project_path or not Path(project_path).exists():
-            messagebox.showinfo("Producción", "No se encontró el archivo del proyecto de plancha.", parent=self)
-            return
         try:
+            import json
+            if project_path and Path(project_path).exists():
+                with Path(project_path).open("r", encoding="utf-8") as source:
+                    project_data = json.load(source)
+            else:
+                project_data = json.loads(saved.get("project_json") or "{}")
+                if not project_data.get("items"):
+                    messagebox.showinfo("Producción", "No se encontró el proyecto de plancha.", parent=self)
+                    return
+            if project_data.get("mode") == "Plantilla regular":
+                from app.planchas.template_editor import RegularTemplateEditor
+                from app.planchas.template_model import RegularTemplateProject
+                editor = RegularTemplateEditor(
+                    self, project=RegularTemplateProject.load(project_path),
+                    database=self.database, library_images=self.database.search(limit=10000),
+                    order_id=saved.get("order_id"), plancha_id=plancha_id,
+                )
+                editor.project_path = project_path
+                editor.final_png_path = saved.get("final_png_path") or ""
+                editor.bind("<Destroy>", lambda e: self.after_idle(self.queue_production_refresh) if e.widget == editor else None)
+                return
             from app.planchas.model import PlanchaProject
             from app.planchas.editor import PlanchaEditor
-            project = PlanchaProject.load(project_path)
+            project = PlanchaProject.load(project_path) if project_path and Path(project_path).exists() else PlanchaProject.from_dict(project_data)
             order_id = saved.get("order_id")
             images = []
             if order_id:
@@ -7298,30 +14584,61 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                         img = path_to_image[item.path].copy()
                         design = path_map.get(item.path, {})
                         img["order_quantity"] = int(design.get("quantity", 1) or 1)
-                        img["order_size_cm"] = float(design.get("size_cm", 5.9) or 5.9)
+                        img["order_size_cm"] = float(design.get("size_cm", 5.0) or 5.0)
                         images.append(img)
             if not images:
                 images = self.database.search(limit=10000)
-            editor = PlanchaEditor(
-                self, images, database=self.database, library_images=self.database.search(limit=10000),
+            editor = self.open_embedded_plancha(
+                images, database=self.database, library_images=self.database.search(limit=10000),
                 project=project, order_id=order_id, plancha_id=plancha_id, preserve_layout=True,
             )
             # Refrescar Producción al cerrar el editor (guardado/imprimir/etc.)
-            editor.bind("<Destroy>", lambda e: self.after_idle(self.refresh_production) if e.widget == editor else None)
+            editor.bind("<Destroy>", lambda e: self.after_idle(self.queue_production_refresh) if e.widget == editor else None)
         except Exception as error:
             messagebox.showerror("No se pudo abrir", str(error), parent=self)
 
     def _production_send_to_print(self):
+        """Envía la plancha seleccionada a la cola sin reabrir el editor."""
         plancha = self._selected_production_plancha()
         if not plancha:
+            messagebox.showinfo("Impresión", "Elegí una plancha de la lista primero.", parent=self)
             return
         plancha_id = int(plancha["id"])
         final_png = plancha.get("final_png_path") or ""
         if not final_png or not Path(final_png).exists():
             messagebox.showinfo("Impresión", "Esta plancha no tiene PNG final. Exportala desde el editor primero.", parent=self)
             return
-        # Abrir el editor directamente en modo impresión
-        self._open_plancha_editor(plancha_id)
+        active = self.database.latest_print_job(
+            plancha_id, ("Pendiente", "Enviando a impresora", "En cola")
+        )
+        if active:
+            messagebox.showinfo(
+                "Impresión",
+                "Esta plancha ya está en la cola. Abrí la cola de impresión para seguir su estado.",
+                parent=self,
+            )
+            return
+        config = self.database.printing_config()
+        printer = (config.get("printer_name") or "").strip()
+        manual_print = not printer
+        self.database.create_print_job(
+            plancha_id,
+            os.environ.get("USERNAME", "Operario"),
+            printer or "Impresión manual",
+            config,
+            max(1, int(config.get("copies", 1) or 1)),
+            final_png,
+        )
+        self.status.set(f"Plancha #{plancha_id} agregada a la cola de impresión.")
+        self.queue_production_refresh(delay=0)
+        if manual_print:
+            messagebox.showinfo(
+                "Lista para impresión manual",
+                "La plancha ya quedó registrada en la cola con su PNG final listo.\n\n"
+                "Abrí «Cola de impresión» y usá «Abrir PNG» para enviarlo manualmente "
+                "desde el diálogo o software de tu impresora.",
+                parent=self,
+            )
 
     def _production_view_png(self):
         plancha = self._selected_production_plancha()
@@ -7334,22 +14651,84 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         os.startfile(str(path))
 
     def _production_reprint(self):
+        """Crea una reimpresión con la misma configuración del último job."""
         plancha = self._selected_production_plancha()
         if not plancha:
+            messagebox.showinfo("Reimprimir", "Elegí una plancha de la lista primero.", parent=self)
             return
-        self._open_plancha_editor(int(plancha["id"]))
+        plancha_id = int(plancha["id"])
+        previous = self.database.latest_print_job(
+            plancha_id, ("Impresa", "En cola", "Error de impresión", "Cancelada")
+        )
+        if not previous:
+            messagebox.showinfo("Reimprimir", "No hay una impresión anterior para esta plancha.", parent=self)
+            return
+        final_png = Path(previous.get("final_png_path") or "")
+        if not final_png.exists():
+            messagebox.showerror("Reimprimir", "No se encontró el PNG de la impresión anterior.", parent=self)
+            return
+        try:
+            config = json.loads(previous.get("configuration_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            config = self.database.printing_config()
+        self.database.create_print_job(
+            plancha_id,
+            os.environ.get("USERNAME", "Operario"),
+            previous.get("printer_name") or self.database.printing_config().get("printer_name", ""),
+            config,
+            max(1, int(previous.get("copies") or 1)),
+            str(final_png),
+            parent_job_id=int(previous["id"]),
+        )
+        self.status.set(f"Reimpresión de plancha #{plancha_id} agregada a la cola.")
+        self.queue_production_refresh(delay=0)
 
     def _production_add_to_continuous(self):
         plancha = self._selected_production_plancha()
         if not plancha:
             return
         plancha_id = int(plancha["id"])
+        if (plancha.get("production_status") or "") == "usada_en_continua":
+            if not messagebox.askyesno(
+                "Liberar plancha de tira pendiente",
+                "Esta plancha figura reservada en una tira pendiente. Se la quitará de esa tira "
+                "para poder confirmarla nuevamente.\n\n¿Continuar?",
+                icon="warning", parent=self,
+            ):
+                return
+            self.database.release_plancha_from_continuous(plancha_id)
+        format_key = (plancha.get("workspace_format") or "a4").lower()
+        if format_key != "a4":
+            format_label = {"franja": "Franja", "a5": "A5"}.get(format_key, format_key.upper())
+            if not messagebox.askyesno(
+                "Confirmar plancha incompleta",
+                f"Vas a enviar «{format_label}» a impresión sin completar una hoja A4.\n\n"
+                "Esto puede desperdiciar material. ¿Querés confirmarla de todas formas?",
+                icon="warning", parent=self,
+            ):
+                return
         final_png = plancha.get("final_png_path") or ""
         if not final_png or not Path(final_png).exists():
             messagebox.showinfo("Producción continua", "La plancha necesita un PNG final para agregarse a una tira.", parent=self)
             return
-        from app.planchas.continuous_editor import ContinuousProductionEditor
-        ContinuousProductionEditor(self, self.database, initial_plancha_id=plancha_id)
+        self.database.confirm_plancha_for_continuous(plancha_id)
+        self.status.set(f"Plancha #{plancha_id} confirmada y lista para impresión.")
+        self.queue_production_refresh(delay=0)
+
+    @staticmethod
+    def _is_photo_print_plancha(plancha: dict) -> bool:
+        """Identifica planchas de papel fotográfico sin depender de un nombre exacto."""
+        import unicodedata
+
+        values = (
+            plancha.get("material"),
+            plancha.get("order_material"),
+            plancha.get("name"),
+        )
+        text = " ".join(str(value or "") for value in values).lower()
+        text = "".join(char for char in unicodedata.normalize("NFD", text)
+                       if unicodedata.category(char) != "Mn")
+        return "fotograf" in text or "papel foto" in text
 
     # --- Ficha de detalle de producción ---
 
@@ -7364,6 +14743,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         sep.pack(fill="x", pady=(0, 4))
         inner = tk.Frame(outer, background=COLORS.panel)
         inner.pack(fill="x")
+        inner._section_outer = outer
         return inner
 
     def _on_production_select(self, _event=None):
@@ -7448,6 +14828,26 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         # --- Preview impresión ---
         preview_path = plancha.get("final_png_path") or plancha.get("preview_path") or ""
         self._update_production_detail_preview(path=preview_path if preview_path and Path(preview_path).exists() else "")
+        # Enable zoom and button when plancha is selected
+        if hasattr(self, "_prod_preview_zoom_slider"):
+            self._prod_preview_zoom_slider.configure(state="normal")
+        if hasattr(self, "_prod_preview_open_btn"):
+            self._prod_preview_open_btn.configure(state="normal")
+        
+        # Update history summary
+        if hasattr(self, "_prod_detail_history_label"):
+            if status_raw == "impresa":
+                self._prod_detail_history_label.config(
+                    text="Impresa correctamente.", foreground=COLORS.success,
+                )
+            elif status_raw == "en_cola" or total_jobs:
+                self._prod_detail_history_label.config(
+                    text="Enviada a impresión · esperando confirmación.", foreground=COLORS.info,
+                )
+            else:
+                self._prod_detail_history_label.config(
+                    text="Todavía no se envió a impresión.", foreground=COLORS.muted,
+                )
 
         # --- Preview cliente ---
         client_cfg = self.database.client_preview_config(pid)
@@ -7478,16 +14878,22 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         self._production_action_btns["open_editor"].configure(state="normal")
         self._production_action_btns["send_print"].configure(state="normal" if has_final_png and status_raw not in {"en_cola", "usada_en_continua"} else "disabled")
         self._production_action_btns["reprint"].configure(state="normal" if has_final_png and status_raw not in {"borrador", "guardada"} else "disabled")
-        self._production_action_btns["add_continuous"].configure(state="normal" if has_final_png and status_raw != "usada_en_continua" else "disabled")
+        self._production_action_btns["add_continuous"].configure(state="normal" if has_final_png else "disabled")
         self._production_action_btns["register_error"].configure(state="normal" if status_raw not in {"borrador"} else "disabled")
         self._production_action_btns["view_history"].configure(state="normal" if total_jobs > 0 else "disabled")
 
     def _clear_production_detail(self):
         """Limpiar la ficha cuando no hay selección."""
-        self._prod_detail_preview_label.config(image="", text="Seleccioná una plancha\npara ver sus datos",
+        # Show compact empty state
+        self._prod_detail_preview_label.config(image="", text="Seleccioná una plancha para ver la vista previa.",
                                                 foreground=COLORS.muted)
         self._prod_detail_preview_photo = None
         self._production_detail_current_preview_path = ""
+        # Disable zoom and button
+        if hasattr(self, "_prod_preview_zoom_slider"):
+            self._prod_preview_zoom_slider.configure(state="disabled")
+        if hasattr(self, "_prod_preview_open_btn"):
+            self._prod_preview_open_btn.configure(state="disabled")
         # Limpiar vista cliente
         self._client_preview_label.config(image="", text="Generá la vista\npara el cliente")
         self._client_preview_photo = None
@@ -7503,6 +14909,9 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         # Deshabilitar todos los botones de acción
         for btn in self._production_action_btns.values():
             btn.configure(state="disabled")
+        # Clear history
+        if hasattr(self, "_prod_detail_history_label"):
+            self._prod_detail_history_label.config(text="Seleccioná una plancha para ver su estado de impresión.")
 
     def _update_production_detail_preview(self, path: str = ""):
         """Actualizar la imagen de preview en la ficha con zoom variable."""
@@ -7510,13 +14919,31 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             path = getattr(self, "_production_detail_current_preview_path", "")
         self._production_detail_current_preview_path = path
         if not path:
-            self._prod_detail_preview_label.config(image="", text="Sin selección")
+            self._prod_detail_preview_label.config(image="", text="Seleccioná una plancha para ver la vista previa.")
             self._prod_detail_preview_photo = None
             return
         try:
             from PIL import Image, ImageTk
+            import logging
+            logger = logging.getLogger(__name__)
+            
+            path_obj = Path(path)
+            logger.info("UI_DETAIL_PREVIEW_PATH=%s", path_obj.resolve())
+            logger.info("UI_DETAIL_PREVIEW_EXISTS=%s", path_obj.exists())
+            if path_obj.exists():
+                logger.info("UI_DETAIL_PREVIEW_MTIME_NS=%s", path_obj.stat().st_mtime_ns)
+                logger.info("UI_DETAIL_PREVIEW_SIZE=%s", path_obj.stat().st_size)
+            
             with Image.open(path) as img:
-                img = img.convert("RGB")
+                # Conservar el canal alfa (RGBA) para planchas PNG con transparencia
+                # Si se convierte a RGB, las áreas transparentes se muestran con artefactos
+                if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                    # La imagen tiene transparencia, usar RGBA
+                    img = img.convert("RGBA")
+                else:
+                    # La imagen es opaca, se puede usar RGB
+                    img = img.convert("RGB")
+                
                 zoom = self._prod_detail_preview_zoom.get()
                 # A4 proporción: 210x297 → ancho fijo ~240px a zoom 1.0
                 base_w = 240
@@ -7526,8 +14953,12 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 photo = ImageTk.PhotoImage(img)
                 self._prod_detail_preview_photo = photo
                 self._prod_detail_preview_label.config(image=photo, text="")
-        except Exception:
-            self._prod_detail_preview_label.config(image="", text="Error al cargar")
+                logger.info("UI_DETAIL_PREVIEW_LOADED=%s", path_obj.resolve())
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.exception("UI_DETAIL_PREVIEW_ERROR: path=%s", path)
+            self._prod_detail_preview_label.config(image="", text="Error al cargar imagen")
 
     # --- Vista previa para cliente ---
 
@@ -7569,7 +15000,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             messagebox.showinfo("Vista cliente", "No se encontró el PNG final de la plancha.", parent=self)
             return
         try:
-            from PIL import Image, ImageTk, ImageOps
+            from PIL import Image, ImageDraw, ImageFont
         except ImportError:
             messagebox.showerror("Vista cliente", "Se requiere Pillow para generar la vista cliente.", parent=self)
             return
@@ -7579,26 +15010,33 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 fg = fg.convert("RGBA")
                 fg_w, fg_h = fg.size
                 # Crear fondo del mismo tamaño que el PNG
-                if bg_type == "custom":
-                    bg_path = self._client_bg_custom_path.get()
-                    if not bg_path or not Path(bg_path).exists():
-                        messagebox.showwarning("Vista cliente", "Elegí una imagen de fondo válida.", parent=self)
-                        return
-                    with Image.open(bg_path) as bg_img:
-                        bg_img = bg_img.convert("RGBA")
-                        bg_img = ImageOps.fit(bg_img, (fg_w, fg_h), Image.Resampling.LANCZOS)
-                        bg_img.paste(fg, (0, 0), fg)
-                        result = bg_img
-                else:
-                    color = self._CLIENT_BG_COLORS.get(bg_type, (255, 255, 255))
-                    result = Image.new("RGBA", (fg_w, fg_h), (*color, 255))
-                    result.paste(fg, (0, 0), fg)
+                asset = Path(__file__).parents[1] / "assets" / "fondo_doccione_bw.png"
+                with Image.open(asset) as bg_img:
+                    result = bg_img.convert("RGBA").resize((fg_w, fg_h), Image.Resampling.LANCZOS)
+                result.alpha_composite(fg)
+                overlay = Image.new("RGBA", (fg_w, fg_h), (0, 0, 0, 0))
+                draw = ImageDraw.Draw(overlay)
+                try:
+                    font = ImageFont.truetype("arialbd.ttf", max(28, fg_w // 44))
+                except OSError:
+                    font = ImageFont.load_default()
+                stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+                text = f"VISTA PREVIA · DOCCIONE · NO IMPRIMIBLE · {stamp}"
+                for y in range(max(45, fg_h // 24), fg_h, max(150, fg_h // 12)):
+                    draw.text((max(24, fg_w // 45), y), text, font=font,
+                              fill=(70, 70, 70, 132), stroke_width=2,
+                              stroke_fill=(255, 255, 255, 105))
+                result = Image.alpha_composite(result, overlay).convert("RGB")
                 # Guardar como archivo derivado (nunca tocar final_png_path)
                 output_dir = Path(final_png).parent
-                output_path = output_dir / f"client_preview_{pid}.png"
-                result.convert("RGB").save(str(output_path), "PNG")
-                self.database.save_client_preview(pid, str(output_path), bg_type,
-                                                  self._client_bg_custom_path.get() if bg_type == "custom" else "")
+                # La previsualización no necesita resolución de impresión.
+                preview_width = min(1400, result.width)
+                if preview_width < result.width:
+                    preview_height = round(result.height * preview_width / result.width)
+                    result = result.resize((preview_width, preview_height), Image.Resampling.LANCZOS)
+                output_path = output_dir / f"client_preview_{pid}.jpg"
+                result.save(str(output_path), "JPEG", quality=82, optimize=True)
+                self.database.save_client_preview(pid, str(output_path), "brand", "protected")
                 # Mostrar en el tab cliente
                 self._show_client_preview(str(output_path))
                 self.status.set(f"Vista cliente generada para plancha #{pid}")
@@ -7776,9 +15214,328 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             ))
         ttk.Button(content, text="Cerrar", command=win.destroy).pack(pady=(8, 0))
 
+    def _open_a4_optimizer(self):
+        """Propone hojas A4 completas y registra sus PNG compuestos."""
+        from app.planchas.a4_imposition import propose_a4_sheets, render_a4_sheet
+
+        # Una composición puede interrumpirse después de haber marcado sus
+        # fuentes como usadas. No las dejamos bloqueadas si no existe la A4
+        # que las contiene: se restauran para poder volver a optimizarlas.
+        rows = self.database.production_planchas()
+        composed_source_ids: set[int] = set()
+        for item in rows:
+            if (item.get("workspace_format") or "").lower() != "a4":
+                continue
+            try:
+                project = json.loads(item.get("project_json") or "{}")
+                composed_source_ids.update(
+                    int(source_id) for source_id in project.get("source_plancha_ids", [])
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+
+        recovered = [
+            item for item in rows
+            if item.get("production_status") == "usada_en_continua"
+            and int(item["id"]) not in composed_source_ids
+        ]
+        for item in recovered:
+            self.database.restore_plancha_status_after_continuous(int(item["id"]))
+        if recovered:
+            rows = self.database.production_planchas()
+
+        candidates = [
+            item for item in rows
+            if item.get("production_status") in {"guardada", "lista"} and item.get("final_png_path")
+        ]
+        sheets, pending = propose_a4_sheets(candidates)
+        dialog = tk.Toplevel(self)
+        dialog.title("Optimizar hojas A4")
+        dialog.configure(background=COLORS.background)
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.geometry("620x540")
+        tk.Label(dialog, text="HOJAS A4 PROPUESTAS", background=COLORS.background,
+                 foreground=COLORS.text, font=(IDENTITY_FONT, 16, "bold")).pack(anchor="w", padx=18, pady=(18, 4))
+        tk.Label(dialog, text="Las planchas originales no se modifican. Confirmá para crear las hojas A4 que luego irán a Impresión continua.",
+                 background=COLORS.background, foreground=COLORS.muted, wraplength=570, justify="left").pack(anchor="w", padx=18, pady=(0, 12))
+        tree = ttk.Treeview(dialog, columns=("sheet", "content"), show="headings", height=10)
+        tree.heading("sheet", text="Hoja")
+        tree.heading("content", text="Contenido")
+        tree.column("sheet", width=170, anchor="w")
+        tree.column("content", width=410, anchor="w")
+        for index, sheet in enumerate(sheets, start=1):
+            names = ", ".join(str(item.get("name") or f"#{item['id']}") for item in sheet.planchas)
+            tree.insert("", "end", iid=str(index - 1), values=(f"A4 #{index} · {sheet.label}", names))
+        tree.pack(fill="both", expand=True, padx=18, pady=(0, 8))
+        pending_label = "Sin pendientes." if not pending else f"Pendientes: {len(pending)} plancha(s) sin espacio completo todavía."
+        tk.Label(dialog, text=pending_label, background=COLORS.background, foreground=COLORS.muted).pack(anchor="w", padx=18)
+
+        def confirm():
+            if not sheets:
+                messagebox.showinfo("Optimizar hojas A4", "Todavía no hay grupos completos para acoplar.", parent=dialog)
+                return
+            root = Path(__file__).resolve().parents[2]
+            folder = root / "outputs" / "planchas_acopladas"
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            created = 0
+            for index, sheet in enumerate(sheets, start=1):
+                output = folder / f"a4_acoplada_{stamp}_{index:02d}.png"
+                render_a4_sheet(sheet, output)
+                project_path = output.with_suffix(".json")
+                project_path.write_text(json.dumps({
+                    "mode": "A4 compuesta", "workspace_format": "a4",
+                    "source_plancha_ids": [item["id"] for item in sheet.planchas],
+                }, ensure_ascii=False, indent=2), encoding="utf-8")
+                plancha_id = self.database.save_plancha_project(
+                    None, f"A4 acoplada {stamp} · {index}", "", project_path.read_text(encoding="utf-8"),
+                    str(project_path), workspace_format="a4",
+                )
+                self.database.set_plancha_final_png(plancha_id, str(output))
+                self.database.update_plancha_production_status(plancha_id, "lista")
+                for source in sheet.planchas:
+                    self.database.save_plancha_status_before_continuous(int(source["id"]))
+                    self.database.update_plancha_production_status(int(source["id"]), "usada_en_continua")
+                created += 1
+            dialog.destroy()
+            self.queue_production_refresh(delay=0)
+            messagebox.showinfo("Hojas A4 creadas", f"Se crearon {created} hoja(s) A4. Ya están listas para enviarse a Impresión continua.", parent=self)
+
+        actions = tk.Frame(dialog, background=COLORS.background)
+        actions.pack(fill="x", padx=18, pady=(10, 18))
+        ttk.Button(actions, text="Cancelar", command=dialog.destroy, style="Secondary.TButton").pack(side="right")
+        ttk.Button(actions, text="Confirmar hojas A4", command=confirm, style="Primary.TButton").pack(side="right", padx=(0, 8))
+        self.center_window(dialog)
+
+    def _open_pdf_print_quote(self):
+        """Open the fast PDF analyser and quote using the active price catalog."""
+        paths = filedialog.askopenfilenames(
+            parent=self, title="Elegir PDFs para cotizar",
+            filetypes=[("Documentos PDF", "*.pdf")],
+        )
+        if not paths:
+            return
+        paths = tuple(paths)
+        from app.services.pdf_print_analysis_service import PdfPrintAnalysisService
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Cotizador inteligente de PDF")
+        dialog.configure(background=COLORS.background)
+        dialog.transient(self)
+        dialog.geometry("720x650")
+        tk.Label(dialog, text="COTIZADOR INTELIGENTE DE PDF", background=COLORS.background,
+                 foreground=COLORS.wine_active, font=(IDENTITY_FONT, 15, "bold")).pack(anchor="w", padx=18, pady=(18, 3))
+        file_summary = Path(paths[0]).name if len(paths) == 1 else f"{len(paths)} archivos PDF seleccionados"
+        tk.Label(dialog, text=file_summary, background=COLORS.background, foreground=COLORS.muted,
+                 font=(UI_FONT, 10)).pack(anchor="w", padx=18)
+
+        controls = tk.Frame(dialog, background=COLORS.background)
+        controls.pack(fill="x", padx=18, pady=14)
+        tk.Label(controls, text="Copias", background=COLORS.background, foreground=COLORS.text).pack(side="left")
+        copies_var = tk.StringVar(value="1")
+        ttk.Spinbox(controls, from_=1, to=9999, width=7, textvariable=copies_var).pack(side="left", padx=(7, 20))
+        duplex_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(controls, text="Impresión doble faz", variable=duplex_var).pack(side="left")
+        recalculate_button = ttk.Button(
+            controls,
+            text="Recalcular",
+            style="Secondary.TButton",
+            state="disabled",
+        )
+        recalculate_button.pack(side="right")
+        status_var = tk.StringVar(value="Analizando color por página…")
+        tk.Label(dialog, textvariable=status_var, background=COLORS.background, foreground=COLORS.muted,
+                 font=(UI_FONT, 10)).pack(anchor="w", padx=18, pady=(0, 8))
+        result_frame = tk.Frame(dialog, background=COLORS.panel, highlightthickness=1, highlightbackground=COLORS.border)
+        result_frame.pack(fill="both", expand=True, padx=18, pady=(0, 12))
+
+        def show_quote(pages_by_document):
+            pages = tuple(page for _path, document_pages in pages_by_document for page in document_pages)
+            try:
+                copies = max(1, int(copies_var.get()))
+            except ValueError:
+                copies = 1
+                copies_var.set("1")
+            pricing = FotocopiaPricingService(self.database.connection)
+            codes = ("fotocopia_bn_simple", "fotocopia_bn_doble", "fotocopia_color_simple", "fotocopia_color_doble")
+            prices = {code: pricing._get_unit_price(code) for code in codes}
+            quote = PdfPrintAnalysisService().quote_documents(
+                (document_pages for _path, document_pages in pages_by_document),
+                copies=copies, duplex=duplex_var.get(), unit_prices=prices,
+            )
+            for child in result_frame.winfo_children():
+                child.destroy()
+            color_pages = quote.color_pages
+            tk.Label(result_frame, text=f"{len(paths)} archivo(s) · {len(pages)} páginas · {color_pages} con color · {len(pages) - color_pages} B/N",
+                     background=COLORS.panel, foreground=COLORS.text, font=(UI_FONT, 11, "bold")).pack(anchor="w", padx=14, pady=(12, 4))
+            labels = {
+                "hoja_simple": "Hoja en blanco",
+                "fotocopia_bn_simple": "B/N simple", "fotocopia_bn_doble": "B/N doble faz",
+                "fotocopia_color_simple": "Color simple", "fotocopia_color_doble": "Color doble faz",
+            }
+            detail = " · ".join(f"{quantity} {labels[code]}" for code, quantity in quote.quantities.items()) or "Sin hojas"
+            tk.Label(result_frame, text=detail, background=COLORS.panel, foreground=COLORS.muted,
+                     wraplength=650, justify="left").pack(anchor="w", padx=14)
+            tk.Label(result_frame, text=f"TOTAL ESTIMADO: ${quote.total:,.2f}", background=COLORS.panel,
+                     foreground=COLORS.wine_active, font=(IDENTITY_FONT, 16, "bold")).pack(anchor="w", padx=14, pady=(10, 8))
+
+            def open_customer_message():
+                mode = "doble faz" if quote.duplex else "simple faz"
+                customer_detail = ", ".join(
+                    f"{quantity} {labels[code].lower()}" for code, quantity in quote.quantities.items()
+                ) or "sin hojas"
+                message = (
+                    f"Hola, te compartimos el presupuesto de impresión de {file_summary}.\n\n"
+                    f"• Cantidad: {quote.copies} copia(s)\n"
+                    f"• Modalidad: impresión {mode}\n"
+                    f"• Documentos: {len(paths)} archivo(s), {len(quote.pages)} página(s)\n"
+                    f"• Detalle: {customer_detail}\n\n"
+                    f"Total estimado: ${quote.total:,.2f}\n\n"
+                    "El importe se calculó según la cobertura de tinta y color de cada página. "
+                    "Si querés avanzar o tenés alguna consulta, estamos a disposición."
+                )
+                modal = tk.Toplevel(dialog)
+                modal.title("Mensaje para el cliente")
+                modal.configure(background=COLORS.background)
+                modal.transient(dialog)
+                modal.geometry("610x410")
+                tk.Label(modal, text="PRESUPUESTO PARA ENVIAR", background=COLORS.background,
+                         foreground=COLORS.wine_active, font=(IDENTITY_FONT, 14, "bold")).pack(anchor="w", padx=18, pady=(18, 8))
+                text = tk.Text(modal, height=13, wrap="word", font=(UI_FONT, 10), background=COLORS.panel,
+                               foreground=COLORS.text, insertbackground=COLORS.text, relief="flat")
+                text.insert("1.0", message)
+                text.configure(state="disabled")
+                text.pack(fill="both", expand=True, padx=18, pady=(0, 12))
+
+                def copy_message():
+                    modal.clipboard_clear()
+                    modal.clipboard_append(message)
+                    modal.update()
+                    self.status.set("Presupuesto para el cliente copiado al portapapeles.")
+                    messagebox.showinfo("Presupuesto copiado", "El mensaje está listo para pegar y enviar al cliente.", parent=modal)
+
+                actions = tk.Frame(modal, background=COLORS.background)
+                actions.pack(fill="x", padx=18, pady=(0, 18))
+                ttk.Button(actions, text="Cerrar", command=modal.destroy, style="Secondary.TButton").pack(side="right")
+                ttk.Button(actions, text="Copiar mensaje", command=copy_message, style="Primary.TButton").pack(side="right", padx=(0, 8))
+                self.center_window(modal)
+
+            ttk.Button(result_frame, text="Generar mensaje para cliente", command=open_customer_message,
+                       style="Secondary.TButton").pack(anchor="e", padx=14, pady=(0, 8))
+            tree = ttk.Treeview(result_frame, columns=("file", "page", "type", "coverage", "ink"), show="headings", height=11)
+            for key, title, width in (("file", "Archivo", 180), ("page", "Página", 70), ("type", "Detección", 150), ("coverage", "Color", 120), ("ink", "Tinta total", 120)):
+                tree.heading(key, text=title); tree.column(key, width=width, anchor="center")
+            for document_path, document_pages in pages_by_document:
+                for page in document_pages:
+                    kind = "Color" if page.is_color else ("Hoja" if page.ink_coverage_percent == 0 else "B/N")
+                    tree.insert("", "end", values=(Path(document_path).name, page.page_number, kind, f"{page.color_coverage_percent:.1f}%", f"{page.ink_coverage_percent:.1f}%"))
+            tree.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+            status_var.set("Presupuesto calculado con los precios vigentes. Podés cambiar copias o doble faz.")
+            recalculate_button.configure(
+                command=lambda: show_quote(pages_by_document),
+                state="normal",
+            )
+
+        def analyze_in_background():
+            try:
+                analyzer = PdfPrintAnalysisService()
+                pages_by_document = tuple((path, analyzer.analyze(path)) for path in paths)
+            except Exception as error:
+                detail = str(error).strip() or error.__class__.__name__
+                message = f"No se pudo analizar uno de los PDFs: {detail}"
+                self.after(0, lambda: (status_var.set(message), messagebox.showerror("Cotizar PDF", message, parent=dialog)))
+                return
+            self.after(0, lambda: show_quote(pages_by_document))
+
+        threading.Thread(target=analyze_in_background, daemon=True).start()
+
     def _open_continuous_from_production(self):
         from app.planchas.continuous_editor import ContinuousProductionEditor
-        ContinuousProductionEditor(self, self.database)
+        host = getattr(self, "_continuous_production_tab", self)
+        editor = getattr(self, "continuous_production_editor", None)
+        if editor and editor.winfo_exists():
+            self._ensure_production_module()
+            self.tabs.select(self.production_tab)
+            self.production_notebook.select(host)
+            editor.focus_set()
+            return editor
+
+        editor = ContinuousProductionEditor(
+            host, self.database, open_print_queue=self.open_print_queue_window,
+            on_close=lambda: self.production_notebook.select(self.production_planchas_tab),
+        )
+        editor.pack(fill="both", expand=True)
+        self.continuous_production_editor = editor
+        editor.bind(
+            "<Destroy>",
+            lambda event: setattr(self, "continuous_production_editor", None)
+            if event.widget is editor else None,
+            add="+",
+        )
+        return editor
+
+    def _open_poster_printing(self, initial_paths: list[Path] | None = None):
+        from app.planchas.poster_print_editor import PosterPrintEditor
+
+        def load_photos(editor):
+            """Abre los archivos de un pedido con sus ajustes individuales."""
+            editor.add_paths(initial_paths or [])
+            editor.mode_var.set("uniform")
+            editor.on_mode_change()
+            children = editor.tree.get_children()
+            if children:
+                editor.tree.selection_set(children[0])
+                editor.tree.focus(children[0])
+                editor.on_uniform_selection()
+
+        host = getattr(self, "_poster_printing_tab", self)
+        editor = getattr(self, "poster_printing_editor", None)
+        if editor is not None and editor.winfo_exists():
+            if initial_paths:
+                load_photos(editor)
+            editor.focus_set()
+            return editor
+
+        editor = PosterPrintEditor(host, database=self.database)
+        editor.pack(fill="both", expand=True)
+        if initial_paths:
+            load_photos(editor)
+        self.poster_printing_editor = editor
+        editor.bind(
+            "<Destroy>",
+            lambda event: setattr(self, "poster_printing_editor", None)
+            if event.widget is editor else None,
+            add="+",
+        )
+        return editor
+
+    def _open_mixed_plancha_window(self):
+        """Abre la ficha propia de planchas mixtas dentro del Studio."""
+        # Asegurar que el módulo de producción esté cargado
+        self._ensure_production_module()
+        
+        create_workspace = getattr(self, "_create_production_plancha_workspace", None)
+        if not create_workspace:
+            messagebox.showerror(
+                "Planchas mixtas",
+                "El Creador de planchas todavía no está disponible.",
+                parent=self,
+            )
+            return None
+
+        # No se crea una ventana Toplevel: el constructor requiere una ficha
+        # del Studio como host. Así no queda una ventana blanca y el modo sigue
+        # siendo independiente de A4, A5, Franja y de Fotos/Mixtos/Collage.
+        editor, _ = create_workspace("mixed", "Planchas mixtas")
+        if editor.project.project_type != "sticker_mixed":
+            editor.enable_sticker_mixed_mode()
+            editor.render()
+
+        self._ensure_production_module()
+        self.tabs.select(self.production_tab)
+        self.production_notebook.select(self.production_constructor_tab)
+        self.status.set("Planchas mixtas: agregá stickers y definí un tamaño distinto para cada diseño.")
+        return editor
 
     def choose_search_image(self, parent=None):
         path = filedialog.askopenfilename(
@@ -7808,16 +15565,23 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         actions.pack(fill="x", pady=(0, 8))
         ttk.Button(actions, text="Pegar imagen", command=lambda: self.paste_search_image(dialog)).pack(side="left")
         ttk.Button(actions, text="Elegir archivo", command=lambda: self.choose_search_image(dialog)).pack(side="left", padx=(8, 0))
+        self.visual_index_button = ttk.Button(
+            actions,
+            text="Estudiar banco",
+            command=self.index_visual_bank,
+        )
+        self.visual_index_button.pack(side="left", padx=(8, 0))
 
         self.visual_status = tk.StringVar(value="Búsqueda local: pegá una imagen para buscar coincidencias visuales en la biblioteca.")
         ttk.Label(actions, textvariable=self.visual_status, style="Muted.TLabel").pack(side="left", padx=12)
 
         # Inicializar variables de búsqueda visual si no existen
         if not hasattr(self, "visual_search_mode"):
-            self.visual_search_mode = tk.StringVar(value="Estricto")
-            self.visual_search_threshold = tk.DoubleVar(value=90.0)
+            self.visual_search_mode = tk.StringVar(value="Relacionado")
+            self.visual_search_threshold = tk.DoubleVar(value=75.0)
             self.visual_search_duplicates = tk.BooleanVar(value=False)
             self.visual_search_ignore_bg = tk.BooleanVar(value=True)
+            self.visual_mode_help = tk.StringVar(value="Relacionado: encuentra stickers con elementos visuales similares.")
 
         # Panel de controles para la búsqueda visual avanzada
         settings_frame = ttk.Frame(content, style="Panel.TFrame")
@@ -7827,7 +15591,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         mode_cb = ttk.Combobox(
             settings_frame,
             textvariable=self.visual_search_mode,
-            values=["Relacionado", "Estricto", "Casi exacto"],
+            values=["Relacionado", "Estricto", "Casi exacto", "Idéntico"],
             state="readonly",
             width=12
         )
@@ -7841,6 +15605,15 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 self.visual_search_threshold.set(90.0)
             elif mode == "Casi exacto":
                 self.visual_search_threshold.set(96.0)
+            elif mode == "Idéntico":
+                self.visual_search_threshold.set(98.0)
+            descriptions = {
+                "Relacionado": "Relacionado: prioriza parecido visual y semántico.",
+                "Estricto": "Estricto: exige color, forma y estructura compatibles.",
+                "Casi exacto": "Casi exacto: admite diferencias pequeñas de recorte o calidad.",
+                "Idéntico": "Idéntico: misma silueta, color, hash y texto disponible; sin aproximaciones.",
+            }
+            self.visual_mode_help.set(descriptions.get(mode, ""))
             self.start_visual_search()
 
         mode_cb.bind("<<ComboboxSelected>>", on_mode_change)
@@ -7891,11 +15664,13 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             highlightthickness=0
         )
         bg_cb.pack(side="left", padx=(0, 4))
+        ttk.Label(content, textvariable=self.visual_mode_help, style="Muted.TLabel").pack(anchor="w", pady=(0, 6))
 
         self.visual_preview = ttk.Label(content, text="Sin imagen de referencia", anchor="center", style="Muted.TLabel")
         self.visual_preview.pack(fill="x", padx=8, pady=(2, 6))
 
         self.visual_gallery = Gallery(content, self.preview_image, self.add_tag, self.remove_tag, lambda: None, self.toggle_selection, self.is_selected, self.dragged_paths, on_trash=self.trash_sticker)
+        self.visual_gallery.set_display_limit(1000)
         self.visual_gallery.pack(fill="both", expand=True)
 
         self.visual_query_path = None
@@ -7940,8 +15715,49 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         self.visual_preview.image = preview
         self.start_visual_search()
 
+    def index_visual_bank(self):
+        """Precalcula las firmas locales para acelerar futuras búsquedas."""
+        if getattr(self, "_visual_indexing", False):
+            self.visual_status.set("El Banco de Stickers ya se está estudiando.")
+            return
+        from app.ai.visual_search import VISUAL_INDEX_VERSION
+        pending = self.database.images_needing_index_migration(VISUAL_INDEX_VERSION)
+        if not pending:
+            self.visual_status.set("El Banco de Stickers ya está estudiado y listo para buscar.")
+            return
+        total = len(pending)
+        self.visual_index_button.configure(state="disabled")
+        self.visual_status.set(f"Estudiando Banco de Stickers: 0 de {total}…")
+
+        def progress(done, _total):
+            if getattr(self, "visual_search_dialog", None) and self.visual_search_dialog.winfo_exists():
+                self.visual_status.set(f"Estudiando Banco de Stickers: {done} de {total}…")
+
+        def complete(done, skipped):
+            if getattr(self, "visual_search_dialog", None) and self.visual_search_dialog.winfo_exists():
+                self.visual_index_button.configure(state="normal")
+                suffix = f" · {skipped} omitido(s)" if skipped else ""
+                self.visual_status.set(f"Banco estudiado: {done} stickers listos para búsqueda rápida.{suffix}")
+
+        self.prepare_visual_index(progress=progress, complete=complete)
+
+        # Una actualización de versión usa la ruta de migración, que también
+        # es asíncrona. Este control devuelve el botón aun en ese caso.
+        def restore_after_migration():
+            if getattr(self, "_visual_indexing", False):
+                self.after(500, restore_after_migration)
+                return
+            if getattr(self, "visual_search_dialog", None) and self.visual_search_dialog.winfo_exists():
+                self.visual_index_button.configure(state="normal")
+
+        self.after(500, restore_after_migration)
+
     def start_visual_search(self):
         if not self.visual_query_path:
+            return
+        from app.ai.visual_search import VISUAL_INDEX_VERSION
+        if self.database.get_visual_index_version() != VISUAL_INDEX_VERSION:
+            self.visual_status.set("El índice cambió. Pulsá ‘Estudiar banco’ una vez antes de buscar.")
             return
         self.cancel_visual_search(silent=True)
         self.visual_search_id += 1
@@ -7962,8 +15778,33 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             not self.visual_search_duplicates.get() and
             self.visual_search_ignore_bg.get()
         )
+        search_options = {
+            "mode": "identico" if self.visual_search_mode.get() == "Idéntico" else self.visual_search_mode.get().lower().replace(" ", "_"),
+            "minimum_score": self.visual_search_threshold.get(),
+            "search_duplicates_only": self.visual_search_duplicates.get(),
+            "ignore_background": self.visual_search_ignore_bg.get(),
+        }
+        candidate_modified = {item["path"]: float(item.get("modified", -1)) for item in candidates}
+        candidate_fingerprint = hashlib.sha256(
+            "\n".join(
+                f"{item['path']}\0{float(item.get('modified', -1))}\0{str(item.get('visual_signature') or '')[:48]}"
+                for item in sorted(candidates, key=lambda row: row["path"])
+            ).encode("utf-8")
+        ).hexdigest()
+        run_key = hashlib.sha256(json.dumps(search_options, sort_keys=True).encode("utf-8")).hexdigest()
 
-        cached_matches = self.database.cached_visual_matches(query_path, query_modified) if is_default else None
+        # El ranking visual cambió (color, forma, diseño y rotación). Las
+        # coincidencias calculadas con la versión anterior no son válidas.
+        visual_cache_version = "7"  # Incrementado para invalidar caché vieja
+        if self.database.app_setting("visual_search_cache_version") != visual_cache_version:
+            self.database.connection.execute("DELETE FROM visual_similarities")
+            self.database.connection.execute("DELETE FROM visual_search_runs")
+            self.database.connection.commit()
+            self.database.save_app_setting("visual_search_cache_version", visual_cache_version)
+
+        cached_matches = self.database.cached_visual_run(run_key, query_path, query_modified, candidate_fingerprint)
+        if cached_matches is None and is_default:
+            cached_matches = self.database.cached_visual_matches(query_path, query_modified)
         if cached_matches:
             self.visual_search_cancel = None
             started = self._visual_search_started.pop(search_id, time.perf_counter())
@@ -7973,25 +15814,18 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 candidates=len(candidates), results=len(cached_matches),
             )
             self.visual_status.set(f"Coincidencias recuperadas de la base local: {len(cached_matches)}.")
+            self._visual_match_details = {}
             self.show_visual_matches(cached_matches)
             return
 
         query_tags = self.database.tags_for_image(query_path)
-        candidate_modified = {item["path"]: float(item.get("modified", -1)) for item in candidates}
-        self.visual_status.set(f"Analizando coincidencias visuales: 0 de {len(candidates)}…")
+        self.visual_status.set(f"Analizando coincidencias visuales: 0% · {len(candidates)} stickers indexados…")
         if hasattr(self, "visual_cancel_button"):
             self.visual_cancel_button.configure(state="normal")
 
-        search_options = {
-            "mode": self.visual_search_mode.get().lower().replace(" ", "_"),
-            "minimum_score": self.visual_search_threshold.get(),
-            "search_duplicates_only": self.visual_search_duplicates.get(),
-            "ignore_background": self.visual_search_ignore_bg.get()
-        }
-
         threading.Thread(
             target=self.run_visual_search,
-            args=(query_path, candidates, cancel_event, search_id, query_tags, query_modified, candidate_modified, is_default, search_options),
+            args=(query_path, candidates, cancel_event, search_id, query_tags, query_modified, candidate_modified, candidate_fingerprint, run_key, is_default, search_options),
             daemon=True
         ).start()
 
@@ -8003,11 +15837,15 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             if not silent:
                 self.visual_status.set("Búsqueda cancelada.")
 
-    def run_visual_search(self, query_path: str, candidates: list[dict], cancel_event: threading.Event, search_id: int, query_tags: str, query_modified: float, candidate_modified: dict[str, float], is_default: bool, search_options: dict):
+    def run_visual_search(self, query_path: str, candidates: list[dict], cancel_event: threading.Event, search_id: int, query_tags: str, query_modified: float, candidate_modified: dict[str, float], candidate_fingerprint: str, run_key: str, is_default: bool, search_options: dict):
         from app.ai.visual_search import find_similar
+        budget_exhausted = threading.Event()
+        match_details = {}
 
         def progress(done, total):
-            self.after(0, lambda: self.visual_status.set(f"Analizando coincidencias visuales: {done} de {total}…"))
+            self.after(0, lambda: self.visual_status.set(
+                f"Analizando coincidencias visuales: {done}% · {total} stickers indexados…"
+            ))
         def save_signatures(rows):
             self.after(0, lambda values=list(rows): self.database.update_visual_signatures(values))
 
@@ -8015,21 +15853,31 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             query_path,
             candidates,
             progress=progress,
-            limit=50,
+            limit=1000,
             cancelled=cancel_event.is_set,
             signature_ready=save_signatures,
             query_tags=query_tags,
             mode=search_options["mode"],
             minimum_score=search_options["minimum_score"],
             search_duplicates_only=search_options["search_duplicates_only"],
-            ignore_background=search_options["ignore_background"]
+            ignore_background=search_options["ignore_background"],
+            time_budget_seconds=300.0,  # Aumentado a 5 minutos para procesar todo el banco
+            timed_out=budget_exhausted.set,
+            details_ready=lambda details: match_details.update(details),
         )
 
-        if matches and is_default and not cancel_event.is_set():
+        # Un resultado parcial no se guarda como definitivo: la siguiente
+        # búsqueda puede completar el análisis si el usuario lo necesita.
+        if matches and is_default and not cancel_event.is_set() and not budget_exhausted.is_set():
             self.after(0, lambda values=matches: self.database.save_visual_matches(query_path, query_modified, values, candidate_modified))
-        self.after(0, lambda: self.finish_visual_search(matches, cancel_event, search_id))
+        if matches and not cancel_event.is_set() and not budget_exhausted.is_set():
+            self.after(0, lambda values=matches: self.database.save_visual_run(run_key, query_path, query_modified, candidate_fingerprint, search_options, values))
+        self.after(0, lambda: self.finish_visual_search(
+            matches, cancel_event, search_id,
+            partial=budget_exhausted.is_set(), details=match_details,
+        ))
 
-    def finish_visual_search(self, matches, cancel_event: threading.Event, search_id: int):
+    def finish_visual_search(self, matches, cancel_event: threading.Event, search_id: int, partial: bool = False, details=None):
         if search_id != self.visual_search_id or cancel_event.is_set():
             return
         self.visual_search_cancel = None
@@ -8041,27 +15889,56 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             (time.perf_counter() - started) * 1000,
             results=len(matches or []),
         )
-        self.show_visual_matches(matches or [])
+        self._visual_match_details = details or {}
+        self.show_visual_matches(matches or [], partial=partial)
 
-    def show_visual_matches(self, matches: list[tuple[str, float]]):
+    def show_visual_matches(self, matches: list[tuple[str, float]], partial: bool = False):
         if not matches:
             self.visual_gallery.show_images([])
-            self.visual_status.set("No se encontraron stickers con una similitud suficiente en el banco de imágenes.")
+            self.visual_status.set(
+                "Búsqueda parcial: no hubo coincidencias dentro de los 8 segundos."
+                if partial else "No se encontraron stickers con una similitud suficiente en el banco de imágenes."
+            )
             return
         paths = [path for path, _score in matches]
         images = self.database.images_by_paths(paths)
         scores = {path: score for path, score in matches}
         for image in images:
             image["visual_match_score"] = scores[image["path"]]
-            image["tags"] = (image.get("tags") or "") + f" · Coincidencia visual: {scores[image['path']]:.1f}%"
+            detail = getattr(self, "_visual_match_details", {}).get(image["path"], {})
+            indexed = detail.get("indexed") or {}
+            shape = float(detail.get("shape_sim") or indexed.get("silhouette_index") or 0.0)
+            color = float(detail.get("color_sim") or indexed.get("color_index") or 0.0)
+            hash_score = float(detail.get("hash_sim") or 0.0)
+            image["visual_match_metrics"] = detail
+            image["tags"] = (
+                (image.get("tags") or "") + f" · Coincidencia: {scores[image['path']]:.1f}%"
+                + f" · forma {shape * 100:.0f}% · color {color * 100:.0f}% · hash {hash_score * 100:.0f}%"
+            )
         self.visual_gallery.show_images(images)
+        if partial:
+            self.visual_status.set(f"Resultado parcial en 8 segundos: {len(images)} coincidencia(s); no se guardó como definitivo.")
+            return
+        # Verificar si los resultados están debajo del umbral (fallback)
+        minimum_score = self.visual_search_threshold.get()
+        below_threshold = [m for m in matches if m[1] < minimum_score]
+        is_fallback = len(below_threshold) == len(matches) and matches
+        
         exact = sum(score == 100 for _path, score in matches)
         strongest = max(scores.values())
         level = "exacta" if strongest >= 99.95 else ("muy alta" if strongest >= 88 else ("probable" if strongest >= 76 else "baja"))
-        self.visual_status.set(
-            f"{len(images)} coincidencias visuales · mejor resultado: {strongest:.1f}% ({level}) · "
-            f"exactas: {exact}. Las tarjetas muestran su puntuación."
-        )
+        
+        if is_fallback:
+            # Mostrar mensaje especial para resultados fallback
+            self.visual_status.set(
+                f"{len(images)} coincidencias cercanas (debajo del {minimum_score:.0f}%) · mejor resultado: {strongest:.1f}% · "
+                f"Estos resultados no superan el umbral mínimo pero son los más parecidos."
+            )
+        else:
+            self.visual_status.set(
+                f"{len(images)} coincidencias visuales · mejor resultado: {strongest:.1f}% ({level}) · "
+                f"exactas: {exact}. Las tarjetas muestran su puntuación."
+            )
 
     def is_selected(self, image: dict) -> bool:
         return image.get("path") in self.selected_images
@@ -8085,6 +15962,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             action = "Se agregó a Seleccionados"
         self.selected_gallery.show_images(list(self.selected_images.values()))
         self.gallery.set_selection_visual(path, selected)
+        self._update_selected_area_state()
         self.tabs.tab(self.selected_tab, text=f"Seleccionados ({len(self.selected_images)})")
         if hasattr(self, "selected_navigation_button"):
             self.selected_navigation_button.configure(text=f"Seleccionados ({len(self.selected_images)})")
@@ -8098,6 +15976,7 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         self.selected_images.clear()
         self.selected_gallery.show_images([])
         self.gallery.clear_selection_visuals()
+        self._update_selected_area_state()
         self.tabs.tab(self.selected_tab, text="Seleccionados (0)")
         if hasattr(self, "selected_navigation_button"):
             self.selected_navigation_button.configure(text="Seleccionados (0)")
@@ -8117,11 +15996,47 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 added += 1
             self.gallery.set_selection_visual(image["path"], True)
         self.selected_gallery.show_images(list(self.selected_images.values()))
+        self._update_selected_area_state()
         self.tabs.tab(self.selected_tab, text=f"Seleccionados ({len(self.selected_images)})")
         if hasattr(self, "selected_navigation_button"):
             self.selected_navigation_button.configure(text=f"Seleccionados ({len(self.selected_images)})")
         self.status.set(f"{added} diseño(s) visibles agregados a Seleccionados.")
         self.refresh_order_selection_highlights()
+
+    def _update_selected_area_state(self):
+        """Mantiene el resumen y las acciones de Seleccionados sincronizados."""
+        count = len(self.selected_images)
+        if hasattr(self, "selected_summary"):
+            if count:
+                noun = "diseño seleccionado" if count == 1 else "diseños seleccionados"
+                self.selected_summary.set(
+                    f"{count} {noun} · Arrastralos a otra aplicación o preparalos para una plancha."
+                )
+            else:
+                self.selected_summary.set(
+                    "0 diseños seleccionados · Elegí diseños desde Biblioteca con Ctrl + clic."
+                )
+        state = "normal" if count else "disabled"
+        for name in (
+            "selected_clear_button", "selected_plancha_button",
+            "selected_order_button", "selected_add_tag_button",
+            "selected_manage_button", "library_add_to_order_button",
+        ):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.configure(state=state)
+        gallery = getattr(self, "selected_gallery", None)
+        empty_state = getattr(self, "selected_empty_state", None)
+        if gallery is None or empty_state is None:
+            return
+        if count:
+            empty_state.pack_forget()
+            if not gallery.winfo_manager():
+                gallery.pack(fill="both", expand=True)
+        else:
+            gallery.pack_forget()
+            if not empty_state.winfo_manager():
+                empty_state.pack(expand=True)
 
     def add_tag_to_selected(self):
         if not self.selected_images:
@@ -8141,6 +16056,95 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
 
         self.ask_tag_with_suggestion("Agregar etiqueta", "Etiqueta para todos los seleccionados:", add_to_all)
 
+    def link_selected_to_order(self):
+        """Vincula los diseños de Seleccionados a un pedido pendiente."""
+        selected = list(self.selected_images.values())
+        if not selected:
+            messagebox.showinfo(
+                "Enlazar a pedido",
+                "Primero seleccioná uno o más diseños.",
+                parent=self,
+            )
+            return
+
+        def link_to(order_id: int) -> None:
+            try:
+                for image in selected:
+                    self.database.link_design_to_order(order_id, image["path"])
+            except Exception as error:
+                messagebox.showerror("No se pudo enlazar al pedido", str(error), parent=self)
+                return
+            self.refresh_order_workspace(order_id)
+            self.status.set(f"{len(selected)} diseño(s) vinculado(s) al pedido #{order_id}.")
+
+        self._show_pending_order_picker(link_to)
+
+    def remove_tag_from_selected(self):
+        """Pide una etiqueta y la quita de todos los disenos seleccionados."""
+        if not self.selected_images:
+            messagebox.showinfo("Seleccionados", "Selecciona uno o mas disenos primero.", parent=self)
+            return
+
+        def remove_from_all(tag: str):
+            count = len(self.selected_images)
+            if not messagebox.askyesno(
+                "Quitar etiqueta",
+                f"Quitar {tag.title()} de {count} diseno(s) seleccionados?",
+                parent=self,
+            ):
+                return False
+            removed = self.database.remove_tag_from_images(list(self.selected_images), tag)
+            self.refresh_tags()
+            self.refresh(self.search.query.get())
+            self.status.set(f"Etiqueta quitada de {removed} diseno(s).")
+            return True
+
+        self.ask_tag_with_suggestion("Quitar etiqueta", "Etiqueta para quitar de los seleccionados:", remove_from_all)
+
+    def clear_category_from_selected(self):
+        """Quita la categoria de todos los disenos seleccionados."""
+        if not self.selected_images:
+            messagebox.showinfo("Seleccionados", "Selecciona uno o mas disenos primero.", parent=self)
+            return
+        count = len(self.selected_images)
+        if not messagebox.askyesno(
+            "Quitar categoria",
+            f"Quitar la categoria de {count} diseno(s) seleccionados? Las etiquetas no cambiaran.",
+            parent=self,
+        ):
+            return
+        paths = list(self.selected_images)
+        placeholders = ", ".join("?" for _ in paths)
+        with self.database.connection:
+            self.database.connection.execute(
+                f"UPDATE images SET category = '' WHERE path IN ({placeholders})", paths,
+            )
+        for image in self.selected_images.values():
+            image["category"] = ""
+        self.refresh_collections()
+        self.refresh(self.search.query.get())
+        self.status.set(f"Categoria quitada de {count} diseno(s).")
+
+    def add_category_to_selected(self):
+        if not self.selected_images:
+            messagebox.showinfo("Seleccionados", "Primero seleccioná uno o más stickers posando el mouse y tocando Ctrl.", parent=self)
+            return
+        def assign_to_all(category: str):
+            try:
+                with self.database.connection:
+                    for image in self.selected_images.values():
+                        self.database.connection.execute(
+                            "UPDATE images SET category = ? WHERE path = ?",
+                            (category, image["path"]),
+                        )
+                self.status.set(f"Categoría «{category}» asignada a {len(self.selected_images)} diseño(s).")
+                self.refresh_categories()
+                self.refresh(self.search.query.get())
+            except Exception as error:
+                messagebox.showerror("No se pudo asignar la categoría", str(error), parent=self)
+
+        self._show_category_picker(assign_to_all)
+
     def ask_plancha_mode(self) -> str | None:
         """Permite elegir el modo antes de crear una nueva plancha."""
         dialog = tk.Toplevel(self)
@@ -8149,34 +16153,222 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         dialog.resizable(False, False)
         dialog.transient(self)
         dialog.grab_set()
-        dialog.geometry("620x300")
+        dialog.geometry("620x285")
         selected = {"value": None}
         tk.Label(dialog, text="¿Cómo querés armar la plancha?", background="#111314", foreground="#fff4ec", font=("Bahnschrift SemiCondensed", 18, "bold")).pack(anchor="w", padx=22, pady=(22, 7))
         tk.Label(dialog, text="Elegí un modo de trabajo. Ambos conservan intactos los archivos originales.", background="#111314", foreground="#b9a79b").pack(anchor="w", padx=22, pady=(0, 15))
+        tk.Label(dialog, text="ELEGÍ CÓMO INICIAR", background="#111314", foreground="#b9a79b",
+                 font=(IDENTITY_FONT, 9, "bold")).pack(anchor="w", padx=22, pady=(5, 7))
+        source_actions = tk.Frame(dialog, background="#111314")
+        source_actions.pack(fill="x", padx=20, pady=(0, 14))
+        source_actions.columnconfigure(0, weight=1)
+        source_actions.columnconfigure(1, weight=1)
+        studio_card = tk.Frame(source_actions, background="#1b1e1f", highlightthickness=1,
+                               highlightbackground="#46515a")
+        studio_card.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        studio_button = ttk.Button(studio_card, text="Doccione Studio", style="Secondary.TButton")
+        studio_button.pack(fill="x", padx=14, pady=(14, 6))
+        tk.Label(studio_card, text="Armá una plancha independiente\ny elegí formato A4, A5 o Franja.",
+                 background="#1b1e1f", foreground="#c7b6aa", justify="left",
+                 font=(UI_FONT, 9)).pack(anchor="w", padx=14, pady=(0, 14))
+        order_card = tk.Frame(source_actions, background="#1b1e1f", highlightthickness=1,
+                              highlightbackground="#1f5ea8")
+        order_card.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        quick_order = ttk.Button(
+            order_card, text="Agregar pedido para cliente",
+            style="Primary.TButton", command=lambda: choose("new_order"),
+        )
+        quick_order.pack(fill="x", padx=14, pady=(14, 6))
+        tk.Label(order_card, text="Buscá o creá el cliente primero.\nDespués preparás su plancha.",
+                 background="#1b1e1f", foreground="#c7b6aa", justify="left",
+                 font=(UI_FONT, 9)).pack(anchor="w", padx=14, pady=(0, 14))
         options = tk.Frame(dialog, background="#111314")
-        options.pack(fill="both", expand=True, padx=20, pady=(0, 14))
 
         def choose(value: str):
             selected["value"] = value
             dialog.destroy()
 
+        def show_doccione_studio_actions():
+            """Habilita el armado independiente dentro de Doccione Studio."""
+            studio_button.configure(state="disabled")
+            options.pack(fill="both", expand=True, padx=20, pady=(0, 14))
+            # Planchas mixtas suma un cuarto botón dentro de Plancha libre;
+            # este ancho evita comprimir o recortar la tarjeta regular.
+            dialog.geometry("820x460")
+            self.center_window(dialog)
+
+        studio_button.configure(command=show_doccione_studio_actions)
+
         for title, detail, value in (
-            ("Plancha libre", "Ubicá stickers, optimizá los espacios y editá una plancha A4 con libertad.", "free"),
+            ("Plancha libre", "Elegí el formato de venta y ubicá stickers con libertad.", "free"),
             ("Plancha regular", "Trabajá con patrones de casillas fijas sin duplicar los archivos originales.", "regular"),
         ):
             card = tk.Frame(options, background="#1b1e1f", highlightbackground="#d60916", highlightthickness=1, cursor="hand2")
             card.pack(side="left", fill="both", expand=True, padx=5)
             tk.Label(card, text=title, background="#1b1e1f", foreground="#f3e0d2", font=("Bahnschrift SemiCondensed", 14, "bold"), cursor="hand2").pack(anchor="w", padx=15, pady=(18, 5))
             tk.Label(card, text=detail, background="#1b1e1f", foreground="#c7b6aa", wraplength=245, justify="left", cursor="hand2").pack(anchor="w", padx=15, pady=(0, 14))
-            ttk.Button(card, text="Elegir", command=lambda choice=value: choose(choice)).pack(anchor="w", padx=15, pady=(0, 16))
-            card.bind("<Button-1>", lambda _event, choice=value: choose(choice))
+            if value == "free":
+                formats = tk.Frame(card, background="#1b1e1f")
+                formats.pack(anchor="w", padx=15, pady=(0, 16))
+                for label, workspace in (("A4", "a4"), ("A5", "a5"), ("Franja", "franja")):
+                    ttk.Button(formats, text=label, command=lambda fmt=workspace: choose(f"free:{fmt}")).pack(side="left", padx=(0, 5))
+                ttk.Button(formats, text="Planchas mixtas", style="Primary.TButton",
+                           command=lambda: choose("mixed")).pack(side="left", padx=(0, 5))
+            else:
+                ttk.Button(card, text="Elegir", command=lambda choice=value: choose(choice)).pack(anchor="w", padx=15, pady=(0, 16))
+                card.bind("<Button-1>", lambda _event, choice=value: choose(choice))
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        self.center_window(dialog)
         self.wait_window(dialog)
         return selected["value"]
+
+    def ask_plancha_person(self):
+        """Solicita la referencia de la persona para planchas sin pedido."""
+        name = simpledialog.askstring("Datos de la plancha", "Nombre de la persona o cliente:", parent=self)
+        if name is None:
+            return None
+        name = name.strip()
+        if not name:
+            messagebox.showwarning("Datos de la plancha", "Indicá al menos el nombre de la persona.", parent=self)
+            return None
+        phone = simpledialog.askstring(
+            "Datos de la plancha", "WhatsApp o teléfono (opcional):", parent=self,
+        )
+        return name, (phone or "").strip()
+
+    def _send_selected_to_production_constructor(
+        self, images: list[dict], workspace_format: str, order_id: int | None = None,
+        packing_mode: str | None = None, project_type: str | None = None,
+    ) -> bool:
+        """Carga la selección en el creador persistente de Producción."""
+        # Asegurar que el módulo de producción esté cargado
+        self._ensure_production_module()
+        
+        create_workspace = getattr(self, "_create_production_plancha_workspace", None)
+        constructor_tab = getattr(self, "production_constructor_tab", None)
+        if not create_workspace or constructor_tab is None:
+            messagebox.showerror(
+                "Creador de planchas",
+                "El creador de planchas de Producción todavía no está disponible.",
+                parent=self,
+            )
+            return False
+
+        if order_id:
+            order = self.database.order(order_id) or {}
+            client = order.get("client_name") or order.get("client") or f"Pedido {order_id}"
+            editor, already_open = create_workspace(f"order:{order_id}", f"Pedido #{order_id} - {client}", order_id)
+            if already_open:
+                self._ensure_production_module()
+                self.tabs.select(self.production_tab)
+                self.production_notebook.select(constructor_tab)
+                self.status.set(f"El armado del pedido #{order_id} ya está abierto en su ficha.")
+                return True
+        else:
+            editor, _ = create_workspace()
+
+        # El formato elegido se aplica al iniciar una plancha vacía. Si ya hay
+        # trabajo en curso se respeta para no modificar un armado existente.
+        if editor.project.items and order_id and editor.order_id != order_id:
+            current = f"pedido #{editor.order_id}" if editor.order_id else "una plancha sin pedido"
+            if not messagebox.askyesno(
+                "Plancha en curso",
+                f"El creador ya contiene diseños de {current}.\n\n"
+                f"¿Querés sumar igualmente los diseños del pedido #{order_id}?",
+                parent=self,
+            ):
+                return False
+
+        if not editor.project.items:
+            from app.planchas.model import A5_PRINT_MARGIN_CM, PRINT_MARGIN_CM
+
+            editor.project.workspace_format = workspace_format
+            editor.project.margin_cm = A5_PRINT_MARGIN_CM if workspace_format == "a5" else PRINT_MARGIN_CM
+            editor.workspace_button.configure(text={"a4": "A4", "a5": "A5", "franja": "1/5"}[workspace_format])
+            editor.format_heading.set(f"PLANCHA {editor.project.workspace_label.upper()}")
+            editor.order_id = order_id
+            if project_type:
+                editor.project.project_type = project_type
+            from app.planchas.model import normalize_new_packing_mode
+            editor.packing_mode = normalize_new_packing_mode(packing_mode)
+            if editor.packing_mode == "sticker_mixed":
+                editor.enable_sticker_mixed_mode()
+            elif packing_mode == "standard_five_bands":
+                editor.project.project_type = "sticker_standard"
+
+        # Una plancha libre nueva no tiene diseños todavía: debe abrirse como
+        # banco vacío, no intentar paginar una lista vacía ni informar fallo.
+        if not images:
+            editor.render()
+            self._ensure_production_module()
+            self.tabs.select(self.production_tab)
+            self.production_notebook.select(constructor_tab)
+            self.status.set("Plancha libre creada. Agregá diseños desde el banco para comenzar.")
+            return True
+
+        from app.planchas.model import HITBOX_INNER_CLEARANCE_CM, PlanchaProject
+
+        # Desde Seleccionados no hay pedido que defina el producto. Para los
+        # modos modernos se pide el nominal, nunca se inventa 5 cm.
+        prepared_images = []
+        for image in images:
+            record = image.copy()
+            nominal = record.get("nominal_size_cm") or record.get("order_size_cm")
+            if nominal is None and editor.project.project_type == "sticker_free":
+                nominal = simpledialog.askfloat(
+                    "Tamaño nominal", f"Tamaño comercial para «{record.get('caption') or record.get('name') or Path(record['path']).stem}» (cm):",
+                    parent=self, minvalue=0.5, maxvalue=29.7,
+                )
+                if nominal is None:
+                    continue
+            if nominal is not None:
+                record["order_size_cm"] = float(nominal)
+                record["nominal_size_cm"] = float(nominal)
+            if editor.project.project_type == "sticker_standard":
+                # Seleccionados → A4/A5/Franja es el producto estándar de
+                # cinco franjas: los items usan el slot histórico de 5,70 cm.
+                record["order_size_cm"] = 5.0
+                record["nominal_size_cm"] = 5.0
+                record["order_packing_mode"] = "standard_five_bands"
+            prepared_images.append(record)
+
+        # Una ficha representa un trabajo completo. El modelo distribuye sus
+        # stickers en las planchas necesarias (por ejemplo, 100 diseños en
+        # cinco planchas) y el navegador interno permite recorrerlas.
+        new_items = PlanchaProject.from_images(prepared_images).items
+        if editor.project.project_type == "sticker_free":
+            for item in new_items:
+                item.layout_width_cm = item.width_cm + 2 * HITBOX_INNER_CLEARANCE_CM
+                item.layout_height_cm = item.height_cm + 2 * HITBOX_INNER_CLEARANCE_CM
+        current_items = [
+            item for project in editor.all_projects for item in project.items
+        ] if editor.all_projects else list(editor.project.items)
+        editor.project.items = current_items + new_items
+        if packing_mode:
+            from app.planchas.model import normalize_new_packing_mode
+            editor.packing_mode = normalize_new_packing_mode(packing_mode)
+        editor.all_projects = []
+        if editor.project.project_type == "sticker_mixed":
+            editor.regenerate_sticker_mixed()
+        else:
+            editor.organize_with_pagination()
+        editor.snapshot()
+        editor.render()
+        editor.update_plancha_navigation()
+        added = len(new_items)
+        self._ensure_production_module()
+        self.tabs.select(self.production_tab)
+        self.production_notebook.select(constructor_tab)
+        if added:
+            self.status.set(f"{added} diseño(s) agregados al Creador de planchas en Producción.")
+        return bool(added)
 
     def open_plancha_constructor(self):
         mode = self.ask_plancha_mode()
         if not mode:
+            return
+        if mode == "new_order":
+            self.new_order_dialog()
             return
         if mode == "regular":
             from app.planchas.template_editor import RegularTemplateEditor
@@ -8187,16 +16379,24 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 library_images=self.database.search(limit=10000),
             )
             return
+        if mode == "mixed":
+            if self.selected_images:
+                self._send_selected_to_production_constructor(
+                    list(self.selected_images.values()), workspace_format="a4",
+                    packing_mode="sticker_mixed", project_type="sticker_mixed",
+                )
+            else:
+                self._open_mixed_plancha_window()
+            return
         if not self.selected_images:
             messagebox.showinfo("Plancha libre", "Seleccioná uno o más diseños con Ctrl y abrí Seleccionados.", parent=self)
             return
-        from app.planchas.editor import PlanchaEditor
-
-        PlanchaEditor(
-            self,
+        workspace_format = mode.split(":", 1)[1] if mode.startswith("free:") else "a4"
+        self._send_selected_to_production_constructor(
             list(self.selected_images.values()),
-            database=self.database,
-            library_images=self.database.search(limit=10000),
+            workspace_format=workspace_format,
+            packing_mode="standard_five_bands",
+            project_type="sticker_standard",
         )
 
     def ask_tag_with_suggestion(self, title: str, prompt: str, on_add=None) -> str | None:
@@ -8268,21 +16468,54 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         self.refresh_categories()
         self.refresh_tags()
 
-    def open_sticker_studio(self, initial_paths=None):
+    def queue_library_refresh(self, query: str | None = None, delay_ms: int = 90, include_collections: bool = False) -> None:
+        """Agrupa varias recargas de biblioteca en una sola operación para evitar trabajo repetido."""
+        if query is None and hasattr(self, "search"):
+            query = self.search.query.get()
+        if getattr(self, "_library_refresh_after", None) is not None:
+            try:
+                self.after_cancel(self._library_refresh_after)
+            except tk.TclError:
+                pass
+        self._library_refresh_after = self.after(delay_ms, lambda: self._flush_library_refresh(query, include_collections))
+
+    def _flush_library_refresh(self, query: str | None = None, include_collections: bool = False) -> None:
+        self._library_refresh_after = None
+        if include_collections:
+            self.refresh_collections()
+        if hasattr(self, "search"):
+            self.refresh(query if query is not None else self.search.query.get())
+
+    def open_sticker_studio(self, initial_paths=None, target_order_id=None,
+                            nominal_size_cm=None):
         """Abre una única cola no destructiva de construcción y revisión."""
         try:
             window = self.sticker_studio_window
             if window is not None and window.winfo_exists():
                 if initial_paths:
                     window.add_paths([Path(path) for path in initial_paths if path])
+                # Configurar el order_id si se proporciona
+                if target_order_id is not None:
+                    window.set_target_order(target_order_id, nominal_size_cm)
                 window.deiconify()
                 window.lift()
-                window.focus_force()
-                return
+                window.focus_set()
+                return True
 
             def refresh_library():
-                self.refresh_collections()
-                self.refresh(self.search.query.get())
+                self.queue_library_refresh(self.search.query.get(), include_collections=True)
+                # Cuando el creador se abrió desde un pedido, la confirmación
+                # también debe reflejarse enseguida en “Diseños del pedido”.
+                studio = self.sticker_studio_window
+                linked_order_id = getattr(studio, "target_order_id", None)
+                if linked_order_id is not None:
+                    self.refresh_order_workspace(int(linked_order_id))
+                # Actualizar "Últimos Procesados" si ya fue cargado, o marcarlo para actualizar
+                if hasattr(self, "_processed_gallery_loaded") and self._processed_gallery_loaded:
+                    self.refresh_processed_gallery()
+                else:
+                    # Marcar que necesita actualización cuando se abra el tab
+                    self._processed_gallery_needs_refresh = True
 
             semantic_analyzer = None
             if self.ai_provider.get() == "Gemini" and self.gemini_api_key:
@@ -8292,8 +16525,9 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                     from app.ai.gemini import analyze_image
                     return analyze_image(path, api_key, model, progress)
 
-            self.sticker_studio_window = StickerStudio(
+            self.sticker_studio_window = _sticker_studio_class()(
                 self, self.database, refresh_library, semantic_analyzer=semantic_analyzer,
+                target_order_id=target_order_id, nominal_size_cm=nominal_size_cm,
             )
             if initial_paths:
                 self.sticker_studio_window.add_paths([Path(path) for path in initial_paths if path])
@@ -8303,7 +16537,8 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 if event.widget is self.sticker_studio_window else None,
                 add="+",
             )
-                
+            return True
+                 
         except Exception as e:
             import traceback
             from tkinter import messagebox
@@ -8326,25 +16561,45 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                     f"No se pudo abrir el creador de stickers.\n\nError: {e}",
                     parent=self
                 )
+            return False
 
     def refresh_categories(self):
-        for widget in self.categories_frame.winfo_children():
-            widget.destroy()
         active = {name for name, value in self.selected_categories.items() if value.get()}
         self.selected_categories = {}
         categories = self.database.category_counts()
-        if hasattr(self, "tag_category_picker"):
-            names = [category for category, _count in categories]
-            self.tag_category_picker["values"] = ["Todas las categorías", *names]
-            if self.tag_category_filter.get() not in {"Todas las categorías", *names}:
-                self.tag_category_filter.set("Todas las categorías")
-        for category, count in categories:
-            value = tk.BooleanVar(value=category in active)
-            self.selected_categories[category] = value
-            item = tk.Checkbutton(self.categories_frame, text=f"▸ {category.title()}  ({count})", variable=value, command=lambda: self.refresh(), anchor="w", justify="left", background=COLORS.panel, foreground=COLORS.text, activebackground=COLORS.panel, activeforeground=COLORS.text, selectcolor=COLORS.wine, font=(UI_FONT, 10), highlightthickness=0)
-            item.pack(fill="x", anchor="w", padx=5, pady=1)
-            item.bind("<Button-3>", lambda event, name=category: self.show_category_context(event, name))
-            item.bind("<MouseWheel>", lambda e: self.scroll_tags_with_wheel(e))
+        names = [category for category, _count in categories]
+        selected = self.category_filter.get() if hasattr(self, "category_filter") else "Todas las categorías"
+        if selected not in names:
+            selected = "Todas las categorías"
+            if hasattr(self, "category_filter"):
+                self.category_filter.set(selected)
+        if hasattr(self, "category_picker"):
+            self.category_picker["values"] = ["Todas las categorías", *names]
+        for category in names:
+            self.selected_categories[category] = tk.BooleanVar(value=category == selected or category in active)
+
+    def _on_category_filter_changed(self):
+        """Aplica la categoría elegida en la lista desplegable."""
+        selected = self.category_filter.get()
+        for category, value in self.selected_categories.items():
+            value.set(category == selected)
+        self.refresh()
+
+    def show_selected_category_actions(self):
+        """Muestra las acciones de la categoría elegida en el desplegable."""
+        category = self.category_filter.get()
+        if category == "Todas las categorías":
+            return
+        menu = tk.Menu(self, tearoff=0)
+        configure_menu(menu)
+        menu.add_command(label="Renombrar o fusionar categoría", command=lambda: self.rename_library_category(category))
+        menu.add_command(label="Eliminar categoría", command=lambda: self.delete_category_from_library(category))
+        self.category_actions_btn.update_idletasks()
+        menu.tk_popup(
+            self.category_actions_btn.winfo_rootx(),
+            self.category_actions_btn.winfo_rooty() + self.category_actions_btn.winfo_height(),
+        )
+        menu.grab_release()
 
     def refresh_tags(self):
         for widget in self.tags_frame.winfo_children():
@@ -8376,34 +16631,65 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
     def show_category_context(self, event, category: str):
         menu = tk.Menu(self, tearoff=0)
         configure_menu(menu)
-        menu.add_command(label="Quitar categoría de los diseños", command=lambda: self.delete_category_from_library(category))
+        menu.add_command(label="Renombrar o fusionar categoria", command=lambda: self.rename_library_category(category))
+        menu.add_command(label="Eliminar categoría", command=lambda: self.delete_category_from_library(category))
         menu.tk_popup(event.x_root, event.y_root)
         menu.grab_release()
         return "break"
+
+    def rename_library_category(self, category: str):
+        def apply_name(new_name: str):
+            try:
+                affected = self.database.rename_category(category, new_name)
+            except ValueError as error:
+                messagebox.showwarning("Categoria invalida", str(error), parent=self)
+                return False
+            self.queue_library_refresh(self.search.query.get(), include_collections=True)
+            self.status.set(f"Categoria actualizada en {affected} diseno(s).")
+            return True
+
+        self._show_category_picker(apply_name, title="Renombrar o fusionar categoria")
 
     def delete_category_from_library(self, category: str):
         message = f"¿Quitar la categoría «{category.title()}» de todos los diseños?\n\nLos archivos y etiquetas no se modificarán."
         if not messagebox.askyesno("Quitar categoría", message, parent=self):
             return
         count = self.database.clear_category(category)
-        self.refresh_collections()
-        self.refresh()
+        self.queue_library_refresh(include_collections=True)
         self.status.set(f"Se quitó la categoría «{category.title()}» de {count} diseño(s).")
 
     def show_tag_context(self, event, tag: str):
         menu = tk.Menu(self, tearoff=0)
         configure_menu(menu)
+        menu.add_command(label="Renombrar o fusionar etiqueta", command=lambda: self.rename_library_tag(tag))
         menu.add_command(label="Eliminar etiqueta", command=lambda: self.delete_tag_from_library(tag))
         menu.tk_popup(event.x_root, event.y_root)
         menu.grab_release()
         return "break"
 
+    def rename_library_tag(self, tag: str):
+        """Renombra una etiqueta y fusiona asociaciones si el destino ya existe."""
+        def apply_name(new_name: str):
+            try:
+                final_name = self.database.rename_tag(tag, new_name)
+            except ValueError as error:
+                messagebox.showwarning("Etiqueta invalida", str(error), parent=self)
+                return False
+            self.queue_library_refresh(self.search.query.get(), include_collections=False)
+            self.status.set(f"Etiqueta actualizada: {final_name}.")
+            return True
+
+        self.ask_tag_with_suggestion(
+            "Renombrar etiqueta",
+            f"Nuevo nombre para {tag}:",
+            apply_name,
+        )
+
     def delete_tag_from_library(self, tag: str):
         if not messagebox.askyesno("Eliminar etiqueta", f"¿Eliminar «{tag.title()}» de todos los stickers?", parent=self):
             return
         self.database.delete_tag(tag)
-        self.refresh_tags()
-        self.refresh()
+        self.queue_library_refresh(include_collections=False)
         self.status.set(f"Etiqueta «{tag.title()}» eliminada de la biblioteca.")
 
     def active_tags(self) -> list[str]:
@@ -8412,7 +16698,46 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
     def active_categories(self) -> list[str]:
         return [category for category, value in self.selected_categories.items() if value.get()]
 
+    def refresh_filter_chips(self):
+        """Muestra los filtros activos y permite quitarlos uno a uno."""
+        if not hasattr(self, "filter_chips_frame"):
+            return
+        for widget in self.filter_chips_frame.winfo_children():
+            widget.destroy()
+        active = [("Categoria", name) for name in self.active_categories()]
+        active.extend(("Etiqueta", name) for name in self.active_tags())
+        if self.untagged_only.get():
+            active.append(("Etiquetas", "Sin etiquetas"))
+        if not active:
+            self.filter_chips_frame.pack_forget()
+            return
+        self.filter_chips_frame.pack(fill="x", padx=12, pady=(0, 5), before=self.gallery)
+        tk.Label(self.filter_chips_frame, text="FILTROS ACTIVOS", background=COLORS.background,
+                 foreground=COLORS.muted, font=(IDENTITY_FONT, 8, "bold")).pack(side="left", padx=(2, 7))
+        for kind, name in active:
+            tk.Button(
+                self.filter_chips_frame, text=f"{kind}: {name}  x",
+                command=lambda filter_kind=kind, filter_name=name: self.remove_library_filter(filter_kind, filter_name),
+                background=COLORS.panel, foreground=COLORS.text, activebackground=COLORS.panel_elevated,
+                activeforeground=COLORS.text, relief="flat", borderwidth=0, cursor="hand2",
+                font=(UI_FONT, 9), padx=7, pady=3,
+            ).pack(side="left", padx=(0, 5))
+        ttk.Button(self.filter_chips_frame, text="Limpiar todo", command=self.clear_all_tags,
+                   style="Secondary.TButton").pack(side="left", padx=(3, 0))
+
+    def remove_library_filter(self, kind: str, name: str):
+        if kind == "Etiquetas" and name == "Sin etiquetas":
+            self.untagged_only.set(False)
+            self.refresh()
+            return
+        filters = self.selected_categories if kind == "Categoria" else self.selected_tags
+        value = filters.get(name)
+        if value is not None:
+            value.set(False)
+        self.refresh()
+
     def clear_all_tags(self):
+        self.untagged_only.set(False)
         for value in self.selected_tags.values():
             value.set(False)
         for value in self.selected_categories.values():
@@ -8432,33 +16757,266 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             self.database.remove_missing()
             self.database.commit()
             self.status.set(f"Se indexaron {count} diseños.")
-            self.refresh_collections()
-            self.refresh(self.search.query.get())
+            self.queue_library_refresh(self.search.query.get(), include_collections=True)
         except OSError as error:
             messagebox.showerror("No se pudo indexar", str(error))
+    def replace_index_with_folder(self):
+        """Reemplaza el índice actual con una carpeta seleccionada."""
+        folder = filedialog.askdirectory(title="Elige la carpeta con diseños")
+        if not folder:
+            return
+        
+        # Confirmación
+        message = (
+            "¿Deseás reemplazar el índice actual y usar únicamente esta carpeta?\n\n"
+            "Esto no eliminará archivos originales, solamente los registros del índice."
+        )
+        if not messagebox.askyesno("Reemplazar índice", message, parent=self):
+            return
+        
+        # Crear diálogo de progreso
+        progress_dialog = tk.Toplevel(self)
+        progress_dialog.title("Indexando carpeta")
+        progress_dialog.geometry("500x250")
+        progress_dialog.configure(background="#080909")
+        progress_dialog.resizable(False, False)
+        
+        # Variables de progreso
+        progress_var = tk.DoubleVar()
+        current_file_var = tk.StringVar(value="Preparando...")
+        processed_var = tk.StringVar(value="0")
+        total_var = tk.StringVar(value="0")
+        errors_var = tk.StringVar(value="0")
+        cancel_flag = [False]
+        
+        # UI del diálogo
+        tk.Label(progress_dialog, text="Indexando carpeta", background="#080909", 
+                foreground="#ffffff", font=("Segoe UI", 12, "bold")).pack(pady=(15, 10))
+        
+        tk.Label(progress_dialog, textvariable=current_file_var, background="#080909", 
+                foreground="#aaaaaa", font=("Segoe UI", 9)).pack(pady=5)
+        
+        progress_bar = ttk.Progressbar(progress_dialog, variable=progress_var, maximum=100)
+        progress_bar.pack(fill="x", padx=20, pady=10)
+        
+        stats_frame = tk.Frame(progress_dialog, background="#080909")
+        stats_frame.pack(pady=10)
+        
+        tk.Label(stats_frame, text="Procesados:", background="#080909", foreground="#aaaaaa").grid(row=0, column=0, padx=5)
+        tk.Label(stats_frame, textvariable=processed_var, background="#080909", foreground="#ffffff").grid(row=0, column=1, padx=5)
+        
+        tk.Label(stats_frame, text="Total:", background="#080909", foreground="#aaaaaa").grid(row=0, column=2, padx=5)
+        tk.Label(stats_frame, textvariable=total_var, background="#080909", foreground="#ffffff").grid(row=0, column=3, padx=5)
+        
+        tk.Label(stats_frame, text="Errores:", background="#080909", foreground="#aaaaaa").grid(row=0, column=4, padx=5)
+        tk.Label(stats_frame, textvariable=errors_var, background="#080909", foreground="#ff6b6b").grid(row=0, column=5, padx=5)
+        
+        cancel_btn = ttk.Button(progress_dialog, text="Cancelar", command=lambda: cancel_flag.__setitem__(0, True))
+        cancel_btn.pack(pady=10)
+        
+        def index_thread():
+            try:
+                # Paso 1: Crear backup
+                current_file_var.set("Creando copia de seguridad...")
+                backup_path = self.database.backup_database()
+                
+                # Paso 2: Eliminar registros anteriores
+                current_file_var.set("Eliminando registros anteriores...")
+                removal_stats = self.database.remove_images_outside_folder(folder)
+                
+                # Paso 3: Guardar nueva carpeta raíz
+                self.database.save_library_root(folder)
+                
+                # Paso 3.5: Reiniciar el watcher con la nueva carpeta
+                self.after(0, lambda: self._restart_banco_watcher(folder))
+                
+                # Paso 4: Escanear carpeta
+                from app.indexer.scanner import scan_folder
+                images = list(scan_folder(folder, follow_symlinks=False))
+                total_var.set(str(len(images)))
+                
+                indexed_count = 0
+                duplicate_count = 0
+                error_count = 0
+                
+                for i, image in enumerate(images):
+                    if cancel_flag[0]:
+                        break
+                    
+                    current_file_var.set(image["name"])
+                    processed_var.set(str(i + 1))
+                    progress_var.set((i / len(images)) * 100)
+                    
+                    try:
+                        self.database.upsert(image)
+                        indexed_count += 1
+                    except Exception as e:
+                        error_count += 1
+                        errors_var.set(str(error_count))
+                
+                # Paso 5: Limpiar archivos faltantes
+                current_file_var.set("Verificando archivos...")
+                self.database.remove_missing()
+                self.database.commit()
+                
+                # Paso 6: Actualizar interfaz
+                self.after(0, lambda: self.queue_library_refresh(self.search.query.get(), include_collections=True))
+                
+                # Mostrar resumen
+                summary = (
+                    f"Carpeta indexada: {folder}\n\n"
+                    f"Archivos encontrados: {len(images)}\n"
+                    f"Archivos indexados: {indexed_count}\n"
+                    f"Duplicados: {duplicate_count}\n"
+                    f"Errores: {error_count}\n\n"
+                    f"Backup guardado en:\n{backup_path}"
+                )
+                self.after(0, lambda: messagebox.showinfo("Indexación completada", summary, parent=self))
+                self.after(0, lambda: self.status.set(f"Índice reemplazado: {indexed_count} diseños."))
+                
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Error", f"No se pudo completar la indexación: {str(e)}", parent=self))
+            finally:
+                self.after(0, progress_dialog.destroy)
+        
+        import threading
+        thread = threading.Thread(target=index_thread, daemon=True)
+        thread.start()
+    
+    def add_folder_to_index(self):
+        """Agrega una carpeta al índice existente sin eliminar registros anteriores."""
+        folder = filedialog.askdirectory(title="Elige la carpeta con diseños")
+        if not folder:
+            return
+        
+        # Crear diálogo de progreso
+        progress_dialog = tk.Toplevel(self)
+        progress_dialog.title("Agregando carpeta al índice")
+        progress_dialog.geometry("500x250")
+        progress_dialog.configure(background="#080909")
+        progress_dialog.resizable(False, False)
+        
+        # Variables de progreso
+        progress_var = tk.DoubleVar()
+        current_file_var = tk.StringVar(value="Preparando...")
+        processed_var = tk.StringVar(value="0")
+        total_var = tk.StringVar(value="0")
+        errors_var = tk.StringVar(value="0")
+        cancel_flag = [False]
+        
+        # UI del diálogo
+        tk.Label(progress_dialog, text="Agregando carpeta al índice", background="#080909", 
+                foreground="#ffffff", font=("Segoe UI", 12, "bold")).pack(pady=(15, 10))
+        
+        tk.Label(progress_dialog, textvariable=current_file_var, background="#080909", 
+                foreground="#aaaaaa", font=("Segoe UI", 9)).pack(pady=5)
+        
+        progress_bar = ttk.Progressbar(progress_dialog, variable=progress_var, maximum=100)
+        progress_bar.pack(fill="x", padx=20, pady=10)
+        
+        stats_frame = tk.Frame(progress_dialog, background="#080909")
+        stats_frame.pack(pady=10)
+        
+        tk.Label(stats_frame, text="Procesados:", background="#080909", foreground="#aaaaaa").grid(row=0, column=0, padx=5)
+        tk.Label(stats_frame, textvariable=processed_var, background="#080909", foreground="#ffffff").grid(row=0, column=1, padx=5)
+        
+        tk.Label(stats_frame, text="Total:", background="#080909", foreground="#aaaaaa").grid(row=0, column=2, padx=5)
+        tk.Label(stats_frame, textvariable=total_var, background="#080909", foreground="#ffffff").grid(row=0, column=3, padx=5)
+        
+        tk.Label(stats_frame, text="Errores:", background="#080909", foreground="#aaaaaa").grid(row=0, column=4, padx=5)
+        tk.Label(stats_frame, textvariable=errors_var, background="#080909", foreground="#ff6b6b").grid(row=0, column=5, padx=5)
+        
+        cancel_btn = ttk.Button(progress_dialog, text="Cancelar", command=lambda: cancel_flag.__setitem__(0, True))
+        cancel_btn.pack(pady=10)
+        
+        def index_thread():
+            try:
+                # Escanear carpeta
+                from app.indexer.scanner import scan_folder
+                images = list(scan_folder(folder, follow_symlinks=False))
+                total_var.set(str(len(images)))
+                
+                indexed_count = 0
+                duplicate_count = 0
+                error_count = 0
+                
+                for i, image in enumerate(images):
+                    if cancel_flag[0]:
+                        break
+                    
+                    current_file_var.set(image["name"])
+                    processed_var.set(str(i + 1))
+                    progress_var.set((i / len(images)) * 100)
+                    
+                    try:
+                        self.database.upsert(image)
+                        indexed_count += 1
+                    except Exception as e:
+                        error_count += 1
+                        errors_var.set(str(error_count))
+                
+                # Limpiar archivos faltantes
+                current_file_var.set("Verificando archivos...")
+                self.database.remove_missing()
+                self.database.commit()
+                
+                # Actualizar interfaz
+                self.after(0, lambda: self.queue_library_refresh(self.search.query.get(), include_collections=True))
+                
+                # Mostrar resumen
+                summary = (
+                    f"Carpeta agregada: {folder}\n\n"
+                    f"Archivos encontrados: {len(images)}\n"
+                    f"Archivos indexados: {indexed_count}\n"
+                    f"Errores: {error_count}"
+                )
+                self.after(0, lambda: messagebox.showinfo("Indexación completada", summary, parent=self))
+                self.after(0, lambda: self.status.set(f"Carpeta agregada: {indexed_count} diseños."))
+                
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Error", f"No se pudo completar la indexación: {str(e)}", parent=self))
+            finally:
+                self.after(0, progress_dialog.destroy)
+        
+        import threading
+        thread = threading.Thread(target=index_thread, daemon=True)
+        thread.start()
+
 
     def refresh(self, query=None):
         query = self.search.query.get() if query is None else query
         tags = self.active_tags()
         categories = self.active_categories()
-        total = self.database.count(query, self.current_extension, tags, categories)
+        untagged_only = self.untagged_only.get()
+        total = self.database.count(query, self.current_extension, tags, categories, untagged_only)
         images = self.database.search(
-            query, limit=self.gallery.display_capacity(), extension=self.current_extension, tags=tags, categories=categories, random_order=True
+            query, limit=self.gallery.display_capacity(), extension=self.current_extension, tags=tags, categories=categories, random_order=False, untagged_only=untagged_only
         )
+        self.gallery.set_search_context(query)
         self.gallery.show_images(images)
+        self.search.set_result_summary(total, len(images), query)
+        self.refresh_filter_chips()
+        # NO actualizar "Últimos Procesados" aquí - solo cuando sea necesario
 
     def predict_search(self, query: str):
         """Busca por etiquetas, categorías, clientes y planchas, nunca por nombre de archivo."""
-        if not query.strip():
+        if len(query.strip()) < 2:
             return
         tags = self.active_tags()
         categories = self.active_categories()
-        total = self.database.count(query, self.current_extension, tags, categories)
+        untagged_only = self.untagged_only.get()
+        # Mientras se escribe priorizamos tarjetas rápidas. El conteo exacto
+        # se calcula al confirmar la búsqueda con Enter.
         images = self.database.search(
-            query, limit=50, extension=self.current_extension, tags=tags, categories=categories, random_order=False
+            query, limit=30, extension=self.current_extension, tags=tags, categories=categories, random_order=False, untagged_only=untagged_only
         )
+        self.gallery.set_search_context(query)
         self.gallery.show_images(images)
-        self.status.set(f"Coincidencias predictivas: {len(images)} de {total} diseños (máximo 50)." if total else "No hay coincidencias predictivas.")
+        self.search.set_result_summary(len(images), len(images), query)
+        self.status.set(
+            f"Coincidencias predictivas: {len(images)} (máximo 30)."
+            if images else "No hay coincidencias predictivas."
+        )
 
     def show_random_grid(self):
         """Llena la cuadrícula con la cantidad de diseños elegida por el usuario."""
@@ -8467,6 +17025,13 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         images = self.database.featured_random(self.gallery.display_capacity())
         self.gallery.show_images(images)
         self.status.set(f"Aleatorios destacados: {len(images)} de {total} diseños." if total else "No hay diseños para mostrar.")
+
+    def show_recent_grid(self):
+        """Muestra el banco en orden descendente: el último procesado primero."""
+        self.search.query.set("")
+        images = self.database.search(limit=self.gallery.display_capacity(), random_order=False)
+        self.gallery.show_images(images)
+        self.status.set(f"Últimos procesados: {len(images)} diseño(s), del más reciente al más antiguo." if images else "No hay diseños para mostrar.")
 
     def prepare_visual_scores(self):
         candidates = self.database.images_missing_visual_score()
@@ -8491,34 +17056,292 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
 
         threading.Thread(target=work, daemon=True).start()
 
+    def prepare_visual_index(self, progress=None, complete=None, allow_migration: bool = True):
+        """Indexa nuevas imágenes en segundo plano para acelerar búsquedas."""
+        if getattr(self, "_visual_indexing", False):
+            return
+        
+        # Verificar si hay migración de versión pendiente
+        from app.ai.visual_search import VISUAL_INDEX_VERSION
+        current_version = self.database.get_visual_index_version()
+        
+        if current_version != VISUAL_INDEX_VERSION:
+            if not allow_migration:
+                return
+            print(f"Detectada migración de índice visual: {current_version} -> {VISUAL_INDEX_VERSION}")
+            self.migrate_visual_index(current_version, VISUAL_INDEX_VERSION, progress=progress, complete=complete)
+            return
+        
+        # Tambien reintenta archivos omitidos o con una firma antigua aunque
+        # la version global del banco ya haya sido actualizada.
+        candidates = self.database.images_needing_index_migration(VISUAL_INDEX_VERSION)
+        if not candidates:
+            if complete:
+                complete(0, 0)
+            return
+        self._visual_indexing = True
+
+        def work():
+            from app.ai.visual_search import build_visual_signature, _enable_diagnostic_log
+
+            # Activar logging diagnóstico para indexación
+            _enable_diagnostic_log("visual_index_diagnostic.log")
+
+            batch = []
+            indexed = 0
+            skipped = 0
+            try:
+                for position, item in enumerate(candidates, start=1):
+                    try:
+                        # Verificar que el archivo existe antes de procesar
+                        from pathlib import Path
+                        if not Path(item["path"]).exists():
+                            print(f"Archivo no encontrado, saltando: {item['path']}")
+                            skipped += 1
+                            continue
+                        
+                        signatures = None
+                        # Usar normalización unificada para consistencia
+                        embedding = None
+                        batch.append((build_visual_signature(item["path"], embedding=item.get("existing_embedding"), text=item.get("index_text", "")), float(item["modified"]), item["path"]))
+                        indexed += 1
+                    except Exception as e:
+                        # Un archivo dañado no debe detener el aprendizaje del banco.
+                        print(f"Error procesando {item.get('path', 'unknown')}: {e}")
+                        skipped += 1
+                        continue
+                    if len(batch) >= 20:
+                        completed, batch = batch, []
+                        self.after(0, lambda values=completed: self.database.update_visual_signatures(values))
+                    if progress and (position == len(candidates) or position % 20 == 0):
+                        self.after(0, lambda done=position: progress(done, len(candidates)))
+                if batch:
+                    self.after(0, lambda values=batch: self.database.update_visual_signatures(values))
+            finally:
+                def finish():
+                    self._visual_indexing = False
+                    if complete:
+                        complete(indexed, skipped)
+                self.after(0, finish)
+
+        threading.Thread(target=work, daemon=True, name="visionvault-visual-index").start()
+    def migrate_visual_index(self, from_version: int, to_version: int, progress=None, complete=None):
+        """Migra el índice visual completo cuando cambia la versión."""
+        if getattr(self, "_visual_indexing", False):
+            print("Ya hay una operación de indexación en progreso")
+            return
+        
+        self._visual_indexing = True
+        
+        def work():
+            from app.ai.visual_search import build_visual_signature, _enable_diagnostic_log
+            
+            _enable_diagnostic_log("visual_migration_diagnostic.log")
+            
+            # Obtener todas las imágenes que necesitan migración
+            candidates = self.database.images_needing_index_migration(to_version)
+            
+            if not candidates:
+                print("No hay imágenes que necesiten migración")
+                def finish_empty_migration():
+                    self._visual_indexing = False
+                    self.database.set_visual_index_version(to_version)
+                    if complete:
+                        complete(0, 0)
+                self.after(0, finish_empty_migration)
+                return
+            
+            print(f"Migrando {len(candidates)} imágenes del índice visual...")
+            
+            batch = []
+            total = len(candidates)
+            indexed = 0
+            skipped = 0
+            try:
+                for i, item in enumerate(candidates):
+                    if getattr(self, "_visual_index_cancel", False):
+                        print("Migración cancelada por usuario")
+                        break
+                    
+                    try:
+                        from pathlib import Path
+                        if not Path(item["path"]).exists():
+                            print(f"Archivo no encontrado, saltando: {item['path']}")
+                            skipped += 1
+                            continue
+                        
+                        signatures = embedding = None
+                        batch.append((build_visual_signature(item["path"], embedding=item.get("existing_embedding"), text=item.get("index_text", "")), float(item["modified"]), item["path"]))
+                        indexed += 1
+                        
+                        if len(batch) >= 20 or i == total - 1:
+                            completed, batch = batch, []
+                            self.after(0, lambda values=completed: self.database.update_visual_signatures(values))
+                            print(f"Progreso migración: {i+1}/{total} ({(i+1)/total*100:.1f}%)")
+                        if progress and (i + 1 == total or (i + 1) % 20 == 0):
+                            self.after(0, lambda done=i + 1: progress(done, total))
+                    except Exception as e:
+                        print(f"Error migrando {item.get('path', 'unknown')}: {e}")
+                        skipped += 1
+                        continue
+                
+                # Solo actualizar versión si se completó exitosamente
+                if not getattr(self, "_visual_index_cancel", False):
+                    self.after(0, lambda: self.database.set_visual_index_version(to_version))
+                    print(f"Migración completada. Índice actualizado a versión {to_version}")
+                else:
+                    print("Migración cancelada, versión no actualizada")
+                    
+            finally:
+                def finish_migration():
+                    self._visual_indexing = False
+                    if complete:
+                        complete(indexed, skipped)
+                self.after(0, finish_migration)
+        
+        self._visual_index_cancel = False
+        threading.Thread(target=work, daemon=True, name="visionvault-visual-migration").start()
+    
+    def cancel_visual_migration(self):
+        """Cancela la migración del índice visual en progreso."""
+        if getattr(self, "_visual_indexing", False):
+            self._visual_index_cancel = True
+            print("Cancelando migración del índice visual...")
+
+
+    def verify_and_rebuild_index(self):
+        """Verifica el índice visual y reconstruye registros faltantes o corruptos."""
+        from pathlib import Path
+        
+        # Obtener todas las imágenes en la base de datos
+        all_images = self.database.connection.execute("SELECT path, modified, visual_signature, visual_signature_modified FROM images").fetchall()
+        
+        missing_or_invalid = []
+        paths_not_found = []
+        
+        for row in all_images:
+            path, modified, signature, sig_modified = row
+            
+            # Verificar si el archivo existe
+            if not Path(path).exists():
+                paths_not_found.append(path)
+                continue
+            
+            # Verificar si tiene signature válida
+            if not signature or signature == '':
+                missing_or_invalid.append({"path": path, "modified": modified})
+                continue
+            
+            # Verificar si la signature está desactualizada
+            try:
+                if sig_modified != modified:
+                    missing_or_invalid.append({"path": path, "modified": modified})
+            except (TypeError, ValueError):
+                missing_or_invalid.append({"path": path, "modified": modified})
+        
+        # Reportar resultados
+        print(f"=== VERIFICACIÓN DE ÍNDICE VISUAL ===")
+        print(f"Total imágenes en BD: {len(all_images)}")
+        print(f"Archivos no encontrados: {len(paths_not_found)}")
+        print(f"Registros faltantes o desactualizados: {len(missing_or_invalid)}")
+        
+        if paths_not_found:
+            print("\nArchivos no encontrados (primeros 10):")
+            for p in paths_not_found[:10]:
+                print(f"  - {p}")
+        
+        if missing_or_invalid:
+            print("\nRegistros a reconstruir (primeros 10):")
+            for item in missing_or_invalid[:10]:
+                print(f"  - {item['path']}")
+            
+            # Preguntar si desea reconstruir
+            response = input(f"\n¿Desea reconstruir {len(missing_or_invalid)} registros faltantes? (s/n): ")
+            if response.lower() == 's':
+                self._rebuild_index_records(missing_or_invalid)
+    
+    def _rebuild_index_records(self, items_to_rebuild):
+        """Reconstruye registros específicos del índice visual."""
+        from app.ai.visual_search import build_visual_signature
+        
+        print(f"Reconstruyendo {len(items_to_rebuild)} registros...")
+        
+        batch = []
+        for i, item in enumerate(items_to_rebuild):
+            try:
+                signatures = embedding = None
+                batch.append((build_visual_signature(item["path"], embedding=item.get("existing_embedding"), text=item.get("index_text", "")), float(item["modified"]), item["path"]))
+                
+                if len(batch) >= 20 or i == len(items_to_rebuild) - 1:
+                    self.database.update_visual_signatures(batch)
+                    batch = []
+                    print(f"Progreso: {i+1}/{len(items_to_rebuild)}")
+            except Exception as e:
+                print(f"Error reconstruyendo {item['path']}: {e}")
+                continue
+        
+        print("Reconstrucción completada.")
+
     def preview_image(self, image):
         if not image:
             return
         from app.indexer.thumbnails import load_thumbnail
 
         preview = tk.Toplevel(self)
-        preview.title(image["name"])
-        preview.geometry("1080x720")
-        preview.minsize(760, 520)
-        preview.configure(background="#080909")
+        preview.title(f"Vista previa - {image['name']}")
+        preview.geometry("1220x780")
+        preview.minsize(900, 600)
+        preview.configure(background="#101112")
         preview.transient(self)
         self.center_window(preview)
-        content = tk.Frame(preview, background="#080909")
-        content.pack(fill="both", expand=True, padx=16, pady=16)
-        visual = tk.Frame(content, background="#080909")
-        visual.pack(side="left", fill="both", expand=True)
+        header = tk.Frame(preview, background="#18191b", height=70)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        header_text = tk.Frame(header, background="#18191b")
+        header_text.pack(side="left", fill="both", expand=True, padx=24, pady=11)
+        tk.Label(header_text, text=image["name"], anchor="w", background="#18191b", foreground="#f7f2ee", font=("Bahnschrift SemiCondensed", 16, "bold")).pack(fill="x")
+        tk.Label(header_text, text="Vista previa del diseño", anchor="w", background="#18191b", foreground="#a9a29c", font=("Bahnschrift", 9)).pack(fill="x", pady=(2, 0))
+        ttk.Button(header, text="Cerrar", style="Secondary.TButton", command=preview.destroy).pack(side="right", padx=20, pady=18)
+
+        content = tk.Frame(preview, background="#101112")
+        content.pack(fill="both", expand=True, padx=20, pady=(16, 20))
+        visual = tk.Frame(content, background="#101112")
+        visual.pack(side="left", fill="both", expand=True, padx=(0, 18))
+        tk.Label(visual, text="DISEÑO", anchor="w", background="#101112", foreground="#d64a64", font=("Bahnschrift SemiCondensed", 10, "bold")).pack(fill="x", pady=(0, 7))
+        stage = tk.Canvas(visual, background="#141517", highlightthickness=1, highlightbackground="#303238")
+        stage.pack(fill="both", expand=True)
         photo = load_thumbnail(image["path"], (760, 650))
         if photo:
-            label = ttk.Label(visual, image=photo, style="Card.TLabel")
-            label.image = photo
-            label.pack(expand=True)
-        else:
-            ttk.Label(visual, text="No se pudo generar la vista previa.", padding=24).pack(expand=True)
+            def redraw_stage(_event=None):
+                stage.delete("all")
+                width, height = max(stage.winfo_width(), 1), max(stage.winfo_height(), 1)
+                square = 18
+                for y in range(0, height, square):
+                    for x in range(0, width, square):
+                        color = "#1c1e20" if (x // square + y // square) % 2 else "#17191b"
+                        stage.create_rectangle(x, y, x + square, y + square, fill=color, outline="")
+                stage.create_image(width // 2, height // 2, image=photo, anchor="center")
+                stage.image = photo
 
-        details = tk.Frame(content, width=290, background="#1c1c1c")
-        details.pack(side="right", fill="y", padx=(16, 0))
-        details.pack_propagate(False)
-        tk.Label(details, text="Información", background="#1c1c1c", foreground="#f3e0d2", font=("Bahnschrift SemiCondensed", 13, "bold")).pack(pady=(14, 10))
+            stage.bind("<Configure>", redraw_stage)
+        else:
+            stage.create_text(300, 200, text="No se pudo generar la vista previa.", fill="#b9a79b")
+        tk.Label(visual, text="El patrón de fondo permite identificar las zonas transparentes.", anchor="w", background="#101112", foreground="#8e908f", font=("Bahnschrift", 9)).pack(fill="x", pady=(8, 0))
+
+        details_shell = tk.Frame(content, width=350, background="#18191b")
+        details_shell.pack(side="right", fill="y")
+        details_shell.pack_propagate(False)
+        details_canvas = tk.Canvas(details_shell, background="#18191b", highlightthickness=0, borderwidth=0)
+        details_scrollbar = ttk.Scrollbar(details_shell, orient="vertical", command=details_canvas.yview)
+        details_canvas.configure(yscrollcommand=details_scrollbar.set)
+        details_scrollbar.pack(side="right", fill="y")
+        details_canvas.pack(side="left", fill="both", expand=True)
+        details = tk.Frame(details_canvas, background="#18191b")
+        details_window = details_canvas.create_window((0, 0), window=details, anchor="nw")
+        details.bind("<Configure>", lambda _event: details_canvas.configure(scrollregion=details_canvas.bbox("all")))
+        details_canvas.bind("<Configure>", lambda _event: details_canvas.itemconfigure(details_window, width=details_canvas.winfo_width()))
+        tk.Label(details, text="INFORMACIÓN", background="#18191b", foreground="#d64a64", font=("Bahnschrift SemiCondensed", 10, "bold")).pack(anchor="w", padx=18, pady=(18, 8))
+        tk.Label(details, text="Datos del archivo", background="#18191b", foreground="#f7f2ee", font=("Bahnschrift SemiCondensed", 16, "bold")).pack(anchor="w", padx=18)
         source = Path(image["path"])
         stat = source.stat()
         dimensions = self.image_dimensions(source)
@@ -8530,27 +17353,29 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
             ("Modificado", datetime.fromtimestamp(stat.st_mtime).strftime("%d/%m/%Y %H:%M")),
         )
         for title, value in entries:
-            row = tk.Frame(details, background="#1c1c1c")
-            row.pack(fill="x", padx=14, pady=3)
-            tk.Label(row, text=title, width=11, anchor="w", background="#1c1c1c", foreground="#a9a9a9").pack(side="left")
-            tk.Label(row, text=value, anchor="w", background="#1c1c1c", foreground="#f3e0d2", wraplength=150).pack(side="left", fill="x", expand=True)
-        tk.Label(details, text="Ruta del archivo", background="#1c1c1c", foreground="#f3e0d2", font=("Bahnschrift SemiCondensed", 11, "bold")).pack(pady=(18, 5))
+            row = tk.Frame(details, background="#202124")
+            row.pack(fill="x", padx=18, pady=2)
+            tk.Label(row, text=title.upper(), width=12, anchor="w", background="#202124", foreground="#96999f", font=("Bahnschrift", 8, "bold")).pack(side="left", padx=(9, 4), pady=7)
+            tk.Label(row, text=value, anchor="w", background="#202124", foreground="#f3e0d2", wraplength=180, font=("Bahnschrift", 9)).pack(side="left", fill="x", expand=True, padx=(0, 8), pady=7)
+        tk.Label(details, text="UBICACIÓN", background="#18191b", foreground="#d64a64", font=("Bahnschrift SemiCondensed", 10, "bold")).pack(anchor="w", padx=18, pady=(18, 6))
         path_box = ttk.Entry(details)
         path_box.insert(0, str(source))
         path_box.configure(state="readonly")
-        path_box.pack(fill="x", padx=14)
-        ttk.Button(details, text="Buscar archivo", command=lambda: self.reveal_in_folder(source)).pack(anchor="e", padx=14, pady=(6, 0))
-        ttk.Button(details, text="Buscar con Google Lens", command=lambda: self.open_google_lens()).pack(anchor="e", padx=14, pady=(6, 0))
+        path_box.pack(fill="x", padx=18)
+        actions = tk.Frame(details, background="#18191b")
+        actions.pack(fill="x", padx=18, pady=(8, 0))
+        ttk.Button(actions, text="Abrir ubicación", command=lambda: self.reveal_in_folder(source)).pack(side="left", fill="x", expand=True)
+        ttk.Button(actions, text="Google Lens", style="Secondary.TButton", command=lambda: self.open_google_lens()).pack(side="left", padx=(7, 0))
         ttk.Button(
             details,
             text="Eliminar archivo",
             command=lambda current=image, window=preview: self.delete_sticker_file(current, window),
             style="Danger.TButton",
-        ).pack(fill="x", padx=14, pady=(10, 0))
+        ).pack(fill="x", padx=18, pady=(10, 0))
         category = (image.get("category") or "").strip()
-        tk.Label(details, text="Categoría", background="#1c1c1c", foreground="#f3e0d2", font=("Bahnschrift SemiCondensed", 11, "bold")).pack(pady=(15, 5))
-        category_row = tk.Frame(details, background="#1c1c1c")
-        category_row.pack(fill="x", padx=14)
+        tk.Label(details, text="CATEGORÍA", background="#18191b", foreground="#d64a64", font=("Bahnschrift SemiCondensed", 10, "bold")).pack(anchor="w", padx=18, pady=(18, 6))
+        category_row = tk.Frame(details, background="#18191b")
+        category_row.pack(fill="x", padx=18)
         category_value = tk.StringVar(value=category)
         category_options = [name for name, _count in self.database.category_counts()]
         category_box = ttk.Combobox(category_row, textvariable=category_value, values=category_options, state="normal")
@@ -8563,26 +17388,26 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         category_box.bind("<Return>", lambda _event, current=image: self.set_preview_category(current, category_value.get(), preview))
         if category:
             ttk.Button(category_row, text="Quitar", style="Secondary.TButton", command=lambda current=image, value=category: self.clear_preview_category(current, value, preview)).pack(side="left", padx=(6, 0))
-        tk.Label(details, text="Etiquetas", background="#1c1c1c", foreground="#f3e0d2", font=("Bahnschrift SemiCondensed", 11, "bold")).pack(pady=(18, 5))
+        tk.Label(details, text="ETIQUETAS", background="#18191b", foreground="#d64a64", font=("Bahnschrift SemiCondensed", 10, "bold")).pack(anchor="w", padx=18, pady=(18, 6))
         tags_text = tk.StringVar(value=image.get("tags") or "Sin etiquetas")
-        tk.Label(details, textvariable=tags_text, anchor="w", justify="left", wraplength=245, background="#101010", foreground="#b9a79b", padx=8, pady=7).pack(fill="x", padx=14)
+        tk.Label(details, textvariable=tags_text, anchor="w", justify="left", wraplength=290, background="#101112", foreground="#d3c6bd", padx=10, pady=8).pack(fill="x", padx=18)
         tag_value = tk.StringVar()
-        tag_bar = tk.Frame(details, background="#1c1c1c")
-        tag_bar.pack(fill="x", padx=14, pady=(8, 0))
+        tag_bar = tk.Frame(details, background="#18191b")
+        tag_bar.pack(fill="x", padx=18, pady=(8, 0))
         tag_entry = ttk.Entry(tag_bar, textvariable=tag_value, style="Search.TEntry")
         tag_entry.pack(side="left", fill="x", expand=True)
         ttk.Button(tag_bar, text="Agregar", command=lambda: self.add_preview_tag(image, tag_value, tags_text)).pack(side="left", padx=(6, 0))
         tag_entry.bind("<Return>", lambda _event: self.add_preview_tag(image, tag_value, tags_text))
         existing_tags = [tag.strip() for tag in (image.get("tags") or "").split(" · ") if tag.strip()]
         if existing_tags:
-            remove_bar = tk.Frame(details, background="#1c1c1c")
-            remove_bar.pack(fill="x", padx=14, pady=(6, 0))
+            remove_bar = tk.Frame(details, background="#18191b")
+            remove_bar.pack(fill="x", padx=18, pady=(6, 0))
             remove_tag_value = tk.StringVar(value=existing_tags[0])
             ttk.Combobox(remove_bar, textvariable=remove_tag_value, values=existing_tags, state="readonly", width=19).pack(side="left", fill="x", expand=True)
             ttk.Button(remove_bar, text="Quitar", style="Secondary.TButton", command=lambda: self.remove_preview_tag(image, remove_tag_value.get(), tags_text, preview)).pack(side="left", padx=(6, 0))
         tag_hint = tk.StringVar(value="")
-        hint_label = tk.Label(details, textvariable=tag_hint, anchor="w", background="#1c1c1c", foreground="#b9a79b", cursor="hand2")
-        hint_label.pack(fill="x", padx=14, pady=(3, 0))
+        hint_label = tk.Label(details, textvariable=tag_hint, anchor="w", background="#18191b", foreground="#b9a79b", cursor="hand2")
+        hint_label.pack(fill="x", padx=18, pady=(3, 0))
 
         def update_preview_suggestion(*_args):
             matches = self.database.suggestions(tag_value.get(), limit=1)
@@ -8592,7 +17417,17 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
 
         tag_value.trace_add("write", update_preview_suggestion)
         hint_label.bind("<Button-1>", lambda _event: tag_value.set(getattr(hint_label, "closest", "")) if getattr(hint_label, "closest", "") else None)
-        ttk.Button(details, text="Analizar con IA", command=lambda: self.analyze_image(image, preview)).pack(fill="x", padx=14, pady=(12, 0))
+        ttk.Button(details, text="Analizar con IA", command=lambda: self.analyze_image(image, preview)).pack(fill="x", padx=18, pady=(14, 18))
+
+        def scroll_details(event):
+            details_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def bind_scroll(widget):
+            widget.bind("<MouseWheel>", scroll_details, add="+")
+            for child in widget.winfo_children():
+                bind_scroll(child)
+
+        preview.after_idle(lambda: bind_scroll(details))
 
     @staticmethod
     def human_size(size: int) -> str:
@@ -8733,27 +17568,46 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         progress.start(12)
 
         provider = self.ai_provider.get()
-        model = self.gemini_model if provider == "Gemini" else "local-v1"
-        cache_model = f"{model}:structured-v3" if provider == "Gemini" else model
+        model = self.gemini_model if provider == "Gemini" else "local-v4"
+        cache_model = f"{model}:structured-v6" if provider == "Gemini" else model
         cached = self.database.ai_result(image["path"], provider, cache_model, image["modified"])
-        if cached:
+        from app.ai.result import has_usable_analysis
+        if has_usable_analysis(cached):
             status.set("Resultado recuperado al instante desde la caché.")
             self.after(60, lambda: self.show_analysis_result(dialog, image, cached))
             return
 
         def update_progress(message):
-            if dialog.winfo_exists():
-                self.after(0, lambda: status.set(message))
+            """Actualiza la UI desde el hilo principal.
+
+            Los proveedores de IA se ejecutan en un hilo de trabajo. Consultar
+            un widget de Tk desde ese hilo (incluso ``winfo_exists``) puede
+            cortar el análisis silenciosamente en Windows.
+            """
+            def apply_progress():
+                if dialog.winfo_exists():
+                    status.set(message)
+
+            self.after(0, apply_progress)
 
         def work():
-            if provider == "Gemini":
-                from app.ai.gemini import analyze_image
-                result = analyze_image(image["path"], self.gemini_api_key, self.gemini_model, update_progress)
-            else:
-                from app.ai.analyzer import analyze_image
-                result = analyze_image(image["path"], update_progress)
+            try:
+                from app.ai.fallback import analyze_image_with_fallback
+                result = analyze_image_with_fallback(
+                    image["path"], provider, self.gemini_api_key,
+                    self.gemini_model, update_progress,
+                )
+            except Exception as error:
+                # No dejar el diálogo de progreso abierto si una dependencia o
+                # el proveedor falla antes de devolver su resultado normal.
+                result = {
+                    "text": "", "caption": "", "suggestions": [],
+                    "category": "", "names": [], "references": [],
+                    "confidence": "", "missing": [],
+                    "errors": [f"No se pudo completar el análisis: {error}"],
+                }
             def complete():
-                if not result.get("missing") and not result.get("errors"):
+                if not result.get("missing") and not result.get("errors") and has_usable_analysis(result):
                     self.database.save_ai_result(image["path"], provider, cache_model, image["modified"], result)
                 self.show_analysis_result(dialog, image, result)
             self.after(0, complete)
@@ -8763,53 +17617,88 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
     def show_analysis_result(self, dialog, image, result):
         from app.ai.naming import sticker_names
 
+        # Los resultados almacenados de versiones anteriores y los errores de
+        # red pueden no tener todas las claves. La pantalla debe poder mostrar
+        # el detalle en vez de fallar al intentar abrirlo.
+        result = {
+            "text": "", "caption": "", "suggestions": [], "category": "",
+            "names": [], "references": [], "confidence": "", "missing": [],
+            "errors": [],
+        } | (result or {})
+
         for widget in dialog.winfo_children():
             widget.destroy()
         dialog.geometry("560x560")
-        ttk.Label(dialog, text="Resultados de IA", style="Title.TLabel", padding=(18, 14, 18, 4)).pack(anchor="w")
+        canvas = tk.Canvas(dialog, background="#080909", highlightthickness=0)
+        scrollbar = ttk.Scrollbar(dialog, orient="vertical", command=canvas.yview)
+        body = tk.Frame(canvas, background="#080909")
+        body_window = canvas.create_window((0, 0), window=body, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        body.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(body_window, width=event.width))
+        canvas.bind("<MouseWheel>", lambda event: canvas.yview_scroll(int(-event.delta / 120), "units"))
+        ttk.Label(body, text="Resultados de IA", style="Title.TLabel", padding=(18, 14, 18, 4)).pack(anchor="w")
+        provider_used = result.get("provider_used")
+        if provider_used:
+            ttk.Label(body, text=f"Analizado con: {provider_used}", style="Muted.TLabel", padding=(18, 0, 18, 5)).pack(anchor="w")
         if result["missing"]:
-            ttk.Label(dialog, text="Instala las dependencias de IA para activar: " + ", ".join(result["missing"]), style="Muted.TLabel", padding=(18, 0, 18, 8), wraplength=470).pack(anchor="w")
+            ttk.Label(body, text="Instala las dependencias de IA para activar: " + ", ".join(result["missing"]), style="Muted.TLabel", padding=(18, 0, 18, 8), wraplength=470).pack(anchor="w")
         if result["errors"]:
-            ttk.Label(dialog, text="Detalle técnico: " + " · ".join(result["errors"]), style="Muted.TLabel", padding=(18, 0, 18, 8), wraplength=470).pack(anchor="w")
-        ttk.Label(dialog, text="Texto reconocido (español, inglés y números): " + (result["text"] or "No se detectó texto"), padding=(18, 4), wraplength=470).pack(anchor="w")
-        ttk.Label(dialog, text="Descripción visual: " + (result["caption"] or "No se pudo identificar el contenido"), padding=(18, 4), wraplength=470).pack(anchor="w")
+            ttk.Label(body, text="Detalle técnico: " + " · ".join(result["errors"]), style="Muted.TLabel", padding=(18, 0, 18, 8), wraplength=470).pack(anchor="w")
+        ttk.Label(body, text="Texto reconocido (español, inglés y números): " + (result["text"] or "No se detectó texto"), padding=(18, 4), wraplength=470).pack(anchor="w")
+        ttk.Label(body, text="Descripción visual: " + (result["caption"] or "No se pudo identificar el contenido"), padding=(18, 4), wraplength=470).pack(anchor="w")
         if result.get("confidence"):
-            ttk.Label(dialog, text="Confianza de identificación: " + result["confidence"], padding=(18, 4), style="Tag.TLabel").pack(anchor="w")
+            ttk.Label(body, text="Confianza de identificación: " + result["confidence"], padding=(18, 4), style="Tag.TLabel").pack(anchor="w")
         reference = (result.get("references") or [None])[0]
         category, generated_names = sticker_names(result["caption"], result["text"], reference)
         category = result.get("category") or category
         names = result.get("names") or generated_names
         if reference:
-            ttk.Label(dialog, text=f"Referencia reconocida: {reference['name']} · {reference['kind']}", padding=(18, 10, 18, 2), style="Tag.TLabel").pack(anchor="w")
-        ttk.Label(dialog, text="Categoría sugerida: " + category, padding=(18, 12, 18, 2), style="Tag.TLabel").pack(anchor="w")
+            ttk.Label(body, text=f"Referencia reconocida: {reference['name']} · {reference['kind']}", padding=(18, 10, 18, 2), style="Tag.TLabel").pack(anchor="w")
+        ttk.Label(body, text="Categoría sugerida: " + category, padding=(18, 12, 18, 2), style="Tag.TLabel").pack(anchor="w")
         category_value = tk.StringVar(value=category)
         category_options = [category] + [name for name, _count in self.database.category_counts() if name != category]
-        ttk.Combobox(dialog, textvariable=category_value, values=category_options, state="readonly", width=42).pack(anchor="w", padx=18, pady=(0, 6))
-        ttk.Label(dialog, text="Posibles nombres para Doccione:", padding=(18, 0, 18, 3)).pack(anchor="w")
-        name_value = tk.StringVar(value=names[0])
+        ttk.Combobox(body, textvariable=category_value, values=category_options, state="readonly", width=42).pack(anchor="w", padx=18, pady=(0, 6))
+        ttk.Label(body, text="Posibles nombres para Doccione:", padding=(18, 0, 18, 3)).pack(anchor="w")
+        name_value = tk.StringVar(value=names[0] if names else "Diseño sin descripción")
         for name in names[:5]:
-            tk.Radiobutton(dialog, text=name, variable=name_value, value=name, anchor="w", justify="left", background="#080909", foreground="#e7d3c4", activebackground="#080909", activeforeground="#fff4ec", selectcolor="#d60916", wraplength=500).pack(fill="x", padx=18)
-        ttk.Button(dialog, text="Usar este nombre", command=lambda: self.save_sticker_name(image, name_value.get(), category_value.get())).pack(anchor="e", padx=18, pady=(5, 2))
-        ttk.Label(dialog, text="Elige las palabras o descripciones que quieras guardar como etiqueta:", padding=(18, 14, 18, 5), wraplength=470).pack(anchor="w")
+            tk.Radiobutton(body, text=name, variable=name_value, value=name, anchor="w", justify="left", background="#080909", foreground="#e7d3c4", activebackground="#080909", activeforeground="#fff4ec", selectcolor="#d60916", wraplength=500).pack(fill="x", padx=18)
+        ttk.Button(body, text="Usar este nombre", command=lambda: self.save_sticker_name(image, name_value.get(), category_value.get())).pack(anchor="e", padx=18, pady=(5, 2))
+        ttk.Label(body, text="Etiquetas sugeridas por IA", padding=(18, 14, 18, 2), style="Title.TLabel").pack(anchor="w")
+        ttk.Label(body, text="Revisá cada propuesta antes de guardarla. Las equivalentes usan la etiqueta ya existente.", padding=(18, 0, 18, 5), style="Muted.TLabel", wraplength=510).pack(anchor="w")
         choices = []
         dismissed = self.database.dismissed_ai_tags(image["path"])
-        suggestions = [tag for tag in result["suggestions"] if tag.strip().casefold() not in dismissed]
+        from app.ai.tag_review import review_suggestions
+        existing_tags = [tag for tag, _count in self.database.tag_counts()]
+        suggestions = review_suggestions(result["suggestions"], existing_tags, dismissed)
 
-        def discard_suggestion(tag: str, row: tk.Widget):
-            self.database.dismiss_ai_tag(image["path"], tag)
-            choices[:] = [choice for choice in choices if choice[0].casefold() != tag.casefold()]
+        def discard_suggestion(item: dict, row: tk.Widget):
+            self.database.dismiss_ai_tag(image["path"], str(item["source_tag"]))
+            choices[:] = [choice for choice in choices if choice[0] != item["tag"]]
             row.destroy()
-            self.status.set(f"Etiqueta descartada: {tag}")
+            self.status.set(f"Etiqueta descartada: {item['source_tag']}")
 
+        last_group = None
         for suggestion in suggestions:
+            group = suggestion["group"]
+            if group != last_group:
+                tk.Label(body, text=str(group).upper(), background="#080909", foreground=COLORS.wine_active,
+                         font=(IDENTITY_FONT, 9, "bold")).pack(anchor="w", padx=18, pady=(8, 1))
+                last_group = group
             selected = tk.BooleanVar(value=True)
-            choices.append((suggestion, selected))
-            row = tk.Frame(dialog, background="#080909")
+            tag = str(suggestion["tag"])
+            choices.append((tag, selected))
+            row = tk.Frame(body, background="#080909")
             row.pack(fill="x", padx=18)
-            tk.Checkbutton(row, text=suggestion, variable=selected, anchor="w", justify="left", background="#080909", foreground="#e7d3c4", activebackground="#080909", activeforeground="#fff4ec", selectcolor="#d60916", wraplength=420).pack(side="left", fill="x", expand=True)
-            tk.Button(row, text="🗑", command=lambda tag=suggestion, widget=row: discard_suggestion(tag, widget), background="#080909", foreground="#e7d3c4", activebackground="#2a1010", activeforeground="#ff7777", borderwidth=0, cursor="hand2", padx=6).pack(side="right")
+            label = tag + ("  (ya existe)" if suggestion["existing"] else "")
+            tk.Checkbutton(row, text=label, variable=selected, anchor="w", justify="left", background="#080909", foreground="#e7d3c4", activebackground="#080909", activeforeground="#fff4ec", selectcolor="#d60916", wraplength=420).pack(side="left", fill="x", expand=True)
+            tk.Button(row, text="X", command=lambda item=suggestion, widget=row: discard_suggestion(item, widget), background="#080909", foreground="#e7d3c4", activebackground="#2a1010", activeforeground="#ff7777", borderwidth=0, cursor="hand2", padx=6).pack(side="right")
         if choices:
-            ttk.Button(dialog, text="Guardar seleccionadas", command=lambda: self.save_ai_tags(image, choices, dialog)).pack(anchor="e", padx=18, pady=16)
+            ttk.Button(body, text="Guardar seleccionadas", command=lambda: self.save_ai_tags(image, choices, dialog)).pack(anchor="e", padx=18, pady=16)
+        else:
+            ttk.Label(body, text="No hay etiquetas nuevas para revisar.", padding=(18, 14), style="Muted.TLabel").pack(anchor="w")
 
     def save_ai_tags(self, image, choices, dialog):
         for tag, selected in choices:
@@ -8859,6 +17748,21 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         if not image:
             return
         path = Path(image["path"])
+        # Un registro antiguo puede apuntar a un archivo que ya estaba en la
+        # papelera antes de que el escáner aprendiera a ignorarla. Eliminarlo
+        # desde ahí evita crear .trash/.trash/... en cada intento.
+        if any(part.startswith(".trash") for part in path.parts):
+            try:
+                if path.is_file():
+                    path.unlink()
+            except OSError as error:
+                messagebox.showerror("Error al eliminar diseño", f"No se pudo eliminar «{path.name}»:\n{error}", parent=self)
+                return
+            self.database.remove_image(str(path))
+            self.selected_images.pop(str(path), None)
+            self.refresh(self.search.query.get())
+            self.status.set(f"Diseño «{path.name}» eliminado definitivamente de la papelera.")
+            return
         if not path.exists():
             # El archivo ya no está; basta con sacarlo de la base.
             self.database.remove_image(str(path))
@@ -8903,16 +17807,19 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
         self.status.set(f"«{path.name}» enviado a la papelera.")
 
     def close(self):
+        self._save_plancha_workspace_state()
+        # Detener monitor de carpeta Banco Stickers
+        try:
+            if hasattr(self, "_sticker_bank_watcher"):
+                self._sticker_bank_watcher.stop()
+        except Exception:
+            pass
         # Detener el worker de notificaciones antes de cerrar
         try:
             self._notification_service.stop_worker()
         except Exception:
             pass
         # Detener servidores HTTP
-        try:
-            self._pairing_server.stop()
-        except Exception:
-            pass
         try:
             self._mobile_jobs_server.stop()
         except Exception:
@@ -8931,6 +17838,1478 @@ def write_orders_zip(orders: list[dict], path: str | None, order_lines_map: dict
                 self.flush_order_autosave(order_id)
         self.database.close()
         self.destroy()
+
+    def _plancha_workspace_state_path(self) -> Path:
+        return Path(__file__).resolve().parents[2] / "outputs" / "plancha_workspace_state.json"
+
+    def schedule_plancha_workspace_save(self) -> None:
+        """Agrupa cambios del editor en un snapshot recuperable al iniciar."""
+        pending = getattr(self, "_plancha_workspace_save_after", None)
+        if pending:
+            try:
+                self.after_cancel(pending)
+            except tk.TclError:
+                pass
+        self._plancha_workspace_save_after = self.after(650, self._flush_plancha_workspace_save)
+
+    def _flush_plancha_workspace_save(self) -> None:
+        self._plancha_workspace_save_after = None
+        self._save_plancha_workspace_state()
+
+    def _save_plancha_workspace_state(self) -> None:
+        """Conserva los armados abiertos para recuperarlos al próximo inicio."""
+        try:
+            entries = []
+            notebook = getattr(self, "production_constructor_notebook", None)
+            editors = getattr(self, "production_constructor_editors", {})
+            hosts_to_keys = {editor.master: key for key, editor in editors.items() if editor.winfo_exists()}
+            ordered_keys = []
+            if notebook:
+                for tab_id in notebook.tabs():
+                    key = hosts_to_keys.get(notebook.nametowidget(tab_id))
+                    if key:
+                        ordered_keys.append(key)
+            for key in ordered_keys:
+                editor = editors[key]
+                if not editor.winfo_exists():
+                    continue
+                # Las planchas regulares usan un modelo de casillas distinto.
+                # Se guardan como proyecto propio desde su editor; no deben
+                # serializarse como una plancha libre al cerrar la aplicación.
+                if not hasattr(editor, "all_projects"):
+                    continue
+                projects = editor.all_projects or [editor.project]
+                # Un banco sin elementos es transitorio: se elimina al cerrar
+                # y no reaparece ni se acumula entre inicios de la aplicación.
+                if not any(project.items for project in projects):
+                    continue
+                entries.append({
+                    "key": key,
+                    "label": notebook.tab(editor.master, "text") if notebook else "Plancha Doccione",
+                    "order_id": editor.order_id,
+                    "current_index": editor.current_project_index,
+                    "projects": [project.to_dict() for project in projects],
+                })
+            path = self._plancha_workspace_state_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            active_key = None
+            if notebook:
+                try:
+                    active_key = hosts_to_keys.get(notebook.nametowidget(notebook.select()))
+                except tk.TclError:
+                    pass
+            path.write_text(json.dumps({"workspaces": entries, "active_key": active_key}, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    def refresh_processed_gallery(self):
+        """Actualiza la galería de trabajos procesados pendientes de confirmar."""
+        if not hasattr(self, "processed_gallery"):
+            return
+        
+        images = []
+        pending_count = 0
+        
+        # ====== FUENTE 1: Jobs de procesamiento de stickers ======
+        processed_jobs = self.database.sticker_processing_jobs(limit=100)
+        pending_statuses = {"Procesado"}
+        visible_statuses = pending_statuses
+        
+        for job in processed_jobs:
+            status = job.get("status", "")
+            if status not in visible_statuses:
+                continue
+            try:
+                artifacts = json.loads(job.get("artifacts") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                artifacts = {}
+            
+            job_id = job.get("id")
+            artifact_path = artifacts.get("master") or artifacts.get("print")
+            if not artifact_path:
+                artifact_rows = list(self.database.connection.execute(
+                    """SELECT path FROM sticker_artifacts
+                       WHERE job_id = ? AND kind IN ('master', 'print')
+                       ORDER BY CASE kind WHEN 'master' THEN 0 ELSE 1 END LIMIT 1""",
+                    (job_id,),
+                ))
+                artifact_path = artifact_rows[0][0] if artifact_rows else ""
+            
+            if not artifact_path or not Path(artifact_path).exists():
+                continue
+
+            if status in pending_statuses:
+                pending_count += 1
+            
+            artifact = Path(artifact_path)
+            images.append({
+                "path": str(artifact),
+                "name": artifact.name,
+                "extension": artifact.suffix.lower(),
+                "size": artifact.stat().st_size,
+                "modified": artifact.stat().st_mtime,
+                "caption": job.get("category", ""),
+                "tags": job.get("tags", ""),
+                "job_id": job_id,
+                "status": status,
+                "source_path": job.get("source_path"),
+                "source_type": "processing_job",  # Marca para identificar origen
+            })
+        
+        # Aplicar ordenamiento seleccionado
+        order = self.processed_order_var.get()
+        if order == "Más recientes":
+            images.sort(key=lambda x: x.get("modified", 0), reverse=True)
+        elif order == "Más antiguos":
+            images.sort(key=lambda x: x.get("modified", 0))
+        elif order == "Nombre":
+            images.sort(key=lambda x: x.get("name", ""))
+        
+        # Ya limitamos a 100 durante la carga, no hace falta volver a limitar
+        
+        self.processed_items = images
+        self.processed_gallery.show_images(images)
+        self._schedule_processed_similarity_checks(processed_jobs, images)
+        
+        # Actualizar contadores
+        self.processed_pending_count.set(f"{pending_count} pendientes")
+        
+        # Contar stickers listos para confirmación masiva (solo jobs de procesamiento)
+        ready_count = sum(1 for img in images if img.get("status") == "Procesado")
+        self.processed_ready_count.set(f"Publicar listos ({ready_count})")
+        self.processed_confirm_all_btn.config(state="normal" if ready_count > 0 else "disabled")
+        
+        # Actualizar el título del tab
+        for tab_id in self.tabs.tabs():
+            if self.tabs.tab(tab_id, "text").startswith("Últimos Procesados"):
+                self.tabs.tab(tab_id, text=f"Últimos Procesados ({len(images)})")
+                break
+        
+        # Mostrar estado vacío si no hay elementos
+        if not images:
+            self.show_processed_empty_state()
+        else:
+            self.hide_processed_empty_state()
+        
+        # Mantener selección válida después de actualizar
+        self.update_processed_selection_state()
+
+    def _schedule_processed_similarity_checks(self, jobs, images):
+        """Busca parecidos sin bloquear el creador ni la bandeja de revisión."""
+        if not images:
+            return
+        active = getattr(self, "_processed_similarity_jobs", set())
+        self._processed_similarity_jobs = active
+        paths_by_job = {item.get("job_id"): item["path"] for item in images}
+        candidates = self.database.indexed_visual_search_images()
+        if not candidates:
+            return  # Se reintenta cuando el índice visual esté disponible.
+
+        for job in jobs:
+            job_id = job.get("id")
+            target = paths_by_job.get(job_id)
+            if not job_id or not target or job_id in active:
+                continue
+            try:
+                analysis = json.loads(job.get("analysis") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                analysis = {}
+            if analysis.get("similarity_checked"):
+                continue
+            active.add(job_id)
+            filtered = [row for row in candidates if row.get("path") != target]
+            threading.Thread(
+                target=self._check_processed_similarity,
+                args=(job_id, target, filtered), daemon=True,
+                name="visionvault-processed-similarity",
+            ).start()
+
+    def _check_processed_similarity(self, job_id: str, target: str, candidates: list[dict]):
+        """Worker: encuentra duplicados reales y crea una variante cromática leve."""
+        match_path, score, changed = "", 0.0, False
+        try:
+            from app.ai.visual_search import find_similar
+
+            matches = find_similar(
+                target, candidates, limit=1, minimum_score=96.0,
+                cancelled=lambda: False, signature_ready=lambda _rows: None,
+                search_duplicates_only=True,
+            ) or []
+            if matches:
+                match_path, score = matches[0]
+                if score >= 96.0:
+                    from app.stickers.color_variant import apply_subtle_color_variant
+                    changed = apply_subtle_color_variant(target) > 0
+        except Exception as error:
+            print(f"Error en revisión diferida de similitud: {error}")
+        finally:
+            self.after(0, lambda: self._finish_processed_similarity_check(
+                job_id, match_path, score, changed,
+            ))
+
+    def _finish_processed_similarity_check(self, job_id, match_path, score, changed):
+        active = getattr(self, "_processed_similarity_jobs", set())
+        active.discard(job_id)
+        try:
+            self.database.record_sticker_similarity_check(job_id, match_path, score, changed)
+            if changed:
+                self.status.set("Se detectó un diseño muy parecido y se aplicó una variación leve de color.")
+                self.refresh_processed_gallery()
+        except Exception as error:
+            print(f"Error al guardar revisión de similitud: {error}")
+
+    def _start_banco_watcher(self):
+        """Inicia el monitoreo automático de la carpeta Banco Stickers."""
+        try:
+            library_root = self.database.get_library_root().strip()
+            if library_root and Path(library_root).exists():
+                self._sticker_bank_watcher.start(library_root)
+                print(f"Monitor de Banco Stickers iniciado: {library_root}")
+                # Mostrar mensaje en la UI
+                self.after(500, lambda: self.status.set(
+                    f"✓ Monitoreo activo en: {Path(library_root).name}"
+                ))
+            else:
+                # Reintentar más tarde si la carpeta aún no está configurada
+                print("Carpeta Banco Stickers no configurada. Reintentando en 10 segundos...")
+                self.after(10000, self._start_banco_watcher)
+        except Exception as e:
+            print(f"Error al iniciar monitor de Banco Stickers: {e}")
+
+    def show_monitored_folder(self):
+        """Muestra la carpeta actualmente monitoreada para auto-procesamiento."""
+        library_root = self.database.get_library_root().strip()
+        
+        if library_root and Path(library_root).exists():
+            watcher_status = "✓ Activo" if self._sticker_bank_watcher.is_active() else "✗ Inactivo"
+            message = (
+                f"CARPETA MONITOREADA PARA AUTO-PROCESAMIENTO\n\n"
+                f"Ruta: {library_root}\n\n"
+                f"Estado del monitor: {watcher_status}\n\n"
+                f"Cuando agregues imágenes a esta carpeta:\n"
+                f"• Se agregarán automáticamente a Biblioteca\n"
+                f"• Se procesarán y aparecerán en Últimos Procesados\n"
+                f"• Recibirás una notificación al completar\n\n"
+                f"¿Querés abrir esta carpeta?"
+            )
+            
+            if messagebox.askyesno("Carpeta Monitoreada", message, parent=self):
+                # Abrir la carpeta en el explorador de Windows
+                try:
+                    subprocess.run(["explorer", str(Path(library_root).resolve())], check=False)
+                except Exception as e:
+                    messagebox.showerror("Error", f"No se pudo abrir la carpeta: {e}", parent=self)
+        else:
+            message = (
+                "NO HAY CARPETA CONFIGURADA\n\n"
+                "Para habilitar el monitoreo automático:\n\n"
+                "1. Ve a Configuración → Índice\n"
+                "2. Haz clic en 'Reemplazar índice con carpeta'\n"
+                "3. Selecciona tu carpeta Banco Stickers\n\n"
+                "Después de configurarla, el sistema detectará\n"
+                "automáticamente las imágenes nuevas que agregues."
+            )
+            messagebox.showinfo("Carpeta No Configurada", message, parent=self)
+
+    def _restart_banco_watcher(self, folder: str):
+        """Reinicia el watcher con una nueva carpeta."""
+        try:
+            if hasattr(self, "_sticker_bank_watcher"):
+                self._sticker_bank_watcher.stop()
+                self._sticker_bank_watcher.start(folder)
+                print(f"Monitor de Banco Stickers reiniciado en: {folder}")
+                self.status.set(f"✓ Monitor actualizado: {Path(folder).name}")
+        except Exception as e:
+            print(f"Error al reiniciar monitor: {e}")
+
+    def _on_new_image_in_banco(self, image_path: str):
+        """Callback cuando se detecta una imagen nueva en Banco Stickers."""
+        try:
+            # Procesar en thread separado para no bloquear el monitor
+            threading.Thread(
+                target=self._process_new_banco_image,
+                args=(image_path,),
+                daemon=True,
+                name="banco-auto-process"
+            ).start()
+        except Exception as e:
+            print(f"Error al iniciar procesamiento automático: {e}")
+
+    def _process_new_banco_image(self, image_path: str):
+        """Procesa automáticamente una imagen nueva agregada a Banco Stickers."""
+        try:
+            from app.stickers.pipeline import StickerProcessor, ProcessingProfile
+            from app.indexer.scanner import IMAGE_EXTENSIONS
+            import uuid
+            
+            path = Path(image_path)
+            if not path.exists():
+                print(f"Imagen no encontrada: {image_path}")
+                return
+            
+            # Verificar que sea una imagen válida
+            if path.suffix.lower() not in IMAGE_EXTENSIONS:
+                print(f"Archivo ignorado (no es imagen): {path.name}")
+                return
+
+            # Un sticker confirmado llega al banco ya indexado por
+            # ``approve_processed_sticker``. El evento de archivo que genera
+            # ese movimiento no debe iniciar otro procesamiento automático.
+            resolved_path = str(path.resolve())
+            already_indexed = self.database.connection.execute(
+                "SELECT 1 FROM images WHERE path = ?", (resolved_path,)
+            ).fetchone()
+            if already_indexed:
+                print(f"Archivo ya confirmado; se omite auto-proceso: {path.name}")
+                return
+            
+            # Mostrar notificación en UI
+            self.after(0, lambda: self.status.set(f"Procesando automáticamente: {path.name}"))
+            
+            # Agregar la imagen original a la biblioteca inmediatamente
+            stat = path.stat()
+            original_image = {
+                "path": resolved_path,
+                "name": path.name,
+                "extension": path.suffix.lower(),
+                "size": stat.st_size,
+                "modified": stat.st_mtime,
+                "caption": "Agregado automáticamente desde Banco Stickers",
+            }
+            self.database.upsert(original_image)
+            self.database.commit()
+            
+            # También procesarlo para crear versiones optimizadas
+            # Crear workspace temporal para el procesamiento
+            workspace = Path(tempfile.gettempdir()) / "visionvault_auto" / str(uuid.uuid4())
+            workspace.mkdir(parents=True, exist_ok=True)
+            
+            # Procesar el sticker
+            profile = ProcessingProfile()
+            processor = StickerProcessor(workspace, profile)
+            
+            def progress_callback(percent, message):
+                print(f"[Auto-proceso {path.name}] {percent}% - {message}")
+            
+            result = processor.process(
+                image_path,
+                progress=progress_callback
+            )
+            
+            if result.status == "Procesado":
+                result.analysis["auto_process"] = True
+                # Guardar el procesamiento en la base de datos para "Últimos Procesados"
+                job_id = str(uuid.uuid4())
+                self.database.connection.execute(
+                    """INSERT INTO sticker_processing_jobs 
+                       (id, source_path, status, artifacts, analysis, category, tags, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))""",
+                    (
+                        job_id,
+                        str(path),
+                        "Procesado",
+                        json.dumps(result.artifacts, ensure_ascii=False),
+                        json.dumps(result.analysis, ensure_ascii=False),
+                        "",
+                        "",
+                    )
+                )
+                
+                # Registrar artefactos
+                for kind, artifact_path in result.artifacts.items():
+                    if artifact_path and Path(artifact_path).exists():
+                        self.database.connection.execute(
+                            "INSERT INTO sticker_artifacts (job_id, kind, path) VALUES (?, ?, ?)",
+                            (job_id, kind, str(artifact_path))
+                        )
+                
+                self.database.connection.commit()
+                
+                # Actualizar UI en el thread principal
+                self.after(0, lambda: self._on_auto_process_complete(path.name))
+                self.after(100, lambda: self.refresh_processed_gallery())
+                self.after(100, lambda: self.refresh(self.search.query.get()))  # Refrescar biblioteca
+                
+                print(f"Procesamiento automático completado: {path.name}")
+            else:
+                print(f"Procesamiento automático falló: {path.name} - {result.status}")
+                self.after(0, lambda: self.status.set(f"Error al procesar automáticamente: {path.name}"))
+                
+        except Exception as e:
+            print(f"Error en procesamiento automático de {image_path}: {e}")
+            import traceback
+            traceback.print_exc()
+            self.after(0, lambda: self.status.set(f"Error al procesar imagen: {Path(image_path).name}"))
+
+    def _on_auto_process_complete(self, filename: str):
+        """Notifica al usuario cuando se completa un procesamiento automático."""
+        self.status.set(f"✓ Sticker procesado automáticamente: {filename}")
+        
+        # Marcar que "Últimos Procesados" necesita actualización
+        if hasattr(self, "_processed_gallery_loaded") and self._processed_gallery_loaded:
+            # Si ya está cargado, actualizar inmediatamente
+            self.refresh_processed_gallery()
+        else:
+            # Si no está cargado, marcar para actualizar cuando se abra
+            self._processed_gallery_needs_refresh = True
+        
+        # Cambiar al tab de últimos procesados si no está activo
+        try:
+            current_tab = self.tabs.select()
+            processed_tab_found = False
+            for tab_id in self.tabs.tabs():
+                if self.tabs.tab(tab_id, "text").startswith("Últimos Procesados"):
+                    processed_tab_found = True
+                    # Mostrar notificación visual
+                    Toast(
+                        self,
+                        f"Nueva imagen procesada: {filename}",
+                        "Revisá los últimos procesados para confirmarla",
+                        duration=5000
+                    )
+                    break
+        except Exception as e:
+            print(f"Error al mostrar notificación: {e}")
+
+    def preview_processed_image(self, image):
+        """Vista previa de un sticker procesado con opciones de confirmar/descartar."""
+        if not image:
+            return
+        from app.indexer.thumbnails import load_thumbnail
+
+        preview = tk.Toplevel(self)
+        preview.title(f"Procesado: {image['name']}")
+        preview.geometry("1080x720")
+        preview.minsize(760, 520)
+        preview.configure(background="#080909")
+        preview.transient(self)
+        self.center_window(preview)
+        content = tk.Frame(preview, background="#080909")
+        content.pack(fill="both", expand=True, padx=16, pady=16)
+        visual = tk.Frame(content, background="#080909")
+        visual.pack(side="left", fill="both", expand=True)
+        photo = load_thumbnail(image["path"], (760, 650))
+        if photo:
+            label = ttk.Label(visual, image=photo, style="Card.TLabel")
+            label.image = photo
+            label.pack(expand=True)
+        else:
+            ttk.Label(visual, text="No se pudo generar la vista previa.", padding=24).pack(expand=True)
+
+        details = tk.Frame(content, width=290, background="#1c1c1c")
+        details.pack(side="right", fill="y", padx=(16, 0))
+        details.pack_propagate(False)
+        tk.Label(details, text="Sticker Procesado", background="#1c1c1c", foreground="#f3e0d2", 
+                 font=("Bahnschrift SemiCondensed", 13, "bold")).pack(pady=(14, 10))
+        
+        # Información del sticker
+        source = Path(image["path"])
+        stat = source.stat()
+        dimensions = self.image_dimensions(source)
+        entries = (
+            ("Archivo", image["name"]),
+            ("Dimensiones", dimensions),
+            ("Tamaño", self.human_size(stat.st_size)),
+            ("Estado", image.get("status", "Desconocido")),
+        )
+        for title, value in entries:
+            row = tk.Frame(details, background="#1c1c1c")
+            row.pack(fill="x", padx=14, pady=3)
+            tk.Label(row, text=f"{title}:", background="#1c1c1c", foreground="#7a6a5e", 
+                     font=("Bahnschrift SemiCondensed", 10)).pack(side="left")
+            tk.Label(row, text=str(value)[:30], background="#1c1c1c", foreground="#f3e0d2", 
+                     font=("Bahnschrift SemiCondensed", 10, "bold")).pack(side="right")
+        
+        # Botones de acción
+        actions_frame = tk.Frame(details, background="#1c1c1c")
+        actions_frame.pack(fill="x", padx=14, pady=(20, 0))
+        
+        ttk.Button(actions_frame, text="Publicar en Biblioteca",
+                   command=lambda: self.approve_single_processed(image, preview),
+                   style="Primary.TButton").pack(fill="x", pady=(0, 8))
+        ttk.Button(actions_frame, text="Descartar", 
+                   command=lambda: self.discard_single_processed(image, preview),
+                   style="Danger.TButton").pack(fill="x")
+
+    def approve_single_processed(self, image, preview_window=None):
+        """Aprueba un sticker procesado individual y lo agrega a la biblioteca."""
+        job_id = image.get("job_id")
+        if not job_id:
+            messagebox.showerror("Error", "No se pudo identificar el sticker.", parent=self)
+            return
+        
+        # Obtener el trabajo de la base de datos
+        jobs = self.database.sticker_processing_jobs(limit=1000)
+        job = next((j for j in jobs if j["id"] == job_id), None)
+        if not job:
+            messagebox.showerror("Error", "No se encontró el sticker procesado.", parent=self)
+            return
+        
+        # Obtener los artefactos desde sticker_artifacts
+        artifact_rows = list(self.database.connection.execute(
+            "SELECT kind, path FROM sticker_artifacts WHERE job_id = ?", (job_id,)
+        ))
+        artifacts = {row[0]: row[1] for row in artifact_rows}
+        
+        if not artifacts:
+            messagebox.showerror("Error", "No se encontraron artefactos del sticker.", parent=self)
+            return
+        
+        # Crear el resultado para approve_processed_sticker
+        result = {
+            "job_id": job_id,
+            "artifacts": artifacts,
+        }
+        
+        # Aprobar y agregar a la biblioteca
+        category = job.get("category", "")
+        tags = json.loads(job.get("tags", "[]"))
+        
+        try:
+            self.database.approve_processed_sticker(result, category, tags)
+            self.status.set(f"Sticker aprobado y agregado a la biblioteca.")
+            if preview_window:
+                preview_window.destroy()
+            self.refresh_processed_gallery()
+            self.refresh(self.search.query.get())
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo aprobar el sticker:\n{e}", parent=self)
+
+    def discard_single_processed(self, image, preview_window=None):
+        """Descarta un sticker procesado individual."""
+        job_id = image.get("job_id")
+        if not job_id:
+            return
+        
+        if not messagebox.askyesno("Confirmar descarte", 
+                                    "¿Estás seguro de que quieres descartar este sticker?",
+                                    parent=self):
+            return
+        
+        try:
+            self.database.discard_processed_sticker(job_id)
+            self.status.set("Sticker descartado.")
+            if preview_window:
+                preview_window.destroy()
+            self.refresh_processed_gallery()
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo descartar el sticker:\n{e}", parent=self)
+
+    def approve_all_processed(self):
+        """Aprueba todos los stickers procesados pendientes."""
+        processed = self.database.sticker_processing_jobs(limit=100)
+        # Filtrar solo los que están en estado pendiente de aprobación
+        processed = [job for job in processed if job.get("status") == "Procesado"]
+        
+        if not processed:
+            messagebox.showinfo("Sin stickers", "No hay stickers procesados pendientes.", parent=self)
+            return
+        
+        if not messagebox.askyesno("Confirmar", 
+                                    f"¿Estás seguro de que quieres aprobar {len(processed)} stickers?\n\n"
+                                    "Todos serán agregados a la biblioteca principal.",
+                                    parent=self):
+            return
+        
+        approved = 0
+        for job in processed:
+            try:
+                job_id = job.get("id")
+                # Obtener artifacts de sticker_artifacts
+                artifact_rows = list(self.database.connection.execute(
+                    "SELECT kind, path FROM sticker_artifacts WHERE job_id = ?", (job_id,)
+                ))
+                artifacts = {row[0]: row[1] for row in artifact_rows}
+                
+                if artifacts:
+                    result = {
+                        "job_id": job_id,
+                        "artifacts": artifacts,
+                    }
+                    category = job.get("category", "")
+                    tags = json.loads(job.get("tags", "[]"))
+                    self.database.approve_processed_sticker(result, category, tags)
+                    approved += 1
+            except Exception:
+                continue
+        
+        self.status.set(f"{approved} de {len(processed)} stickers aprobados.")
+        self.refresh_processed_gallery()
+        self.refresh(self.search.query.get())
+
+    def confirm_all_ready_stickers(self):
+        """Publica en Biblioteca todos los stickers pendientes disponibles."""
+        ready_items = [img for img in self.processed_items if img.get("status") == "Procesado"]
+        
+        if not ready_items:
+            return
+        
+        ready_count = len(ready_items)
+        
+        # Diálogo de confirmación
+        if not messagebox.askyesno(
+            "Publicar stickers listos",
+            f"¿Publicar {ready_count} stickers en la Biblioteca?\n\n"
+            "Se copiarán al Banco de Stickers y dejarán de aparecer en esta bandeja.",
+            parent=self
+        ):
+            return
+        
+        confirmed = []
+        omitted = []
+        failed = []
+        
+        for img in ready_items:
+            job_id = img.get("job_id")
+            if not job_id:
+                omitted.append((img.get("name", "Desconocido"), "Sin ID de trabajo"))
+                continue
+            
+            try:
+                # Verificar si ya está confirmado (idempotencia)
+                current_status = img.get("status")
+                if current_status == "Confirmado":
+                    omitted.append((img.get("name", "Desconocido"), "Ya confirmado"))
+                    continue
+                
+                # Obtener artifacts desde sticker_artifacts
+                artifact_rows = list(self.database.connection.execute(
+                    "SELECT kind, path FROM sticker_artifacts WHERE job_id = ?", (job_id,)
+                ))
+                artifacts = {row[0]: row[1] for row in artifact_rows}
+                
+                if not artifacts:
+                    failed.append((img.get("name", "Desconocido"), "Sin archivos de artefacto"))
+                    continue
+                
+                # Verificar que el archivo final exista
+                master_path = artifacts.get("master") or artifacts.get("print")
+                if not master_path or not Path(master_path).exists():
+                    failed.append((img.get("name", "Desconocido"), "Archivo final inexistente"))
+                    continue
+                
+                # Usar transacción por sticker para continuar aunque uno falle
+                try:
+                    with self.database.connection:
+                        result = {
+                            "job_id": job_id,
+                            "artifacts": artifacts,
+                        }
+                        category = img.get("category", "")
+                        tags = json.loads(img.get("tags", "[]"))
+                        self.database.approve_processed_sticker(result, category, tags)
+                        confirmed.append(img.get("name", "Desconocido"))
+                except Exception as e:
+                    failed.append((img.get("name", "Desconocido"), str(e)))
+                    
+            except Exception as e:
+                failed.append((img.get("name", "Desconocido"), str(e)))
+        
+        # Mostrar resumen
+        self._show_bulk_confirmation_summary(confirmed, omitted, failed, ready_count)
+        
+        # Actualizar UI
+        self.refresh_processed_gallery()
+        self.refresh(self.search.query.get())
+
+    def _show_bulk_confirmation_summary(self, confirmed: list[str], omitted: list[tuple[str, str]], 
+                                        failed: list[tuple[str, str]], total: int):
+        """Muestra un diálogo con el resumen de la confirmación masiva."""
+        dialog = tk.Toplevel(self)
+        dialog.title("Publicación completada")
+        dialog.geometry("600x500")
+        dialog.configure(background=COLORS.panel)
+        dialog.transient(self)
+        dialog.grab_set()
+        self.center_window(dialog)
+        
+        content = tk.Frame(dialog, background=COLORS.panel, padx=24, pady=24)
+        content.pack(fill="both", expand=True)
+        
+        tk.Label(content, text="Publicación completada", background=COLORS.panel, foreground=COLORS.text,
+                 font=(IDENTITY_FONT, 18, "bold")).pack(anchor="w", pady=(0, 16))
+        
+        # Resumen numérico
+        summary_frame = tk.Frame(content, background=COLORS.panel)
+        summary_frame.pack(fill="x", pady=(0, 16))
+        
+        tk.Label(summary_frame, text=f"Publicados: {len(confirmed)}", background=COLORS.panel,
+                 foreground="#39d353", font=(UI_FONT, 12, "bold")).pack(anchor="w")
+        tk.Label(summary_frame, text=f"Omitidos: {len(omitted)}", background=COLORS.panel,
+                 foreground=COLORS.muted, font=(UI_FONT, 12)).pack(anchor="w")
+        tk.Label(summary_frame, text=f"Con error: {len(failed)}", background=COLORS.panel,
+                 foreground="#ff4d5a", font=(UI_FONT, 12)).pack(anchor="w")
+        
+        # Detalles de errores si los hay
+        if failed:
+            tk.Label(content, text="No se pudieron publicar:", background=COLORS.panel, foreground=COLORS.text,
+                     font=(UI_FONT, 11, "bold")).pack(anchor="w", pady=(16, 8))
+            
+            error_frame = tk.Frame(content, background=COLORS.panel)
+            error_frame.pack(fill="both", expand=True)
+            
+            error_text = tk.Text(error_frame, height=8, wrap="word", font=(UI_FONT, 9),
+                               background=COLORS.panel_elevated, foreground=COLORS.text,
+                               relief="flat", padx=12, pady=12)
+            error_text.pack(fill="both", expand=True)
+            
+            for name, error in failed:
+                error_text.insert("end", f"- {name}: {error}\n")
+            
+            error_text.config(state="disabled")
+        
+        # Botón de cerrar
+        button_frame = tk.Frame(content, background=COLORS.panel)
+        button_frame.pack(fill="x", pady=(16, 0))
+        
+        ttk.Button(button_frame, text="Cerrar", command=dialog.destroy,
+                  style="Primary.TButton").pack(side="right")
+        
+        # Actualizar estado
+        self.status.set(f"Publicación masiva: {len(confirmed)} publicados, {len(omitted)} omitidos, {len(failed)} con error.")
+
+    def discard_all_processed(self):
+        """Descarta todos los stickers procesados pendientes."""
+        processed = self.database.sticker_processing_jobs(limit=100)
+        # Filtrar solo los que están en estado pendiente de aprobación
+        processed = [job for job in processed if job.get("status") == "Procesado"]
+        
+        if not processed:
+            messagebox.showinfo("Sin stickers", "No hay stickers procesados pendientes.", parent=self)
+            return
+        
+        if not messagebox.askyesno("Confirmar", 
+                                    f"¿Estás seguro de que quieres descartar {len(processed)} stickers?\n\n"
+                                    "Esta acción no se puede deshacer.",
+                                    parent=self):
+            return
+        
+        discarded = 0
+        for job in processed:
+            try:
+                self.database.discard_processed_sticker(job["id"])
+                discarded += 1
+            except Exception:
+                continue
+        
+        self.status.set(f"{discarded} de {len(processed)} stickers descartados.")
+        self.refresh_processed_gallery()
+
+    def discard_processed_sticker(self, image):
+        """Descarta un sticker procesado desde la galería."""
+        self.discard_single_processed(image)
+
+    def is_processed_selected(self, image):
+        """Verifica si un sticker procesado está seleccionado."""
+        if not image:
+            return False
+        return image.get("path") in self.processed_selection
+
+    def toggle_processed_selection(self, image):
+        """Alterna la selección de un sticker procesado."""
+        if not image:
+            return
+        
+        previous_count = len(self.processed_selection)
+        path = image.get("path")
+        if path in self.processed_selection:
+            self.processed_selection.remove(path)
+        else:
+            self.processed_selection.add(path)
+        
+        current_count = len(self.processed_selection)
+        # Evita reconstruir y recargar todas las miniaturas en cada Ctrl + clic.
+        # La ficha solo necesita regenerarse al pasar entre 0, 1 y varios.
+        self.update_processed_selection_state(
+            refresh_detail=(previous_count <= 1 or current_count <= 1),
+        )
+
+    def select_all_processed(self):
+        """Selecciona todos los stickers procesados."""
+        if not self.processed_items:
+            return
+        
+        # Si ya están todos seleccionados, deseleccionar todos
+        if len(self.processed_selection) == len(self.processed_items):
+            self.processed_selection.clear()
+        else:
+            # Seleccionar todos
+            self.processed_selection = {img.get("path") for img in self.processed_items}
+        
+        self.update_processed_selection_state()
+        self.processed_gallery.render()
+
+    def approve_selected_processed(self):
+        """Aprueba los stickers procesados seleccionados."""
+        if not self.processed_selection:
+            return
+        
+        selected_count = len(self.processed_selection)
+        
+        if not messagebox.askyesno("Publicar en Biblioteca",
+                                    f"¿Publicar {selected_count} stickers seleccionados?\n\n"
+                                    "Se agregarán a la Biblioteca principal y al Banco de Stickers.",
+                                    parent=self):
+            return
+        
+        approved = 0
+        for img in self.processed_items:
+            if img.get("path") in self.processed_selection:
+                job_id = img.get("job_id")
+                if job_id:
+                    try:
+                        jobs = self.database.sticker_processing_jobs(limit=1000)
+                        job = next((j for j in jobs if j["id"] == job_id), None)
+                        if job:
+                            # Obtener artifacts desde sticker_artifacts
+                            artifact_rows = list(self.database.connection.execute(
+                                "SELECT kind, path FROM sticker_artifacts WHERE job_id = ?", (job_id,)
+                            ))
+                            artifacts = {row[0]: row[1] for row in artifact_rows}
+                            
+                            if artifacts:
+                                result = {
+                                    "job_id": job_id,
+                                    "artifacts": artifacts,
+                                }
+                                category = job.get("category", "")
+                                tags = json.loads(job.get("tags", "[]"))
+                                self.database.approve_processed_sticker(result, category, tags)
+                                approved += 1
+                    except Exception:
+                        continue
+        
+        self.status.set(f"{approved} de {selected_count} stickers publicados en Biblioteca.")
+        self.processed_selection.clear()
+        self.refresh_processed_gallery()
+        self.refresh(self.search.query.get())
+
+    def discard_selected_processed(self):
+        """Descarta los stickers procesados seleccionados."""
+        if not self.processed_selection:
+            return
+        
+        selected_count = len(self.processed_selection)
+        
+        if not messagebox.askyesno("Confirmar", 
+                                    f"¿Estás seguro de que quieres descartar {selected_count} stickers?\n\n"
+                                    "Esta acción no se puede deshacer.",
+                                    parent=self):
+            return
+        
+        discarded = 0
+        for img in self.processed_items:
+            if img.get("path") in self.processed_selection:
+                job_id = img.get("job_id")
+                if job_id:
+                    try:
+                        self.database.discard_processed_sticker(job_id)
+                        discarded += 1
+                    except Exception:
+                        continue
+        
+        self.status.set(f"{discarded} de {selected_count} stickers descartados.")
+        self.processed_selection.clear()
+        self.refresh_processed_gallery()
+
+    def add_tag_to_selected_processed(self):
+        """Agrega una etiqueta a los trabajos pendientes seleccionados en lote."""
+        selected = [
+            image for image in self.processed_items
+            if image.get("path") in self.processed_selection
+        ]
+        if not selected:
+            messagebox.showinfo("Últimos procesados", "Seleccioná uno o más stickers con Ctrl + clic.", parent=self)
+            return
+
+        job_ids = {image.get("job_id") for image in selected if image.get("job_id")}
+        jobs = {
+            job["id"]: job for job in self.database.sticker_processing_jobs(limit=1000)
+            if job.get("id") in job_ids
+        }
+
+        def add_to_all(tag: str):
+            normalized = tag.strip()
+            if not normalized:
+                return False
+            updated = 0
+            try:
+                for job_id in job_ids:
+                    job = jobs.get(job_id)
+                    if not job:
+                        continue
+                    try:
+                        tags = json.loads(job.get("tags") or "[]")
+                    except (TypeError, json.JSONDecodeError):
+                        tags = []
+                    if normalized.casefold() not in {str(value).casefold() for value in tags}:
+                        tags.append(normalized)
+                    self.database.connection.execute(
+                        "UPDATE sticker_processing_jobs SET tags = ?, updated_at = ? WHERE id = ?",
+                        (json.dumps(tags, ensure_ascii=False), datetime.now().isoformat(timespec="seconds"), job_id),
+                    )
+                    updated += 1
+                self.database.commit()
+            except Exception as error:
+                self.database.connection.rollback()
+                messagebox.showerror("No se pudo agregar la etiqueta", str(error), parent=self)
+                return False
+            self.status.set(f"Etiqueta «{normalized.title()}» agregada a {updated} sticker(s) procesado(s).")
+            self.processed_selection.clear()
+            self.refresh_processed_gallery()
+            return True
+
+        self.ask_tag_with_suggestion(
+            "Agregar etiqueta",
+            f"Etiqueta para {len(selected)} sticker(s) procesado(s):",
+            add_to_all,
+        )
+
+    def _selected_processed_items(self) -> list[dict]:
+        return [
+            image for image in self.processed_items
+            if image.get("path") in self.processed_selection
+        ]
+
+    def assign_category_to_selected_processed(self):
+        """Asigna una categoría común sin modificar los archivos de imagen."""
+        selected = self._selected_processed_items()
+        if not selected:
+            return
+        def assign(normalized: str) -> None:
+            try:
+                with self.database.connection:
+                    for image in selected:
+                        self.database.connection.execute(
+                            "UPDATE sticker_processing_jobs SET category = ?, updated_at = ? WHERE id = ?",
+                            (normalized, datetime.now().isoformat(timespec="seconds"), image["job_id"]),
+                        )
+                        # Los pendientes aún no están en images; este UPDATE es
+                        # seguro y sincroniza los que ya fueron confirmados.
+                        self.database.connection.execute(
+                            "UPDATE images SET category = ? WHERE path = ?",
+                            (normalized, image["path"]),
+                        )
+            except Exception as error:
+                messagebox.showerror("No se pudo asignar la categoría", str(error), parent=self)
+                return
+            self.status.set(f"Categoría «{normalized}» asignada a {len(selected)} sticker(s).")
+            self.processed_selection.clear()
+            self.refresh_processed_gallery()
+            self.refresh(self.search.query.get())
+
+        self._show_category_picker(assign)
+
+    def _show_category_picker(self, on_selected, title: str = "Asignar categoria") -> None:
+        """Selector predictivo de categorías, con creación explícita si falta."""
+        categories = self.database.category_counts()
+        dialog = tk.Toplevel(self)
+        dialog.title(title)
+        dialog.title("Asignar categoría")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.configure(background=COLORS.panel)
+        dialog.resizable(False, False)
+        dialog.title(title)
+        dialog.geometry("500x340")
+
+        tk.Label(dialog, text="Asignar categoría", background=COLORS.panel, foreground=COLORS.text,
+                 font=(IDENTITY_FONT, 16, "bold")).pack(anchor="w", padx=18, pady=(18, 3))
+        tk.Label(dialog, text="Escribí para buscar una categoría existente o crear una nueva.",
+                 background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 9)).pack(anchor="w", padx=18)
+
+        query = tk.StringVar()
+        entry = ttk.Entry(dialog, textvariable=query)
+        entry.pack(fill="x", padx=18, pady=(14, 8))
+        results = tk.Listbox(dialog, background=COLORS.field, foreground=COLORS.text,
+                             selectbackground=COLORS.primary, selectforeground=COLORS.text,
+                             borderwidth=0, highlightthickness=1, highlightbackground=COLORS.border,
+                             height=9, font=(UI_FONT, 10))
+        results.pack(fill="both", expand=True, padx=18, pady=(0, 12))
+        visible: list[str] = []
+
+        def refresh_results(*_args):
+            term = query.get().strip().casefold()
+            matches = [(name, count) for name, count in categories if not term or term in name.casefold()]
+            visible[:] = [name for name, _count in matches]
+            results.delete(0, "end")
+            for name, count in matches:
+                results.insert("end", f"{name} ({count})")
+            if matches:
+                results.selection_set(0)
+
+        def accept(_event=None):
+            selection = results.curselection()
+            value = visible[selection[0]] if selection else query.get()
+            normalized = value.strip().title()
+            if not normalized:
+                messagebox.showwarning("Categoría requerida", "Ingresá una categoría para continuar.", parent=dialog)
+                return "break"
+            dialog.destroy()
+            on_selected(normalized)
+            return "break"
+
+        query.trace_add("write", refresh_results)
+        results.bind("<Double-Button-1>", accept)
+        results.bind("<Return>", accept)
+        entry.bind("<Return>", accept)
+        ttk.Button(dialog, text="Asignar categoría", command=accept, style="Primary.TButton").pack(anchor="e", padx=18, pady=(0, 18))
+        refresh_results()
+        entry.focus_set()
+
+    def link_selected_processed_to_order(self):
+        """Vincula los stickers confirmados seleccionados a un pedido existente."""
+        selected = self._selected_processed_items()
+        if not selected:
+            return
+        eligible = [image for image in selected if image.get("status") in {"Aprobado", "Confirmado"}]
+        skipped = len(selected) - len(eligible)
+        if not eligible:
+            messagebox.showinfo(
+                "Enlazar a pedido",
+                "Confirmá los stickers antes de vincularlos a un pedido.",
+                parent=self,
+            )
+            return
+        def link_to(order_id: int) -> None:
+            try:
+                for image in eligible:
+                    self.database.link_design_to_order(order_id, image["path"])
+            except Exception as error:
+                messagebox.showerror("No se pudo enlazar al pedido", str(error), parent=self)
+                return
+            self.refresh_order_workspace(order_id)
+            self.status.set(
+                f"{len(eligible)} sticker(s) vinculado(s) al pedido #{order_id}."
+                + (f" {skipped} pendiente(s) sin vincular." if skipped else "")
+            )
+
+        self._show_pending_order_picker(link_to)
+
+    def _show_pending_order_picker(self, on_selected) -> None:
+        """Selector predictivo limitado a pedidos pendientes reales."""
+        orders = self.database.pending_orders()
+        if not orders:
+            messagebox.showinfo("Enlazar a pedido", "No hay pedidos pendientes disponibles.", parent=self)
+            return
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Enlazar a pedido pendiente")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.configure(background=COLORS.panel)
+        dialog.resizable(False, False)
+        dialog.geometry("580x360")
+
+        tk.Label(dialog, text="Enlazar a pedido", background=COLORS.panel, foreground=COLORS.text,
+                 font=(IDENTITY_FONT, 16, "bold")).pack(anchor="w", padx=18, pady=(18, 3))
+        tk.Label(dialog, text=f"{len(orders)} pedido(s) pendiente(s) · escribí cliente, estado o número.",
+                 background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 9)).pack(anchor="w", padx=18)
+
+        query = tk.StringVar()
+        entry = ttk.Entry(dialog, textvariable=query)
+        entry.pack(fill="x", padx=18, pady=(14, 8))
+        results = tk.Listbox(dialog, background=COLORS.field, foreground=COLORS.text,
+                             selectbackground=COLORS.primary, selectforeground=COLORS.text,
+                             borderwidth=0, highlightthickness=1, highlightbackground=COLORS.border,
+                             height=10, font=(UI_FONT, 10))
+        results.pack(fill="both", expand=True, padx=18, pady=(0, 12))
+        visible: list[dict] = []
+
+        def refresh_results(*_args):
+            term = query.get().strip().casefold()
+            matches = [
+                order for order in orders
+                if not term or term in f"{order['id']} {order.get('client_name') or order.get('client', '')} {order.get('status', '')}".casefold()
+            ]
+            visible[:] = matches
+            results.delete(0, "end")
+            for order in matches:
+                client = order.get("client_name") or order.get("client") or "Sin cliente"
+                results.insert("end", f"#{order['id']} · {client} · {order.get('status', 'Pendiente')}")
+            if matches:
+                results.selection_set(0)
+
+        def accept(_event=None):
+            selection = results.curselection()
+            if not selection:
+                return "break"
+            order_id = int(visible[selection[0]]["id"])
+            dialog.destroy()
+            on_selected(order_id)
+            return "break"
+
+        query.trace_add("write", refresh_results)
+        results.bind("<Double-Button-1>", accept)
+        results.bind("<Return>", accept)
+        entry.bind("<Return>", accept)
+        ttk.Button(dialog, text="Enlazar seleccionados", command=accept, style="Primary.TButton").pack(anchor="e", padx=18, pady=(0, 18))
+        refresh_results()
+        entry.focus_set()
+
+    def show_processed_empty_state(self):
+        """Muestra el estado vacío en el panel izquierdo."""
+        if hasattr(self, "processed_gallery"):
+            self.processed_gallery.pack_forget()
+        
+        if not hasattr(self, "processed_empty_label"):
+            self.processed_empty_label = tk.Label(
+                self.processed_paned.winfo_children()[0],
+                text="No hay stickers pendientes\n\nLos nuevos procesamientos aparecerán aquí para su revisión.",
+                background=COLORS.panel,
+                foreground=COLORS.muted,
+                font=(UI_FONT, 11),
+                justify="center"
+            )
+            self.processed_empty_label.pack(expand=True)
+
+    def hide_processed_empty_state(self):
+        """Oculta el estado vacío y muestra la galería."""
+        if hasattr(self, "processed_empty_label"):
+            self.processed_empty_label.pack_forget()
+        
+        if hasattr(self, "processed_gallery"):
+            self.processed_gallery.pack(fill="both", expand=True)
+
+    def update_processed_selection_state(self, refresh_detail=True):
+        """Actualiza el estado de selección y la UI."""
+        selected_count = len(self.processed_selection)
+        
+        # Actualizar contadores
+        self.processed_selected_count.set(f"{selected_count} seleccionados")
+        self.processed_bottom_count.set(f"{selected_count} seleccionados")
+        
+        # Habilitar/deshabilitar botones
+        state = "normal" if selected_count > 0 else "disabled"
+        self.processed_confirm_btn.config(state=state)
+        self.processed_discard_btn.config(state=state)
+        self.processed_tag_btn.config(state=state)
+        self.processed_category_btn.config(state=state)
+        self.processed_order_btn.config(state=state)
+        
+        # Actualizar panel derecho
+        if selected_count == 1:
+            # Encontrar el elemento seleccionado
+            if refresh_detail:
+                for img in self.processed_items:
+                    if img.get("path") in self.processed_selection:
+                        self.show_processed_detail(img)
+                        break
+        elif selected_count > 1:
+            if refresh_detail:
+                self.show_processed_multiple_selection(selected_count)
+            elif getattr(self, "_processed_multiple_label", None):
+                self._processed_multiple_label.configure(text=f"Hay {selected_count} stickers seleccionados.")
+        else:
+            if refresh_detail:
+                self.show_processed_no_selection()
+
+    def show_processed_detail(self, image):
+        """Muestra el detalle de un sticker en el panel derecho."""
+        # Limpiar contenedor
+        for widget in self.processed_detail_container.winfo_children():
+            widget.destroy()
+        self._processed_multiple_label = None
+        
+        from app.indexer.thumbnails import load_thumbnail
+        
+        # Contenedor scrollable
+        detail_canvas = tk.Canvas(self.processed_detail_container, background=COLORS.panel, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self.processed_detail_container, orient="vertical", command=detail_canvas.yview)
+        detail_frame = tk.Frame(detail_canvas, background=COLORS.panel)
+        
+        detail_canvas.configure(yscrollcommand=scrollbar.set)
+        detail_canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        detail_canvas.create_window((0, 0), window=detail_frame, anchor="nw")
+        detail_frame.bind("<Configure>", lambda e: detail_canvas.configure(scrollregion=detail_canvas.bbox("all")))
+        
+        # Resultado procesado
+        preview_frame = tk.Frame(detail_frame, background=COLORS.panel)
+        preview_frame.pack(fill="x", pady=(0, 16))
+        tk.Label(preview_frame, text="RESULTADO PROCESADO", background=COLORS.panel,
+                 foreground=COLORS.muted, font=(UI_FONT, 9, "bold")).pack(anchor="w", padx=8)
+        
+        photo = load_thumbnail(image["path"], (300, 300))
+        if photo:
+            label = ttk.Label(preview_frame, image=photo, style="Card.TLabel")
+            label.image = photo
+            label.pack(pady=8)
+
+        # El procesamiento no reemplaza al archivo que lo originó. Mostrar
+        # ambos permite validar visualmente el resultado antes de aprobarlo.
+        original_path = Path(image.get("source_path") or "")
+        original_frame = tk.Frame(detail_frame, background=COLORS.panel,
+                                  highlightthickness=1, highlightbackground=COLORS.border)
+        original_frame.pack(fill="x", padx=8, pady=(0, 16))
+        tk.Label(original_frame, text="ORIGEN ORIGINAL", background=COLORS.panel,
+                 foreground=COLORS.text, font=(UI_FONT, 10, "bold")).pack(anchor="w", padx=10, pady=(8, 2))
+        tk.Label(original_frame, text="Archivo usado para crear este sticker", background=COLORS.panel,
+                 foreground=COLORS.muted, font=(UI_FONT, 8)).pack(anchor="w", padx=10)
+        if original_path.is_file():
+            original_photo = load_thumbnail(str(original_path), (220, 180))
+            if original_photo:
+                original_preview = ttk.Label(original_frame, image=original_photo, style="Card.TLabel")
+                original_preview.image = original_photo
+                original_preview.pack(pady=(8, 4))
+            tk.Label(original_frame, text=original_path.name, background=COLORS.panel,
+                     foreground=COLORS.text, font=(UI_FONT, 9), wraplength=250).pack(anchor="w", padx=10)
+            ttk.Button(original_frame, text="Abrir original", style="Secondary.TButton",
+                       command=lambda path=original_path: self.preview_original_source(path)).pack(
+                           anchor="e", padx=10, pady=(6, 10)
+                       )
+        else:
+            tk.Label(original_frame, text="El archivo original ya no está disponible en su ruta registrada.",
+                     background=COLORS.panel, foreground=COLORS.muted, font=(UI_FONT, 9),
+                     wraplength=250, justify="left").pack(anchor="w", padx=10, pady=(8, 10))
+        
+        # Información editable
+        info_frame = tk.Frame(detail_frame, background=COLORS.panel)
+        info_frame.pack(fill="x", padx=8)
+        
+        # Nombre editable
+        tk.Label(info_frame, text="Nombre:", background=COLORS.panel, foreground=COLORS.text,
+                 font=(UI_FONT, 9, "bold")).pack(anchor="w")
+        name_var = tk.StringVar(value=image.get("name", ""))
+        name_entry = ttk.Entry(info_frame, textvariable=name_var)
+        name_entry.pack(fill="x", pady=(0, 12))
+        
+        # Categoría
+        tk.Label(info_frame, text="Categoría:", background=COLORS.panel, foreground=COLORS.text,
+                 font=(UI_FONT, 9, "bold")).pack(anchor="w")
+        category_var = tk.StringVar(value=image.get("caption", ""))
+        category_entry = ttk.Entry(info_frame, textvariable=category_var)
+        category_entry.pack(fill="x", pady=(0, 12))
+        
+        # Etiquetas
+        tk.Label(info_frame, text="Etiquetas:", background=COLORS.panel, foreground=COLORS.text,
+                 font=(UI_FONT, 9, "bold")).pack(anchor="w")
+        tags_var = tk.StringVar(value=image.get("tags", ""))
+        tags_entry = ttk.Entry(info_frame, textvariable=tags_var)
+        tags_entry.pack(fill="x", pady=(0, 12))
+        
+        # Información de solo lectura
+        source_path = image.get("source_path", "Desconocido")
+        if source_path and len(source_path) > 40:
+            source_path = "..." + source_path[-37:]
+        
+        tk.Label(info_frame, text="Archivo:", background=COLORS.panel, foreground=COLORS.muted,
+                 font=(UI_FONT, 9)).pack(anchor="w")
+        tk.Label(info_frame, text=source_path, background=COLORS.panel, foreground=COLORS.text,
+                 font=(UI_FONT, 9)).pack(anchor="w", pady=(0, 8))
+        
+        # Estado
+        status = image.get("status", "Desconocido")
+        tk.Label(info_frame, text="Estado:", background=COLORS.panel, foreground=COLORS.muted,
+                 font=(UI_FONT, 9)).pack(anchor="w")
+        tk.Label(info_frame, text=status, background=COLORS.panel, foreground=COLORS.text,
+                 font=(UI_FONT, 9)).pack(anchor="w", pady=(0, 16))
+        
+        # Botones de acción
+        actions_frame = tk.Frame(detail_frame, background=COLORS.panel)
+        actions_frame.pack(fill="x", padx=8, pady=(8, 0))
+        
+        ttk.Button(actions_frame, text="Publicar en Biblioteca",
+                   command=lambda: self.approve_single_processed(image),
+                   style="Primary.TButton").pack(fill="x", pady=(0, 8))
+        ttk.Button(actions_frame, text="Descartar", 
+                   command=lambda: self.discard_single_processed(image),
+                   style="Danger.TButton").pack(fill="x", pady=(0, 8))
+        ttk.Button(actions_frame, text="Reprocesar", 
+                   command=lambda: self.reprocess_sticker(image),
+                   style="Secondary.TButton").pack(fill="x", pady=(0, 8))
+        ttk.Button(actions_frame, text="Abrir editor", 
+                   command=lambda: self.open_editor_for_processed(image),
+                   style="Secondary.TButton").pack(fill="x")
+
+    def preview_original_source(self, source_path: Path):
+        """Abre una vista de solo lectura del archivo que originó el proceso."""
+        if not source_path.is_file():
+            messagebox.showwarning("Original no disponible", "No se encontró el archivo original en la ruta registrada.", parent=self)
+            return
+        from app.indexer.thumbnails import load_thumbnail
+
+        preview = tk.Toplevel(self)
+        preview.title(f"Original: {source_path.name}")
+        preview.geometry("820x640")
+        preview.minsize(560, 420)
+        preview.configure(background=COLORS.background)
+        preview.transient(self)
+        self.center_window(preview)
+        photo = load_thumbnail(str(source_path), (760, 520))
+        if photo:
+            image_label = ttk.Label(preview, image=photo, style="Card.TLabel")
+            image_label.image = photo
+            image_label.pack(fill="both", expand=True, padx=16, pady=(16, 8))
+        else:
+            tk.Label(preview, text="No se pudo cargar la vista previa del original.",
+                     background=COLORS.background, foreground=COLORS.muted).pack(expand=True)
+        footer = tk.Frame(preview, background=COLORS.background)
+        footer.pack(fill="x", padx=16, pady=(0, 16))
+        tk.Label(footer, text=str(source_path), background=COLORS.background,
+                 foreground=COLORS.muted, anchor="w", wraplength=570).pack(side="left", fill="x", expand=True)
+        ttk.Button(footer, text="Ver en carpeta", style="Secondary.TButton",
+                   command=lambda: self.reveal_in_folder(source_path)).pack(side="right", padx=(12, 0))
+
+    def show_processed_multiple_selection(self, count):
+        """Muestra estado de selección múltiple en el panel derecho."""
+        for widget in self.processed_detail_container.winfo_children():
+            widget.destroy()
+        
+        label = tk.Label(
+            self.processed_detail_container,
+            text=f"Hay {count} stickers seleccionados.",
+            background=COLORS.panel,
+            foreground=COLORS.muted,
+            font=(UI_FONT, 11)
+        )
+        label.pack(expand=True)
+        self._processed_multiple_label = label
+
+    def show_processed_no_selection(self):
+        """Muestra estado sin selección en el panel derecho."""
+        for widget in self.processed_detail_container.winfo_children():
+            widget.destroy()
+        self._processed_multiple_label = None
+        
+        label = tk.Label(
+            self.processed_detail_container,
+            text="Seleccioná un sticker para revisar sus datos.",
+            background=COLORS.panel,
+            foreground=COLORS.muted,
+            font=(UI_FONT, 10)
+        )
+        label.pack(expand=True)
+
+    def reprocess_sticker(self, image):
+        """Envía nuevamente el original al Creador de Stickers."""
+        if not messagebox.askyesno(
+            "Reprocesar sticker",
+            "Se volverá a crear el resultado a partir del archivo original. "
+            "El original no se modificará.",
+            parent=self,
+        ):
+            return
+
+        studio = self._open_processed_in_studio(image)
+        if studio is None:
+            return
+        studio.reprocess_current()
+
+    def open_editor_for_processed(self, image):
+        """Abre el editor de máscara del resultado procesado seleccionado."""
+        studio = self._open_processed_in_studio(image)
+        if studio is None:
+            return
+
+        result = (studio.current_job() or {}).get("result")
+        mask_path = result.artifacts.get("mask") if result else ""
+        if not mask_path or not Path(mask_path).is_file():
+            messagebox.showwarning(
+                "Editor no disponible",
+                "No se encontró la máscara de este resultado. Reprocesalo para generar una nueva.",
+                parent=self,
+            )
+            return
+        studio.open_mask()
+
+    def _open_processed_in_studio(self, image):
+        """Abre el Creador y selecciona el trabajo asociado a ``image``.
+
+        Los resultados de la bandeja guardan el origen por separado del PNG
+        final. Trabajar sobre el origen evita que el reprocesamiento acumule
+        recortes o transparencias sobre el resultado anterior.
+        """
+        source_path = Path(image.get("source_path") or "")
+        if not source_path.is_file():
+            messagebox.showwarning(
+                "Original no disponible",
+                "No se encontró el archivo original registrado para este sticker.",
+                parent=self,
+            )
+            return None
+
+        if not self.open_sticker_studio(initial_paths=[source_path]):
+            return None
+        studio = self.sticker_studio_window
+        if studio is None or not studio.winfo_exists():
+            return None
+
+        try:
+            source_key = str(source_path.resolve())
+            target_index = next(
+                index for index, job in enumerate(studio.jobs)
+                if str(Path(job["source_path"]).resolve()) == source_key
+            )
+        except (StopIteration, OSError, KeyError):
+            messagebox.showerror(
+                "Trabajo no disponible",
+                "No se pudo cargar este sticker en el Creador.",
+                parent=self,
+            )
+            return None
+
+        studio.current_index = target_index
+        studio.refresh_queue()
+        studio.queue.selection_set(str(target_index))
+        studio.queue.see(str(target_index))
+        studio.render_current()
+        studio.deiconify()
+        studio.lift()
+        studio.focus_set()
+        return studio
+
+    def restore_processed_separator(self):
+        """Restaura la posición del separador desde la configuración guardada."""
+        # Implementación básica - se puede mejorar con persistencia real
+        try:
+            # Intentar leer desde archivo de configuración
+            config_path = Path.home() / ".visionvault" / "processed_separator.json"
+            if config_path.exists():
+                with open(config_path, "r") as f:
+                    data = json.load(f)
+                    ratio = data.get("separator_ratio", 0.65)
+                    # Aplicar después de un pequeño delay para que el layout esté listo
+                    self.after(100, lambda: self.apply_processed_separator_ratio(ratio))
+        except Exception:
+            pass
+
+    @staticmethod
+    def processed_separator_position(total_width: int, ratio: float) -> int:
+        """Mantiene visibles tanto la galería como el inspector de revisión."""
+        total_width = max(0, int(total_width))
+        if total_width < 600:
+            return total_width // 2
+        desired = int(total_width * min(0.80, max(0.45, float(ratio))))
+        return min(max(desired, 320), total_width - 280)
+
+    def apply_processed_separator_ratio(self, ratio):
+        """Aplica una proporción específica al separador."""
+        try:
+            if hasattr(self, "processed_paned"):
+                total_width = self.processed_paned.winfo_width()
+                if total_width > 100:
+                    left_width = self.processed_separator_position(total_width, ratio)
+                    self.processed_paned.sashpos(0, left_width)
+        except Exception:
+            pass
+
+    def save_processed_separator(self):
+        """Guarda la posición actual del separador."""
+        try:
+            if hasattr(self, "processed_paned"):
+                total_width = self.processed_paned.winfo_width()
+                sash_pos = self.processed_paned.sashpos(0)
+                safe_position = self.processed_separator_position(total_width, sash_pos / total_width) if total_width > 0 else 0
+                ratio = safe_position / total_width if total_width > 0 else 0.65
+                
+                config_path = Path.home() / ".visionvault"
+                config_path.mkdir(parents=True, exist_ok=True)
+                
+                with open(config_path / "processed_separator.json", "w") as f:
+                    json.dump({"separator_ratio": ratio}, f)
+        except Exception:
+            pass
 
     # Durante una edición anterior estos métodos quedaron dentro de este
     # ayudante de exportación. Al instalarlos explícitamente en la clase se

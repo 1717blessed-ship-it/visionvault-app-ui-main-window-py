@@ -23,6 +23,10 @@ def calculate_priority(order: dict, estimated_work_minutes: int = 0) -> tuple[Pr
     Returns:
         (nivel_prioridad, score_numerico, razón_principal)
     """
+    status = str(order.get("status") or "").strip().casefold()
+    if status in {"entregado", "terminado"}:
+        return "Sin prisa", 0, "Pedido entregado"
+
     score = 0
     reasons = []
     delivery_level: PriorityLevel | None = None

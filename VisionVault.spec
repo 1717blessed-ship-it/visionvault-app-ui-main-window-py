@@ -6,7 +6,9 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    # ``fitz`` se importa bajo demanda al cotizar PDFs; declararlo evita que
+    # PyInstaller lo descarte al generar el ejecutable.
+    hiddenimports=['fitz'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

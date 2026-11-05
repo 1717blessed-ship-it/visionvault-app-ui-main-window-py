@@ -1,0 +1,60 @@
+{
+  "cold_start": {
+    "avg_wall_ms": 1114.5,
+    "measurements": [
+      1129.4,
+      1108.0,
+      1106.1
+    ],
+    "avg_db_init_ms": null,
+    "avg_app_init_ms": null
+  },
+  "hot_start": {
+    "avg_wall_ms": 1111.9,
+    "measurements": [
+      1118.4,
+      1115.9,
+      1101.5
+    ]
+  },
+  "cold_raw": [
+    {
+      "error": "{\n  \"import_times\": {\n    \"tkinter\": 35.45,\n    \"tkinter.ttk\": 7.86,\n    \"tkinter.messagebox\": 1.63,\n    \"tkinter.filedialog\": 5.63,\n    \"tkinter.simpledialog\": 0.0,\n    \"sqlite3\": 3.58,\n    \"threading\": 1.48,\n    \"json\": 0.0,\n    \"csv\": 0.58,\n    \"pathlib\": 0.0,\n    \"datetime\": 0.0,\n    \"re\": 0.0,\n    \"os\": 0.0,\n    \"sys\": 0.0,\n    \"traceback\": 2.51,\n    \"time\": 0.0,\n    \"subprocess\": 2.31,\n    \"webbrowser\": 7.16,\n    \"zipfile\": 3.67,\n    \"tempfile\": 2.38,\n    \"calendar\": 0.89,\n    \"app.database.database\": 26.77,\n    \"app.ui.main_window\": 59.2\n  },\n  \"db_init_time_ms\": 3.5,\n  \"app_init_time_ms\": 770.17,\n  \"table_count\": 36,\n  \"index_count\": 54,\n  \"total_widgets\": 330,\n  \"after_callbacks\": -1,\n  \"memory_current_bytes\": 0,\n  \"memory_peak_bytes\": 0\n}\n",
+      "elapsed_ms": 1129.4,
+      "wall_clock_ms": 1129.4
+    },
+    {
+      "error": "{\n  \"import_times\": {\n    \"tkinter\": 33.74,\n    \"tkinter.ttk\": 6.29,\n    \"tkinter.messagebox\": 1.89,\n    \"tkinter.filedialog\": 5.58,\n    \"tkinter.simpledialog\": 0.0,\n    \"sqlite3\": 3.34,\n    \"threading\": 1.43,\n    \"json\": 0.0,\n    \"csv\": 0.56,\n    \"pathlib\": 0.0,\n    \"datetime\": 0.0,\n    \"re\": 0.0,\n    \"os\": 0.0,\n    \"sys\": 0.0,\n    \"traceback\": 2.39,\n    \"time\": 0.0,\n    \"subprocess\": 2.35,\n    \"webbrowser\": 7.02,\n    \"zipfile\": 3.08,\n    \"tempfile\": 2.14,\n    \"calendar\": 0.86,\n    \"app.database.database\": 26.29,\n    \"app.ui.main_window\": 58.95\n  },\n  \"db_init_time_ms\": 3.35,\n  \"app_init_time_ms\": 752.66,\n  \"table_count\": 36,\n  \"index_count\": 54,\n  \"total_widgets\": 330,\n  \"after_callbacks\": -1,\n  \"memory_current_bytes\": 0,\n  \"memory_peak_bytes\": 0\n}\n",
+      "elapsed_ms": 1108.0,
+      "wall_clock_ms": 1108.0
+    },
+    {
+      "error": "{\n  \"import_times\": {\n    \"tkinter\": 33.99,\n    \"tkinter.ttk\": 6.46,\n    \"tkinter.messagebox\": 1.55,\n    \"tkinter.filedialog\": 5.45,\n    \"tkinter.simpledialog\": 0.0,\n    \"sqlite3\": 3.46,\n    \"threading\": 1.43,\n    \"json\": 0.0,\n    \"csv\": 0.57,\n    \"pathlib\": 0.0,\n    \"datetime\": 0.0,\n    \"re\": 0.0,\n    \"os\": 0.0,\n    \"sys\": 0.0,\n    \"traceback\": 2.85,\n    \"time\": 0.0,\n    \"subprocess\": 2.54,\n    \"webbrowser\": 7.26,\n    \"zipfile\": 3.3,\n    \"tempfile\": 2.47,\n    \"calendar\": 0.86,\n    \"app.database.database\": 25.12,\n    \"app.ui.main_window\": 57.32\n  },\n  \"db_init_time_ms\": 3.49,\n  \"app_init_time_ms\": 758.03,\n  \"table_count\": 36,\n  \"index_count\": 54,\n  \"total_widgets\": 330,\n  \"after_callbacks\": -1,\n  \"memory_current_bytes\": 0,\n  \"memory_peak_bytes\": 0\n}\n",
+      "elapsed_ms": 1106.1,
+      "wall_clock_ms": 1106.1
+    }
+  ],
+  "hot_raw": [
+    {
+      "import_ms": 163.09,
+      "app_init_ms": 763.89,
+      "mem_current": 0,
+      "mem_peak": 0,
+      "wall_clock_ms": 1118.4
+    },
+    {
+      "import_ms": 159.85,
+      "app_init_ms": 762.3,
+      "mem_current": 0,
+      "mem_peak": 0,
+      "wall_clock_ms": 1115.9
+    },
+    {
+      "import_ms": 163.22,
+      "app_init_ms": 749.04,
+      "mem_current": 0,
+      "mem_peak": 0,
+      "wall_clock_ms": 1101.5
+    }
+  ]
+}
