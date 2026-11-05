@@ -402,6 +402,47 @@ class TestTransactionalStageChange:
         assert success is False
         assert job_data is None
 
+    def test_delivering_last_job_clears_order_priority(
+        self, stage_service, repo, sample_order, sample_device
+    ):
+        conn = repo.conn
+        # This transition test represents physically fulfilled jobs.
+        conn.executescript("""
+            CREATE TABLE plancha_item_assignments(order_job_id INTEGER,quantity REAL,state TEXT);
+            CREATE TABLE order_design_demand_lines(order_job_id INTEGER);
+            INSERT INTO plancha_item_assignments
+                SELECT id,quantity,'finished' FROM order_jobs;
+        """)
+        from app.services.delivery_readiness import install_delivery_guards
+        install_delivery_guards(conn)
+        order_id = sample_order
+        device_id, _ = sample_device
+        jobs = conn.execute(
+            "SELECT id FROM order_jobs WHERE order_id = ? ORDER BY id", (order_id,)
+        ).fetchall()
+        conn.execute(
+            "UPDATE order_jobs SET status = 'Entregado' WHERE id = ?", (jobs[0]["id"],)
+        )
+        conn.execute(
+            "UPDATE orders SET print_priority = 4 WHERE id = ?", (order_id,)
+        )
+        conn.commit()
+
+        success, _, _ = stage_service.change_job_stage(
+            job_id=jobs[1]["id"],
+            new_stage="Entregado",
+            device_id=device_id,
+            device_name="Test Device",
+            source="mobile",
+        )
+
+        order = conn.execute(
+            "SELECT status, print_priority FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        assert success is True
+        assert order["status"] == "Entregado"
+        assert order["print_priority"] == 0
+
 
 class TestSessionTokenGeneration:
     """Tests para generación y validación de session tokens."""

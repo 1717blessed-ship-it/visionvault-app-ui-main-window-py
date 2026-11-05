@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 import uuid
 import ntpath
+import math
+import copy
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -44,6 +47,16 @@ WORKSPACE_FORMATS = {
     "a5": ("A5 (media A4)", 1 / 2),
     "franja": ("Franja horizontal (1/5 A4)", 1 / 5),
 }
+
+
+class PaginationError(ValueError):
+    """La salida parcial no está autorizada: ninguna tanda debe confirmarla."""
+    def __init__(self, report, pages):
+        self.report, self.pages = report, pages
+        super().__init__('Distribución incompleta; no se confirma la tanda:\n' + '\n'.join(
+            f"{r['design']} [{r['reference']}] {r['width_cm']:g}×{r['height_cm']:g} cm · "
+            f"solicitadas {r['requested']}, colocadas {r['placed']}, no colocadas {r['unplaced']} · "
+            f"{r['reason']}. {r['action']}" for r in report))
 
 
 @dataclass
@@ -180,7 +193,12 @@ def requested_unit_key(
 def visible_bbox(image):
     """Caja de la silueta visible, incluso en PNG/JPG con fondo blanco opaco."""
     rgba = image.convert("RGBA")
-    alpha_box = rgba.getchannel("A").getbbox()
+    # Un alfa apenas distinto de cero no es necesariamente parte visible del
+    # sticker. Varios PNG de Biblioteca contienen residuos de exportación con
+    # opacidad 1..8 alrededor del diseño; ``getbbox()`` los incluía y hacía
+    # que el contenido humano perceptible quedara más pequeño en la plancha.
+    visible_alpha = rgba.getchannel("A").point(lambda value: 255 if value > 8 else 0)
+    alpha_box = visible_alpha.getbbox()
     if alpha_box and (alpha_box[2] - alpha_box[0] < rgba.width * 0.98 or alpha_box[3] - alpha_box[1] < rgba.height * 0.98):
         return _padded_box(alpha_box, rgba.size)
 
@@ -217,18 +235,29 @@ def size_from_visible_dimensions(width: int | float, height: int | float, reques
     return round(requested_size_cm * width / height, 3), requested_size_cm
 
 
+@lru_cache(maxsize=2048)
+def _visible_dimensions_for_file(path: str, modified_ns: int, file_size: int) -> tuple[int, int]:
+    """Métrica visible cacheada e invalidada al cambiar el archivo."""
+    del modified_ns, file_size
+    from PIL import Image
+
+    with Image.open(path) as image:
+        left, top, right, bottom = visible_bbox(image)
+    return max(1, right - left), max(1, bottom - top)
+
+
+def visible_dimensions_for_path(path: str) -> tuple[int, int]:
+    """Dimensiones perceptibles, ignorando residuos alfa casi invisibles."""
+    try:
+        stat = Path(path).stat()
+        return _visible_dimensions_for_file(str(Path(path)), stat.st_mtime_ns, stat.st_size)
+    except Exception:
+        return 1, 1
+
+
 def size_for_image(path: str, requested_size_cm: float = STANDARD_SIZE_CM) -> tuple[float, float]:
     """Devuelve medidas de la silueta, sin abrir ni modificar el original."""
-    try:
-        from PIL import Image
-
-        with Image.open(path) as image:
-            left, top, right, bottom = visible_bbox(image)
-            width, height = right - left, bottom - top
-        if width <= 0 or height <= 0:
-            raise ValueError
-    except Exception:
-        width, height = 1, 1
+    width, height = visible_dimensions_for_path(path)
     return size_from_visible_dimensions(width, height, requested_size_cm)
 
 
@@ -863,14 +892,25 @@ class PlanchaProject:
                 current_major = max(width, height)
                 width, height = width * production_major / current_major, height * production_major / current_major
             
-            # Conservar la orientación física del diseño. El empaquetador
-            # puede rotar una copia cuando sea conveniente, pero la creación
-            # del item no debe alterar el ancho/alto ni la rotación original.
-            rotation = int(image.get("rotation", 0) or 0) % 360
+            # La lectura productiva de stickers es vertical: el lado mayor
+            # debe apuntar hacia arriba. La entrada desde Biblioteca ya aplica
+            # esta regla; los diseños provenientes de pedidos también deben
+            # normalizarse aquí para no depender de cuál fue su puerta de
+            # entrada al Creador de Planchas. Sólo intercambiamos los ejes y
+            # registramos el cuarto de vuelta: nunca escalamos ni deformamos.
+            source_rotation = int(image.get("rotation", 0) or 0) % 360
+            rotation = source_rotation
+            # ``visible_width``/``visible_height`` describen el archivo base;
+            # una rotación persistida de 90°/270° ya invierte su caja física.
+            if source_rotation % 180:
+                width, height = height, width
+            if width > height:
+                width, height = height, width
+                rotation = (rotation + 90) % 360
             design_line_id = str(image.get("order_design_line_id") or "").strip()
             
             group_id = order_design_group_id(
-                order_id, image["path"], order_job_id, nominal_size, rotation,
+                order_id, image["path"], order_job_id, nominal_size, source_rotation,
             ) if order_id is not None else uuid.uuid4().hex
             copy_numbers = image.get("order_copy_numbers")
             if copy_numbers is None:
@@ -883,7 +923,7 @@ class PlanchaProject:
                 if order_id is not None and order_job_id is not None:
                     unit_key = requested_unit_key(
                         int(order_id), int(order_job_id), image["path"], nominal_size,
-                        rotation, copy_num, design_line_id=design_line_id,
+                        source_rotation, copy_num, design_line_id=design_line_id,
                     )
                 items.append(PlanchaItem(
                     path=image["path"], 
@@ -905,7 +945,10 @@ class PlanchaProject:
                     nominal_size_cm=nominal_size,
                     order_nominal_size_cm=nominal_size if order_id is not None else None,
                     rotation=rotation,
-                    rotation_allowed=True,  # Permitir rotación adicional para optimizar packing
+                    # La orientación vertical normalizada es el valor seguro
+                    # por defecto. El usuario todavía puede habilitar una
+                    # rotación adicional desde el inspector cuando la quiera.
+                    rotation_allowed=False,
                     # En estándar 5,70 cm es el lado mayor productivo + la
                     # guarda, no una celda cuadrada: un diseño 2:1 conserva
                     # su lado corto real y puede aprovechar la franja.
@@ -969,6 +1012,7 @@ class PlanchaProject:
             item.y_cm = round(min(max(self.margin_cm, item.y_cm), max_y), 3)
 
     def optimize(self, progress=None) -> list[PlanchaItem]:
+        self._restored_geometry = False
         if self.layout_mode == "special":
             return self._optimize_special(progress)
         return self._optimize_five_bands(progress)
@@ -1073,6 +1117,7 @@ class PlanchaProject:
 
         # Justify each row independently. It removes the visible unused strip
         # on either side without moving a sticker into another band.
+        last_row = max((index for index, row in enumerate(rows) if row), default=-1)
         for row_index, row in enumerate(rows):
             if not row:
                 continue
@@ -1082,7 +1127,12 @@ class PlanchaProject:
             used_width = sum(item.width_cm for item in row)
             tallest = max(item.height_cm for item in row)
             y = top + sum(band_heights[:row_index]) + (band_heights[row_index] - gap - tallest) / 2
-            if len(row) == 1:
+            if row_index == last_row and self._incomplete_row([item.width_cm for item in row]):
+                x = left
+                for item in row:
+                    item.x_cm = round(x, 3)
+                    x += item.width_cm + gap
+            elif len(row) == 1:
                 row[0].x_cm = round(left + (self.usable_width - used_width) / 2, 3)
             else:
                 row_gap = max(gap, (self.usable_width - used_width) / (len(row) - 1))
@@ -1104,6 +1154,8 @@ class PlanchaProject:
         primero la fila superior donde entre cada diseño (first-fit decreasing),
         para conservar una lectura y corte claros de izquierda a derecha.
         """
+        if self.project_type == "sticker_standard":
+            self.normalize_standard_geometry()
         if any(item.locked for item in self.items):
             return self._optimize_locked_five_bands(progress)
 
@@ -1228,6 +1280,7 @@ class PlanchaProject:
             best_rows = [best_rows[index] for index in order]
             band_heights = [band_heights[index] for index in order]
 
+        last_row = max((index for index, row in enumerate(best_rows) if row), default=-1)
         for row_index, row in enumerate(best_rows):
             if not row:
                 continue
@@ -1235,7 +1288,9 @@ class PlanchaProject:
             # se llenó. Así la lectura visual es siempre izquierda → derecha.
             used_width = sum(width for _index, _item, width, _height, _rotated in row)
             row_height = max(height for _index, _item, _width, height, _rotated in row)
-            if len(row) == 1:
+            if row_index == last_row and self._incomplete_row([width for _index, _item, width, _height, _rotated in row]):
+                x, row_gap = left, gap
+            elif len(row) == 1:
                 x = left + (capacity - used_width) / 2
                 row_gap = gap
             else:
@@ -1261,9 +1316,69 @@ class PlanchaProject:
         self.keep_inside_print_area()
         return best_overflow
 
+    def normalize_standard_geometry(self) -> bool:
+        """Iguala el lado mayor de todos los stickers del producto estándar.
+
+        Un diseño agregado desde Biblioteca partía del mínimo productivo,
+        mientras uno proveniente de un pedido usaba el máximo permitido por
+        la franja. Ambos representan el mismo producto nominal y deben ocupar
+        el mismo estándar físico. Se escala cada caja proporcionalmente, sin
+        convertir rectángulos en cuadrados ni alterar su orientación.
+
+        Devuelve ``True`` cuando debió corregir geometría guardada. Esto
+        permite que cualquier vista previa antigua vuelva a organizar la hoja
+        una sola vez antes de dibujarla, sin acumular escalados sucesivos.
+        """
+        if self.project_type != "sticker_standard":
+            return False
+
+        changed = False
+        for item in self.items:
+            nominal = float(item.nominal_size_cm or 5.0)
+            target_major = min(
+                production_max_for_nominal(nominal),
+                FIVE_ROW_SIZE_CM - 0.02,
+            )
+            # No confiar ciegamente en ``visible_width`` histórico: las
+            # métricas anteriores incluían residuos alfa imperceptibles. La
+            # lectura cacheada del archivo real corrige también proyectos ya
+            # guardados, manteniendo la orientación decidida por el editor.
+            if Path(item.path).is_file():
+                target_width, target_height = size_for_image(item.path, target_major)
+                if item.rotation % 180:
+                    target_width, target_height = target_height, target_width
+            else:
+                current_major = max(float(item.width_cm), float(item.height_cm))
+                if current_major <= EPSILON:
+                    continue
+                scale = target_major / current_major
+                target_width = item.width_cm * scale
+                target_height = item.height_cm * scale
+            target_layout_width = target_width + 2 * HITBOX_INNER_CLEARANCE_CM
+            target_layout_height = target_height + 2 * HITBOX_INNER_CLEARANCE_CM
+            if (
+                abs(item.width_cm - target_width) > EPSILON
+                or abs(item.height_cm - target_height) > EPSILON
+                or abs(item.reserved_width_cm - target_layout_width) > EPSILON
+                or abs(item.reserved_height_cm - target_layout_height) > EPSILON
+            ):
+                changed = True
+            item.width_cm = target_width
+            item.height_cm = target_height
+            item.layout_width_cm = item.width_cm + 2 * HITBOX_INNER_CLEARANCE_CM
+            item.layout_height_cm = item.height_cm + 2 * HITBOX_INNER_CLEARANCE_CM
+        return changed
+
     def _optimize_geometric(self, progress=None) -> list[PlanchaItem]:
         items = [item.to_dict() for item in self.items]
-        result = geometric_pack(items, extra_cm=SPECIAL_LAYOUT_EXTRA_CM, allow_rotation=True, strategy="area_desc")
+        # La variante geométrica debe respetar el mismo contrato del editor:
+        # sólo puede invertir un diseño cuando su rotación fue autorizada.
+        # Así no deshace silenciosamente la orientación vertical de ingreso.
+        allow_rotation = all(item.rotation_allowed for item in self.items)
+        result = geometric_pack(
+            items, extra_cm=SPECIAL_LAYOUT_EXTRA_CM,
+            allow_rotation=allow_rotation, strategy="area_desc",
+        )
 
         placed_by_id = {item["item_id"]: item for item in result.placed if "item_id" in item}
         overflow_ids = {item["item_id"] for item in result.overflow if isinstance(item, dict) and "item_id" in item}
@@ -1473,10 +1588,21 @@ class PlanchaProject:
         self.justify_rows(placed)
         return overflow
 
+    def _incomplete_row(self, widths: list[float]) -> bool:
+        """A row is partial if another smallest member fits at the normal gap.
+
+        Use the distributor's reserved widths, not a fixed sticker count, so
+        mixed sizes and rotated pieces retain their physical clearance.
+        """
+        return bool(widths) and (
+            sum(widths) + self.gap_cm * len(widths) + min(widths)
+            <= self.usable_width + 0.0001
+        )
+
     def justify_rows(self, items: list[PlanchaItem] | None = None) -> None:
         """Reparte cada fila al ancho útil, manteniendo la separación segura."""
         items = self.items if items is None else items
-        if len(items) < 2:
+        if not items:
             return
         tolerance = 0.02
         rows: list[list[PlanchaItem]] = []
@@ -1488,11 +1614,12 @@ class PlanchaProject:
                 row.append(item)
 
         for row in rows:
-            if len(row) < 2 or any(item.locked for item in row):
+            partial_last = row is rows[-1] and self._incomplete_row([item.width_cm for item in row])
+            if (len(row) < 2 and not partial_last) or any(item.locked for item in row):
                 continue
             row.sort(key=lambda item: item.x_cm)
             used_width = sum(item.width_cm for item in row)
-            available_gap = (self.usable_width - used_width) / (len(row) - 1)
+            available_gap = self.gap_cm if partial_last else (self.usable_width - used_width) / (len(row) - 1)
             if available_gap < self.gap_cm - 0.0001:
                 continue
             outside = [item for item in items if item not in row]
@@ -1500,7 +1627,7 @@ class PlanchaProject:
             # ocupa un hueco, conserva la distribución equitativa más amplia
             # que siga siendo físicamente válida.
             chosen = None
-            for step in range(100, -1, -1):
+            for step in ([0] if partial_last else range(100, -1, -1)):
                 row_gap = self.gap_cm + (available_gap - self.gap_cm) * step / 100
                 proposed = []
                 x = self.margin_cm
@@ -1584,7 +1711,7 @@ class PlanchaProject:
         return min(100.0, area * 100 / usable_area) if usable_area else 0.0
 
     def to_dict(self) -> dict:
-        return {
+        return {**copy.deepcopy(getattr(self, '_persisted_options', {})),
             "version": 1,
             "paper": "A4 vertical",
             "width_cm": A4_WIDTH_CM,
@@ -1599,22 +1726,36 @@ class PlanchaProject:
         }
 
     def save(self, path: str | Path) -> None:
-        Path(path).write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        from app.planchas.output_safety import save_text
+        save_text(path, json.dumps(self.to_dict(), ensure_ascii=False, indent=2))
 
     @classmethod
     def from_dict(cls, data: dict) -> "PlanchaProject":
         workspace_format = data.get("workspace_format", "a4")
-        return cls(
+        def dimension(key, fallback):
+            value = float(data[key]) if key in data else fallback
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f'Parámetro de proyecto inválido: {key}={value}')
+            return value
+        project = cls(
             [PlanchaItem.from_dict(item) for item in data.get("items", [])],
-            A5_PRINT_MARGIN_CM if workspace_format == "a5" else PRINT_MARGIN_CM, 0.05,
+            dimension('margin_cm', A5_PRINT_MARGIN_CM if workspace_format == "a5" else PRINT_MARGIN_CM),
+            dimension('gap_cm', 0.05),
             data.get("layout_mode", "classic"), workspace_format,
             data.get("project_type", "legacy"), data.get("manual_from_mixed", False),
         )
+        if workspace_format not in WORKSPACE_FORMATS or project.usable_width <= 0 or project.usable_height <= 0:
+            raise ValueError('Formato o margen de proyecto incompatible con el área imprimible.')
+        known = {'items', 'margin_cm', 'gap_cm', 'layout_mode', 'workspace_format', 'project_type', 'manual_from_mixed'}
+        project._persisted_options = copy.deepcopy({key: value for key, value in data.items() if key not in known})
+        project._restored_geometry = True
+        return project
 
     @staticmethod
     def calculate_pagination(all_items: list[PlanchaItem], margin_cm: float = PRINT_MARGIN_CM,
                             gap_cm: float = 0.05, layout_mode: str = "classic", 
-                            workspace_format: str = "a4", progress=None) -> list["PlanchaProject"]:
+                            workspace_format: str = "a4", progress=None,
+                            project_type: str = "legacy") -> list["PlanchaProject"]:
         """Calcula automáticamente la paginación de stickers en múltiples planchas.
         
         Reutiliza el algoritmo de optimización existente para distribuir stickers
@@ -1642,7 +1783,8 @@ class PlanchaProject:
                 margin_cm=margin_cm,
                 gap_cm=gap_cm,
                 layout_mode=layout_mode,
-                workspace_format=workspace_format
+                workspace_format=workspace_format,
+                project_type=project_type,
             )
             
             # Optimizar esta plancha
@@ -1653,8 +1795,27 @@ class PlanchaProject:
             placed_items = [item for item in current_project.items if item.item_id not in overflow_ids]
             
             if not placed_items:
-                # Si ningún item entra, romper para evitar loop infinito
-                break
+                report = []
+                for item in remaining_items:
+                    orientations = [(item.reserved_width_cm, item.reserved_height_cm)]
+                    if item.rotation_allowed:
+                        orientations.append((item.reserved_height_cm, item.reserved_width_cm))
+                    fits_a4 = any(w <= A4_WIDTH_CM and h <= A4_HEIGHT_CM for w, h in orientations)
+                    fits_margins = any(w <= current_project.usable_width and h <= current_project.usable_height for w, h in orientations)
+                    reason = ('Pieza demasiado grande para A4' if not fits_a4 else
+                              'Márgenes o separación incompatibles' if not fits_margins else
+                              'Restricción de formato/franja o error de distribución')
+                    related = [candidate for candidate in all_items if candidate.path == item.path
+                               and candidate.group_id == item.group_id]
+                    placed_ids = {candidate.item_id for page in projects for candidate in page.items}
+                    if any(r['reference'] == item.group_id for r in report):
+                        continue
+                    placed = sum(candidate.item_id in placed_ids for candidate in related)
+                    report.append(dict(design=item.name, reference=item.group_id, path=item.path,
+                                       width_cm=item.width_cm, height_cm=item.height_cm,
+                                       requested=len(related), placed=placed, unplaced=len(related)-placed,
+                                       reason=reason, action='Revisá tamaño, formato y parámetros sin cambiar la calibración.'))
+                raise PaginationError(report, projects)
                 
             # Actualizar el proyecto con solo los items colocados
             current_project.items = placed_items
@@ -1673,3 +1834,17 @@ class PlanchaProject:
     @classmethod
     def load(cls, path: str | Path) -> "PlanchaProject":
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+    @staticmethod
+    def save_pages(path, projects):
+        from app.planchas.output_safety import save_text
+        save_text(path, json.dumps({'version': 1, 'projects': [project.to_dict() for project in projects]},
+                                   ensure_ascii=False, indent=2))
+
+    @classmethod
+    def load_pages(cls, path):
+        data = json.loads(Path(path).read_text(encoding='utf-8'))
+        pages = data.get('projects') if 'projects' in data else [data]
+        if not pages:
+            raise ValueError('El conjunto guardado no contiene páginas.')
+        return [cls.from_dict(page) for page in pages]

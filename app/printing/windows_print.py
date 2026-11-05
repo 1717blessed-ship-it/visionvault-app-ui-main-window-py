@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+from app.planchas.production_geometry import PRINT_SCALE, calibrated_print_pixels
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +14,21 @@ class PrintResult:
     success: bool
     message: str
     spool_job_id: int | None = None
+
+
+PRINT_SATURATION_FACTOR = 1.08
+PRINT_SCALE_PERCENT = PRINT_SCALE * 100
+
+
+def _prepare_print_image(source):
+    """Compone sobre blanco y realza levemente el color solo al imprimir."""
+    from PIL import Image, ImageEnhance
+
+    rgba = source.convert("RGBA")
+    page = Image.new("RGBA", rgba.size, "white")
+    page.alpha_composite(rgba)
+    enhanced = ImageEnhance.Color(page.convert("RGB")).enhance(PRINT_SATURATION_FACTOR)
+    return enhanced.convert("RGBA")
 
 
 def _windows_only() -> bool:
@@ -100,7 +116,7 @@ def validate_a4_png(path: str | Path) -> tuple[bool, str]:
 
 
 def print_png(printer_name: str, path: str | Path, copies: int = 1, document_name: str = "Doccione Studio") -> PrintResult:
-    """Envía el PNG A4 en color, al 100 %, mediante GDI y la cola de Windows."""
+    """Envía el PNG A4 en color con la calibración fija de 97,27 %."""
     valid, message = validate_a4_png(path)
     if not valid:
         return PrintResult(False, message)
@@ -113,10 +129,7 @@ def print_png(printer_name: str, path: str | Path, copies: int = 1, document_nam
         from PIL import Image
 
         with Image.open(path) as source:
-            source = source.convert("RGBA")
-            page = Image.new("RGBA", source.size, "white")
-            page.alpha_composite(source)
-            page = page.convert("RGBA")
+            page = _prepare_print_image(source)
             width, height = page.size
             pixels = page.tobytes("raw", "BGRA")
     except Exception:
@@ -151,17 +164,38 @@ def print_png(printer_name: str, path: str | Path, copies: int = 1, document_nam
     gdi.AbortDoc.argtypes = [ctypes.c_void_p]
     gdi.SetStretchBltMode.argtypes = [ctypes.c_void_p, ctypes.c_int]
     gdi.SetViewportOrgEx.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    # StretchDIBits no infiere que el primer parámetro es un HDC (puntero).
+    # Sin esta firma ctypes lo convierte como c_int y falla en Windows x64
+    # cuando el identificador de la impresora supera el rango de 32 bits.
+    gdi.StretchDIBits.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+    ]
+    gdi.StretchDIBits.restype = ctypes.c_int
     hdc = gdi.CreateDCW("WINSPOOL", printer_name, None, None)
     if not hdc:
         return PrintResult(False, "No se pudo crear la conexión con la impresora configurada.")
     try:
-        # La resolución de destino conserva el tamaño físico A4 sin ajustar.
+        # La calibración se aplica siempre en la última etapa, antes de que el
+        # driver procese el trabajo. Así todos los diseños salen al 97,27 %.
         dpi_x, dpi_y = gdi.GetDeviceCaps(hdc, 88), gdi.GetDeviceCaps(hdc, 90)  # LOGPIXELSX/Y
         physical_w, physical_h = gdi.GetDeviceCaps(hdc, 110), gdi.GetDeviceCaps(hdc, 111)  # PHYSICALWIDTH/HEIGHT
         offset_x, offset_y = gdi.GetDeviceCaps(hdc, 112), gdi.GetDeviceCaps(hdc, 113)  # PHYSICALOFFSETX/Y
-        target_w, target_h = round(21 / 2.54 * dpi_x), round(29.7 / 2.54 * dpi_y)
-        if physical_w and physical_h and (target_w > physical_w + 2 or target_h > physical_h + 2):
-            return PrintResult(False, "La impresora no admite A4 vertical al 100 % con su configuración actual.")
+        printable_w, printable_h = gdi.GetDeviceCaps(hdc, 8), gdi.GetDeviceCaps(hdc, 10)  # HORZRES/VERTRES
+        target_w = round(21 / 2.54 * dpi_x * PRINT_SCALE)
+        target_h = round(29.7 / 2.54 * dpi_y * PRINT_SCALE)
+        if printable_w and printable_h and (target_w > printable_w or target_h > printable_h):
+            # Algunos drivers dejan un área útil menor que el A4 físico. Se
+            # reduce lo mínimo necesario para no perder el borde superior.
+            fit = min(printable_w / target_w, printable_h / target_h)
+            target_w, target_h = round(target_w * fit), round(target_h * fit)
+        if printable_w and printable_h and (target_w > printable_w + 2 or target_h > printable_h + 2):
+            return PrintResult(False, "La impresora no admite A4 vertical con su configuración actual.")
+        # El viewport se lleva al origen físico. Para quedar en el centro de
+        # lo que la impresora puede imprimir se suma su desplazamiento físico.
+        draw_x = offset_x + max(0, (printable_w - target_w) // 2) if printable_w else 0
+        draw_y = offset_y + max(0, (printable_h - target_h) // 2) if printable_h else 0
         info = DOCINFOW(ctypes.sizeof(DOCINFOW), document_name, None, None, 0)
         spool_job_id = gdi.StartDocW(hdc, ctypes.byref(info))
         if spool_job_id <= 0:
@@ -179,7 +213,7 @@ def print_png(printer_name: str, path: str | Path, copies: int = 1, document_nam
             gdi.SetViewportOrgEx(hdc, -offset_x, -offset_y, None)
             gdi.SetStretchBltMode(hdc, 4)  # HALFTONE
             drawn = gdi.StretchDIBits(
-                hdc, 0, 0, target_w, target_h, 0, 0, width, height, buffer,
+                hdc, draw_x, draw_y, target_w, target_h, 0, 0, width, height, buffer,
                 ctypes.byref(bitmap), 0, 0x00CC0020,  # DIB_RGB_COLORS · SRCCOPY
             )
             if drawn in (0, -1) or gdi.EndPage(hdc) <= 0:
@@ -349,6 +383,8 @@ def print_png_strip(
     copies: int = 1,
     document_name: str = "Doccione Continua",
     devmode_bytes: bytes | None = None,
+    scale_percent: float = PRINT_SCALE_PERCENT,
+    strict_calibration: bool = False,
 ) -> PrintResult:
     """Envía una tira continua (alto variable) a la impresora mediante GDI.
 
@@ -373,12 +409,12 @@ def print_png_strip(
         from PIL import Image
 
         with Image.open(path) as source:
-            source = source.convert("RGBA")
-            page = Image.new("RGBA", source.size, "white")
-            page.alpha_composite(source)
-            page = page.convert("RGBA")
+            source_dpi = source.info.get("dpi", (300, 300))
+            page = _prepare_print_image(source)
             strip_width, strip_height = page.size
             pixels = page.tobytes("raw", "BGRA")
+            source_dpi_x = max(1.0, float(source_dpi[0] if source_dpi else 300))
+            source_dpi_y = max(1.0, float(source_dpi[1] if source_dpi else 300))
     except Exception as error:
         return PrintResult(False, f"No se pudo preparar la tira para impresión: {error}")
 
@@ -417,6 +453,14 @@ def print_png_strip(
     gdi.AbortDoc.argtypes = [ctypes.c_void_p]
     gdi.SetStretchBltMode.argtypes = [ctypes.c_void_p, ctypes.c_int]
     gdi.SetViewportOrgEx.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    # Ver la misma declaración en print_png: el HDC debe viajar como puntero
+    # para evitar OverflowError al imprimir desde Windows de 64 bits.
+    gdi.StretchDIBits.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+    ]
+    gdi.StretchDIBits.restype = ctypes.c_int
 
     # Aplicar el DEVMODE elegido por el usuario si está disponible.
     dm_buffer = None
@@ -435,6 +479,8 @@ def print_png_strip(
         physical_h = gdi.GetDeviceCaps(hdc, 111)  # PHYSICALHEIGHT
         offset_x = gdi.GetDeviceCaps(hdc, 112)    # PHYSICALOFFSETX
         offset_y = gdi.GetDeviceCaps(hdc, 113)    # PHYSICALOFFSETY
+        printable_w = gdi.GetDeviceCaps(hdc, 8)   # HORZRES
+        printable_h = gdi.GetDeviceCaps(hdc, 10)  # VERTRES
 
         if not dpi_x or not dpi_y:
             dpi_x = dpi_y = 300
@@ -442,11 +488,34 @@ def print_png_strip(
         # Escalar la imagen al tamaño físico real de la página configurada.
         # Si la impresora no reporta dimensiones físicas se usa la resolución
         # del PNG como referencia directa (sin escalar).
-        if physical_w and physical_h:
-            target_w, target_h = physical_w, physical_h
-        else:
-            target_w = round(strip_width * dpi_x / 300)
-            target_h = round(strip_height * dpi_y / 300)
+        # ``scale_percent`` se mantiene por compatibilidad con trabajos
+        # guardados, pero no puede alterar la calibración global de impresión.
+        scale = PRINT_SCALE
+        target_w = max(1, round(strip_width * dpi_x / source_dpi_x * scale))
+        target_h = max(1, round(strip_height * dpi_y / source_dpi_y * scale))
+        if strict_calibration:
+            try:
+                target_w, target_h = calibrated_print_pixels(
+                    strip_width, strip_height, dpi_x, dpi_y, source_dpi_x, source_dpi_y,
+                    printable_width=printable_w, printable_height=printable_h)
+            except ValueError as error:
+                return PrintResult(False, str(error))
+        if not strict_calibration and printable_w and target_w > printable_w:
+            fit = printable_w / target_w
+            target_w = max(1, round(target_w * fit))
+            target_h = max(1, round(target_h * fit))
+        if printable_w and target_w > printable_w + 2:
+            return PrintResult(False, "El ancho configurado en la impresora no admite una plancha A4.")
+        if not strict_calibration and printable_h and target_h > printable_h:
+            # Para Hoja esta es la diferencia entre imprimir centrado o comer
+            # el diseño en el borde superior no imprimible.
+            fit = printable_h / target_h
+            target_w = max(1, round(target_w * fit))
+            target_h = max(1, round(target_h * fit))
+        if printable_h and target_h > printable_h + 2:
+            return PrintResult(False, "El largo configurado en la impresora es menor que la tira a imprimir.")
+        draw_x = offset_x + max(0, (printable_w - target_w) // 2) if printable_w else 0
+        draw_y = offset_y + max(0, (printable_h - target_h) // 2) if printable_h else 0
 
         info = DOCINFOW(ctypes.sizeof(DOCINFOW), document_name, None, None, 0)
         spool_job_id = gdi.StartDocW(hdc, ctypes.byref(info))
@@ -467,7 +536,7 @@ def print_png_strip(
             gdi.SetViewportOrgEx(hdc, -offset_x, -offset_y, None)
             gdi.SetStretchBltMode(hdc, 4)  # HALFTONE
             drawn = gdi.StretchDIBits(
-                hdc, 0, 0, target_w, target_h,
+                hdc, draw_x, draw_y, target_w, target_h,
                 0, 0, strip_width, strip_height,
                 buffer, ctypes.byref(bitmap),
                 0, 0x00CC0020,  # DIB_RGB_COLORS · SRCCOPY

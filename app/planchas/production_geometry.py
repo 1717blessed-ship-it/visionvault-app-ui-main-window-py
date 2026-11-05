@@ -12,6 +12,23 @@ CUT_INSET_CM = CUT_INSET_MM / 10.0
 MAX_FINAL_BONUS_CM = 0.50
 
 
+def validate_print_scale(value) -> bool:
+    """Escala lógica histórica 100 o compensación 97,27: backend aplica una vez."""
+    try:
+        return any(abs(float(value) - expected) < 0.00001 for expected in (100.0, PRINT_SCALE * 100))
+    except (ValueError, TypeError):
+        return False
+
+
+def calibrated_print_pixels(width_px, height_px, dpi_x, dpi_y, source_dpi_x=300, source_dpi_y=300, *, printable_width=0, printable_height=0):
+    """Geometría efectiva del Creador: una sola compensación, nunca auto-fit."""
+    width = max(1, round(width_px * dpi_x / source_dpi_x * PRINT_SCALE))
+    height = max(1, round(height_px * dpi_y / source_dpi_y * PRINT_SCALE))
+    if (printable_width and width > printable_width + 2) or (printable_height and height > printable_height + 2):
+        raise ValueError('La hoja calibrada no cabe en el área del driver. Revisá papel/perfil: no se aplicó una segunda reducción.')
+    return width, height
+
+
 def expected_final_size(production_cm: float) -> float:
     """Estimación del lado final tras impresión y corte interior."""
     return float(production_cm) * PRINT_SCALE - 2 * CUT_INSET_CM

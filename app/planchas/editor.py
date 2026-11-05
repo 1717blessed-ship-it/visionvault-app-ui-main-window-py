@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import copy
 import json
+import logging
 import os
 import tkinter as tk
 import threading
@@ -16,6 +17,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from app.indexer.thumbnails import load_thumbnail
 from app.performance import record_performance
+from app.planchas.output_safety import validate_sources, validate_geometry, save_image, save_text, save_page_outputs, ExportValidationError, output_action
 from app.planchas.model import A4_HEIGHT_CM, A4_WIDTH_CM, A5_PRINT_MARGIN_CM, DEFAULT_EXTRA_LAYOUT_CM, FIVE_ROW_SIZE_CM, HITBOX_INNER_CLEARANCE_CM, MAX_SIZE_CM, PRINT_MARGIN_CM, SIZE_OFFSET_CM, SPECIAL_LAYOUT_EXTRA_CM, WORKSPACE_FORMATS, PlanchaItem, PlanchaProject, size_for_image, size_from_visible_dimensions, validate_no_overlaps, visible_bbox
 from app.planchas.production_geometry import expected_final_size, production_max_for_nominal, production_min_for_nominal, proportional_production_size
 from app.ui.components import icon_button
@@ -30,6 +32,8 @@ from app.ui.theme import (
     UI_FONT,
     configure_plancha_styles,
 )
+
+logger = logging.getLogger(__name__)
 
 WORKSPACE_COLORS = {
     "a4": ("#38bdf8", "#e0f2fe"),
@@ -253,13 +257,13 @@ def add_outer_black_outline(image, pixels: int = 2):
 
 
 def size_for_record(image: dict, requested_size_cm: float = 5.0) -> tuple[float, float]:
-    """Deriva el tamaño productivo desde el nominal, sin agrandado de UI."""
-    if image.get("visible_width") and image.get("visible_height"):
-        return proportional_production_size(requested_size_cm, image["visible_width"], image["visible_height"])
-    width, height = size_for_image(image["path"], requested_size_cm)
-    major = max(width, height)
-    production_major = proportional_production_size(requested_size_cm, 1, 1)[0]
-    return width * production_major / major, height * production_major / major
+    """Deriva el tamaño desde la silueta perceptible del archivo real.
+
+    Las columnas visibles siguen siendo una caché útil para listados, pero no
+    se usan como autoridad productiva: pueden pertenecer a una versión anterior
+    del detector de alfa y contener píxeles residuales imperceptibles.
+    """
+    return size_for_image(image["path"], requested_size_cm)
 
 
 def preview_geometry(item: PlanchaItem, page_number: int = 1) -> dict[str, float | int | str]:
@@ -320,12 +324,14 @@ class PlanchaEditor(tk.Frame):
         
         # Crear proyecto inicial
         self.project = project or PlanchaProject.from_images(images)
-        self.project.layout_mode = self.layout_mode
         if project is None:
+            self.project.layout_mode = self.layout_mode
             self.project.workspace_format = workspace_format if workspace_format in WORKSPACE_FORMATS else "a4"
-        self.project.margin_cm = A5_PRINT_MARGIN_CM if self.project.workspace_format == "a5" else PRINT_MARGIN_CM
+            self.project.margin_cm = A5_PRINT_MARGIN_CM if self.project.workspace_format == "a5" else PRINT_MARGIN_CM
+        else:
+            self.layout_mode = self.project.layout_mode
         self.format_heading = tk.StringVar(value=f"PLANCHA {self.project.workspace_label.upper()}")
-        self.preserve_layout = preserve_layout
+        self.preserve_layout = preserve_layout or project is not None
         self.use_experimental_packing = False
         self.database = database
         self.order_id = order_id
@@ -577,6 +583,8 @@ class PlanchaEditor(tk.Frame):
             work, "⇄", "Convertir plancha mixta a Libre", lambda *a, _fn=self.convert_sticker_mixed_to_free: _fn(*a),
         )
         toolbar_icon(work, "◈", "Optimizar distribución", lambda *a, _fn=self.optimize: _fn(*a), tone="primary").pack(side="left", padx=(2, 0))
+        toolbar_icon(work, "⇆", "Comparar aprovechamiento (opcional, sin filas)",
+                     lambda: self.compare_optional_distribution()).pack(side="left", padx=(2, 0))
         self.workspace_button = toolbar_icon(work, "▭", "Elegir formato de venta", lambda *a, _fn=self.show_workspace_options: _fn(*a), width=3)
         self.workspace_button.pack(side="left", padx=(2, 0))
         self.regenerate_mixed_button.pack_forget()
@@ -985,9 +993,21 @@ class PlanchaEditor(tk.Frame):
         return None
 
     def _current_print_config(self) -> dict:
+        saved = getattr(getattr(self, 'project', None), '_persisted_options', {}).get('print_settings')
+        if isinstance(saved, dict):
+            return copy.deepcopy(saved)
         if not self.database:
             return {"printer_name": "", "paper": "A4", "orientation": "Vertical", "scale": 97.27, "quality": "Alta", "color": "Color", "copies": 1}
         return self.database.printing_config()
+
+    def _capture_project_settings(self, project):
+        options = getattr(project, '_persisted_options', {}).copy()
+        if 'print_settings' not in options:
+            options['print_settings'] = copy.deepcopy(self._current_print_config())
+        from app.planchas.production_geometry import PRINT_SCALE, CUT_INSET_MM
+        options.setdefault('cut_settings', {'inset_mm': CUT_INSET_MM})
+        options.setdefault('calibration', {'print_scale': PRINT_SCALE})
+        project._persisted_options = options
 
     def _print_role(self) -> str:
         """Hasta que exista el módulo de usuarios, la sesión local es administrador."""
@@ -1158,6 +1178,10 @@ class PlanchaEditor(tk.Frame):
             return False
 
     def _print_validation_error(self) -> str | None:
+        try:
+            validate_sources(self.project.items)
+        except ExportValidationError as error:
+            return str(error)
         if not self.database:
             return "No se pudo acceder a la configuración de impresión."
         if not self.plancha_id or not self.project_path or not Path(self.project_path).exists():
@@ -1182,8 +1206,9 @@ class PlanchaEditor(tk.Frame):
         if order and order["status"] not in {"Aprobado", "En diseño", "Listo para plancha"}:
             return "El estado del pedido no permite impresión."
         config = self._current_print_config()
-        if config.get("paper") != "A4" or config.get("orientation") != "Vertical" or int(config.get("scale", 0)) != 100:
-            return "La configuración fija no coincide con A4 vertical y escala 100 %."
+        from app.planchas.production_geometry import validate_print_scale
+        if config.get("paper") != "A4" or config.get("orientation") != "Vertical" or not validate_print_scale(config.get('scale')):
+            return "Configuración incompatible: se requiere A4 vertical y escala lógica 100 % o compensación calibrada 97,27 %, aplicada una sola vez."
         available, message = printer_status(config.get("printer_name") or "")
         if not available:
             return message
@@ -1325,7 +1350,8 @@ class PlanchaEditor(tk.Frame):
                 job["final_png_path"],
                 job["copies"],
                 f"Doccione · Plancha {job['plancha_id']}",
-                devmode_bytes=devmode_bytes
+                devmode_bytes=devmode_bytes,
+                strict_calibration=True,
             )
             self.after(0, lambda: self._finish_print_job(job["id"], result))
 
@@ -1525,11 +1551,7 @@ class PlanchaEditor(tk.Frame):
             schedule()
 
     def restore(self, data: dict):
-        self.project = PlanchaProject(
-            [PlanchaItem.from_dict(item) for item in data["items"]], data["margin_cm"], data["gap_cm"],
-            data.get("layout_mode", self.layout_mode), data.get("workspace_format", "a4"),
-            data.get("project_type", "legacy"), data.get("manual_from_mixed", False),
-        )
+        self.project = PlanchaProject.from_dict(data)
         self.selected_id = None
         self.selected_ids.clear()
         self.render()
@@ -1565,8 +1587,21 @@ class PlanchaEditor(tk.Frame):
         visible_size = 5 if longest_side <= FIVE_ROW_SIZE_CM + 0.02 else min(29, max(5, round(longest_side - SIZE_OFFSET_CM)))
         return f"{visible_size}cm"
 
-    def render(self):
+    def _prepare_current_project_for_preview(self) -> None:
+        """Aplica el mismo contrato geométrico a todas las vistas y salidas.
+
+        También corrige sesiones antiguas que guardaron stickers estándar con
+        escalas distintas. Si cambia alguna caja se vuelve a acomodar la hoja;
+        las siguientes vistas son idempotentes y no acumulan transformaciones.
+        """
+        if getattr(self.project, '_restored_geometry', False):
+            return
+        if self.project.normalize_standard_geometry():
+            self.project.optimize()
         self.project.keep_inside_print_area()
+
+    def render(self):
+        self._prepare_current_project_for_preview()
         self.canvas.delete("all")
         # La preview siempre representa la hoja física A4 completa. El formato
         # comercial sólo se indica con guías en la vista técnica.
@@ -1612,6 +1647,13 @@ class PlanchaEditor(tk.Frame):
         legend = self.project.legend()
         pending = f"\nSobrantes pendientes: {len(self.pending_overflow)}" if self.pending_overflow else ""
         self.stats.set(f"A4 vertical · 21 × 29,7 cm\nMargen: {self.project.margin_cm:g} cm · Separación: {self.project.gap_cm:g} cm\nOcupación: {self.project.occupancy():.1f}%\nEspacio libre: {free:.1f}%\nStickers: {len(self.project.items)} · Vista: {self.zoom * 100:.0f}%{pending}")
+        if getattr(self.project,'_persisted_options',{}).get('distribution_mode')=='optimized_gaps_v1':
+            from app.planchas.optional_distribution import indicators
+            values=indicators(self.all_projects or [self.project])
+            self.stats.set(self.stats.get()+
+                f"\nHUECOS SIN FILAS · {values['pages']} hojas\n"
+                f"{values['placed']} colocadas · {values['pending']} pendientes · {values['impossible']} imposibles\n"
+                f"Área diseños/útil: {values['occupancy']:.1f}%\nLibre hitboxes: {values['available_cm2']:.1f} cm²")
         for widget in self.legend_frame.winfo_children():
             widget.destroy()
         for color, client, order, count in legend[:4]:
@@ -2132,6 +2174,7 @@ class PlanchaEditor(tk.Frame):
             self.pending_overflow.extend(item for item in overflow if item not in self.pending_overflow)
         return overflow
 
+    @output_action
     def organize_with_pagination(self, progress=None) -> list[PlanchaItem]:
         """Organiza stickers automáticamente con paginación en múltiples planchas."""
         from app.planchas.model import PlanchaProject
@@ -2195,14 +2238,17 @@ class PlanchaEditor(tk.Frame):
         if progress:
             progress(0, 10, "Calculando distribución en planchas...")
         
-        self.all_projects = PlanchaProject.calculate_pagination(
-            all_items,
-            margin_cm=self.project.margin_cm,
-            gap_cm=self.project.gap_cm,
-            layout_mode=self.layout_mode,
-            workspace_format=self.project.workspace_format,
-            progress=progress
-        )
+        try:
+            pages = PlanchaProject.calculate_pagination(
+                all_items, margin_cm=self.project.margin_cm, gap_cm=self.project.gap_cm,
+                layout_mode=self.layout_mode, workspace_format=self.project.workspace_format,
+                progress=progress, project_type=self.project.project_type,
+            )
+        except ValueError as error:
+            self._pagination_error = str(error)
+            raise
+        self._pagination_error = None
+        self.all_projects = pages
         # La paginación crea páginas nuevas: conservar explícitamente el modo
         # del flujo que las originó para persistirlas sin reinterpretarlas.
         for page in self.all_projects:
@@ -2229,7 +2275,7 @@ class PlanchaEditor(tk.Frame):
         
         total_stickers = sum(len(project.items) for project in self.all_projects) if self.all_projects else len(self.project.items)
         self.plancha_stats_text.set(f"{total_stickers} stickers distribuidos en {self.max_planchas} plancha(s)")
-        self.plancha_counter_text.set(f"Plancha {self.plancha_number} de {self.max_planchas}")
+        self.plancha_counter_text.set(f"Plancha {self.plancha_number} de {self.max_planchas} · {len(self.project.items)} unidades")
         
         # Habilitar/deshabilitar botones según posición
         self.prev_plancha_btn.config(state="normal" if self.current_project_index > 0 else "disabled")
@@ -2832,11 +2878,62 @@ class PlanchaEditor(tk.Frame):
         return True
 
     def optimize(self):
+        if getattr(self.project,'_persisted_options',{}).pop('distribution_mode',None):
+            self.format_heading.set(f'PLANCHA {self.project.workspace_label.upper()}')
         overflow = self.organize_automatically()
         self.snapshot()
         self.render()
         if overflow:
             self.offer_overflow(overflow)
+
+    @output_action
+    def compare_optional_distribution(self):
+        """Comparación de borrador: nunca escribe reservas ni estados."""
+        from app.planchas.optional_distribution import compare_distribution, indicators
+        if self.plancha_id or self.project_path or self.preserve_layout:
+            raise ValueError('Proyecto guardado/histórico: usá un borrador nuevo sin reservas para comparar.')
+        pages=self.all_projects or [self.project]
+        items=[item for page in pages for item in page.items]
+        validate_sources(items)
+        contexts={}
+        for item in items:
+            if item.order_job_id is not None:
+                if not item.requested_unit_key or not item.order_design_line_id:
+                    raise ValueError('Falta identidad trazable de la unidad; prepará el trabajo desde Pedidos.')
+                if not self.database:
+                    raise ValueError('Falta la base para verificar compatibilidad del trabajo.')
+                row=self.database.connection.execute('SELECT material,unit_kind FROM order_jobs WHERE id=?',
+                                                     (item.order_job_id,)).fetchone()
+                if not row:
+                    raise ValueError('El trabajo de origen no existe.')
+                if self.database.connection.execute(
+                    "SELECT 1 FROM plancha_item_assignments WHERE requested_unit_key=? AND state<>'released' LIMIT 1",
+                    (item.requested_unit_key,)).fetchone():
+                    raise ValueError('Hay unidades reservadas; esta comparación no modifica reservas existentes.')
+                contexts[item.item_id]=(row['material'],self.project.workspace_format,row['unit_kind'])
+            else:
+                contexts[item.item_id]=('Biblioteca',self.project.workspace_format,item.production_unit_kind)
+        comparison=compare_distribution(self.project,pages=pages,contexts=contexts)
+        normal=indicators(comparison.normal); optimized=indicators(comparison.selected)
+        def summary(label,values):
+            return (f"{label}: {values['pages']} hojas · {values['placed']} colocadas · "
+                    f"{values['pending']} pendientes · {values['impossible']} imposibles\n"
+                    f"Diseños/área útil: {values['occupancy']:.1f}% · libre de hitboxes: {values['available_cm2']:.1f} cm²")
+        text=summary('Normal',normal)+'\n\n'+summary('Alternativa',optimized)+'\n\n'+comparison.reason
+        text+='\nModo de huecos SIN FILAS: no modifica tamaños ni contornos.'
+        if not comparison.improved:
+            messagebox.showinfo('Comparación de aprovechamiento',text,parent=self)
+            return False
+        if not messagebox.askyesno('Comparar distribución opcional',text+'\n\n¿Aplicar sólo a este borrador?',parent=self):
+            return False
+        self.all_projects=comparison.selected
+        self.project=self.all_projects[0]
+        self.current_project_index=0; self.plancha_number=1; self.max_planchas=len(self.all_projects)
+        self.selected_id=None; self.selected_ids.clear(); self._pagination_error=None
+        self.format_heading.set('HUECOS OPTIMIZADOS · SIN FILAS')
+        self.snapshot(); self.render(); self.update_plancha_navigation()
+        self.status_message(f"Aplicado: {normal['pages']} → {optimized['pages']} hojas; sin reservas nuevas.")
+        return True
 
     def show_workspace_options(self):
         """Define el tramo comercial, conservando el soporte físico A4."""
@@ -2894,6 +2991,18 @@ class PlanchaEditor(tk.Frame):
             else:
                 nominal = float(supplied_nominal or 5.0)
             width, height = size_for_record(image, nominal)
+
+            if self.project.project_type == "sticker_standard":
+                standard_major = min(
+                    production_max_for_nominal(nominal),
+                    FIVE_ROW_SIZE_CM - 0.02,
+                )
+                current_major = max(width, height)
+                if current_major > 0:
+                    width, height = (
+                        width * standard_major / current_major,
+                        height * standard_major / current_major,
+                    )
             
             # Rotación automática para stickers horizontales
             rotation = 0
@@ -2910,7 +3019,10 @@ class PlanchaEditor(tk.Frame):
                     height_cm=height,
                     nominal_size_cm=nominal,
                     rotation=rotation,
-                    rotation_allowed=True,
+                    # Mantener el lado mayor hacia arriba. La rotación para
+                    # packing queda disponible como decisión explícita en el
+                    # inspector, no como una inversión automática posterior.
+                    rotation_allowed=False,
                     layout_width_cm=width + 2 * HITBOX_INNER_CLEARANCE_CM if modern_layout else width + SPECIAL_LAYOUT_EXTRA_CM,
                     layout_height_cm=height + 2 * HITBOX_INNER_CLEARANCE_CM if modern_layout else height + SPECIAL_LAYOUT_EXTRA_CM,
                     source=str(image.get("source") or "Biblioteca"),
@@ -3773,7 +3885,11 @@ class PlanchaEditor(tk.Frame):
     def render_sheet(self, preview: bool = False, progress=None):
         from PIL import Image, ImageDraw
 
-        self.project.keep_inside_print_area()
+        if self.__dict__.get('_pagination_error'):
+            raise ExportValidationError(self._pagination_error)
+        validate_sources(self.project.items)
+        self._prepare_current_project_for_preview()
+        validate_geometry(self.project)
         dpi = 300
         # La plancha de producción se entrega como un único PNG A4 transparente:
         # solo diseños, sin celdas, guías ni información de UI.
@@ -3833,11 +3949,14 @@ class PlanchaEditor(tk.Frame):
                 x = round(geometry["design_x_cm"] / 2.54 * dpi) + (target[0] - sticker.width) // 2
                 y = round(geometry["design_y_cm"] / 2.54 * dpi) + (target[1] - sticker.height) // 2
                 sheet.alpha_composite(sticker, (x, y))
-            except Exception:
-                continue
+            except Exception as error:
+                logger.exception('Error en diseño %s: %s', item.item_id, item.path)
+                raise ExportValidationError(f'{item.name} · referencia {item.item_id} · {item.path}: {error}') from error
             finally:
                 if progress:
                     progress(index, total_items, f"Procesando diseño {index} de {total_items}")
+        if sheet.getchannel('A').getbbox() is None:
+            raise ExportValidationError('El render no contiene diseños visibles; se conserva la exportación anterior.')
         if preview:
             draw = ImageDraw.Draw(sheet)
             for item in self.project.items:
@@ -3848,6 +3967,7 @@ class PlanchaEditor(tk.Frame):
             draw.text((80, sheet.height // 2), watermark, fill=(210, 9, 22, 110), stroke_width=2)
         return sheet
 
+    @output_action
     def export_preview(self, silent: bool = False):
         if not self.project.items:
             return
@@ -3862,7 +3982,7 @@ class PlanchaEditor(tk.Frame):
         if not path:
             return
         sheet = self.render_client_preview()
-        sheet.save(path, "JPEG", quality=95, subsampling=0, dpi=(300, 300), icc_profile=None)
+        save_image(sheet, path, "JPEG", quality=95, subsampling=0, dpi=(300, 300), icc_profile=None)
         if self.database and self.plancha_id:
             self.database.request_plancha_approval(self.plancha_id, path)
             self._sync_open_order_after_approval()
@@ -3894,7 +4014,7 @@ class PlanchaEditor(tk.Frame):
             # La vista que queda en el pedido usa la misma protección que se
             # comparte con el cliente, nunca el PNG apto para producción.
             sheet = self.render_client_preview()
-            sheet.save(
+            save_image(sheet,
                 output, "JPEG", quality=95, subsampling=0, dpi=(300, 300), icc_profile=None,
             )
             
@@ -3909,8 +4029,10 @@ class PlanchaEditor(tk.Frame):
     def render_client_preview(self):
         """Renderiza una vista de cliente, aplanada y no reutilizable para impresión."""
         from PIL import Image, ImageDraw, ImageFont
+        validate_sources(self.project.items)
         
-        self.project.keep_inside_print_area()
+        self._prepare_current_project_for_preview()
+        validate_geometry(self.project)
         dpi = 300
         target_size = (round(A4_WIDTH_CM / 2.54 * dpi), round(A4_HEIGHT_CM / 2.54 * dpi))
         
@@ -3964,8 +4086,9 @@ class PlanchaEditor(tk.Frame):
                 x = round((item.x_cm + (item.reserved_width_cm - item.width_cm) / 2) / 2.54 * dpi) + (target[0] - sticker.width) // 2
                 y = round((item.y_cm + (item.reserved_height_cm - item.height_cm) / 2) / 2.54 * dpi) + (target[1] - sticker.height) // 2
                 sheet.alpha_composite(sticker, (x, y))
-            except Exception:
-                continue
+            except Exception as error:
+                logger.exception('Error en diseño %s: %s', item.item_id, item.path)
+                raise ExportValidationError(f'{item.name} · referencia {item.item_id} · {item.path}: {error}') from error
         
         # Componer la capa de diseños sobre el fondo de Doccione. Luego se
         # aplica una segunda marca encima de los diseños: quitar sólo el fondo
@@ -4020,7 +4143,7 @@ class PlanchaEditor(tk.Frame):
                 f'  <image width="{width}" height="{height}" href="data:image/png;base64,{encoded_png}"/>\n'
                 '</svg>\n'
             )
-            Path(path).write_text(svg, encoding="utf-8")
+            save_text(path, svg)
         except (OSError, ValueError) as error:
             messagebox.showerror("Guardar SVG", f"No se pudo guardar la plancha como SVG:\n{error}", parent=self)
             return
@@ -4035,7 +4158,8 @@ class PlanchaEditor(tk.Frame):
 
     def export_final(self, silent: bool = False, custom_path: str | None = None):
         if not self.project.items:
-            return
+            raise ExportValidationError('No se puede exportar una plancha vacía.')
+        self._capture_project_settings(self.project)
         if not silent and len(self.all_projects) > 1:
             # En un trabajo paginado, el botón habitual de guardado debe
             # registrar el trabajo completo; nunca una sola página aislada.
@@ -4075,10 +4199,16 @@ class PlanchaEditor(tk.Frame):
                 report_progress(len(self.project.items), len(self.project.items), "Guardando PNG final")
             # PNG sigue siendo totalmente sin pérdida; una compresión moderada
             # solo reduce el tiempo de guardado y puede generar un archivo algo mayor.
-            sheet.save(output, "PNG", dpi=(300, 300), compress_level=3)
+            save_image(sheet, output, "PNG", dpi=(300, 300), compress_level=3)
             export_completed = True
             if not silent:
                 report_progress(len(self.project.items) + 1, len(self.project.items) + 1, "PNG final listo")
+        except (ExportValidationError, OSError) as error:
+            logger.exception('Exportación fallida: %s', output)
+            if silent:
+                raise
+            messagebox.showerror('Exportación bloqueada', str(error), parent=self)
+            return False
         finally:
             record_performance(
                 "export_final_png",
@@ -4158,7 +4288,7 @@ class PlanchaEditor(tk.Frame):
                 )
                 self.project = project
                 sheet = self.render_sheet(preview=False)
-                sheet.save(final_path, "PNG", dpi=(300, 300), compress_level=3)
+                save_image(sheet, final_path, "PNG", dpi=(300, 300), compress_level=3)
                 self.database.set_plancha_final_png(plancha_id, str(final_path))
                 plancha_ids.append(plancha_id)
                 report_progress(index, len(projects), f"Plancha {index} lista")
@@ -4184,7 +4314,10 @@ class PlanchaEditor(tk.Frame):
         initial_plancha_id = self.plancha_id if self.plancha_id and self.final_png_path else None
         ContinuousProductionEditor(self, self.database, initial_plancha_id=initial_plancha_id)
 
+    @output_action
     def save_project(self):
+        validate_sources(self.project.items)
+        self._capture_project_settings(self.project)
         path = filedialog.asksaveasfilename(title="Guardar proyecto de plancha", defaultextension=".doccione-plancha.json", filetypes=[("Proyecto Doccione", "*.doccione-plancha.json"), ("JSON", "*.json")])
         if path:
             # Si hay múltiples planchas, guardar todas como un conjunto
@@ -4244,10 +4377,15 @@ class PlanchaEditor(tk.Frame):
         self.all_projects = projects
         self.save_plancha_set(str(base_path))
 
+    @output_action
     def save_plancha_set(self, base_path: str):
         """Guarda un conjunto de planchas múltiples como proyectos individuales vinculados."""
         import uuid
         from datetime import datetime
+
+        validate_sources([item for project in self.all_projects for item in project.items])
+        for project in self.all_projects:
+            self._capture_project_settings(project)
         
         if not self.database:
             messagebox.showwarning("Guardado", "Se requiere conexión a la base de datos para guardar conjuntos de planchas.", parent=self)
@@ -4274,14 +4412,17 @@ class PlanchaEditor(tk.Frame):
         original_index = self.current_project_index
         
         # Guardar cada plancha del conjunto
+        def render_page(project):
+            self.project = project
+            return self.render_sheet(preview=False)
+        try:
+            save_page_outputs(self.all_projects, base_path, render_page)
+        finally:
+            self.project, self.current_project_index = original_project, original_index
         for index, project in enumerate(self.all_projects):
             plancha_number = index + 1
             plancha_path = base_dir / f"{base_name}_plancha_{plancha_number}.json"
             final_path = base_dir / f"{base_name}_plancha_{plancha_number}.png"
-            project.save(str(plancha_path))
-            self.project = project
-            sheet = self.render_sheet(preview=False)
-            sheet.save(final_path, "PNG", dpi=(300, 300), compress_level=3)
             
             # Guardar en base de datos con metadatos del conjunto
             plancha_id = self.database.save_plancha_project(
@@ -4338,8 +4479,11 @@ class PlanchaEditor(tk.Frame):
         if not path:
             return
         try:
-            self.project = PlanchaProject.load(path)
-            self.project.margin_cm = A5_PRINT_MARGIN_CM if self.project.workspace_format == "a5" else PRINT_MARGIN_CM
+            self.all_projects = PlanchaProject.load_pages(path)
+            self.project = self.all_projects[0]
+            self.current_project_index = 0
+            self.max_planchas = len(self.all_projects)
+            self.plancha_number = 1
             self.layout_mode = self.project.layout_mode
             title_kind = "especial" if self.layout_mode == "special" else "clásica"
             self.title(f"Plancha {self.plancha_number} de {self.max_planchas} · {title_kind} · {self.project.workspace_label}")

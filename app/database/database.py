@@ -7,6 +7,7 @@ import unicodedata
 import threading
 import logging
 import uuid
+import math
 from pathlib import Path
 from decimal import Decimal
 from dataclasses import asdict
@@ -21,6 +22,7 @@ from costos.services.variable_cost_calculator import VariableCostCalculator
 from app.database.maintenance import DatabaseMaintenance, MigrationRunner
 from app.database.migrations import application_migrations
 from app.diagnostics import record_health
+from app.database.order_transaction import OrderConnection
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +124,14 @@ class ImageDatabase:
         self._visual_search_cache: tuple[int, list[dict]] | None = None
         self._images_by_paths_cache: dict[tuple[str, ...], list[dict]] = {}
 
+        if exists and size > 0:
+            job_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(order_jobs)")}
+            if job_columns and "distribution_policy" not in job_columns:
+                self.maintenance.create_backup("pre_order_distribution_policy")
+            if job_columns and not self.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='order_delivery_readiness'"
+            ).fetchone():
+                self.maintenance.create_backup("pre_verified_delivery")
         self._initialize_schema()
         self.applied_migrations = MigrationRunner(self.connection, self.maintenance).apply_all(
             application_migrations(),
@@ -157,7 +167,7 @@ class ImageDatabase:
         return self.last_automatic_backup
 
     def _create_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30, factory=OrderConnection)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout = 30000")
@@ -168,6 +178,20 @@ class ImageDatabase:
         if not hasattr(self._thread_connections, 'conn'):
             self._thread_connections.conn = self._create_connection()
         return self._thread_connections.conn
+
+    @property
+    def event_repo(self):
+        # Outbox rows must use the same per-thread transaction as the order.
+        from app.events.event_repository import EventRepository
+        repo = getattr(self._thread_connections, 'event_repo', None)
+        if repo is None or repo.conn is not self.connection:
+            repo = EventRepository(self.connection)
+            self._thread_connections.event_repo = repo
+        return repo
+
+    @event_repo.setter
+    def event_repo(self, repository):
+        self._thread_connections.event_repo = repository
 
     def _initialize_schema(self) -> None:
         # Ensure the schema exists on the first connection for this database.
@@ -545,6 +569,18 @@ class ImageDatabase:
         )
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_order_payments_order ON order_payments(order_id, paid_at DESC)"
+        )
+        payment_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(order_payments)")}
+        for column, definition in (
+            ("cancelled_at", "TEXT DEFAULT ''"),
+            ("cancellation_reason", "TEXT DEFAULT ''"),
+            ("idempotency_key", "TEXT DEFAULT ''"),
+        ):
+            if column not in payment_columns:
+                self.connection.execute(f"ALTER TABLE order_payments ADD COLUMN {column} {definition}")
+        self.connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_order_payments_idempotency "
+            "ON order_payments(order_id, idempotency_key) WHERE idempotency_key <> ''"
         )
         self.connection.execute(
             """CREATE TABLE IF NOT EXISTS order_previews (
@@ -1609,6 +1645,7 @@ class ImageDatabase:
         title = str(job.get("title", "") or "").strip() or f"Producto {position + 1}"
         return {
             "id": job.get("id"), "title": title,
+            "distribution_policy": str(job.get("distribution_policy") or "legacy"),
             "unit_kind": str(job.get("unit_kind", "") or "").strip().casefold()
             if str(job.get("unit_kind", "") or "").strip().casefold() in {"item", "sheet"} else "",
             "material": str(job.get("material", "") or "").strip(),
@@ -1658,21 +1695,31 @@ class ImageDatabase:
                 continue
             produced = float(self.connection.execute(
                 """SELECT COALESCE(SUM(quantity),0) FROM plancha_item_assignments
-                   WHERE order_job_id=? AND state IN ('printed','finished')""",
+                   WHERE order_job_id=? AND state<>'released'""",
                 (int(job["id"]),),
             ).fetchone()[0] or 0)
             if float(job["quantity"]) < produced:
                 raise ValueError(
                     f"No se puede reducir el trabajo #{job['id']} a {job['quantity']}: "
-                    f"ya hay {produced:g} unidad(es) impresas o terminadas. "
+                    f"ya hay {produced:g} unidad(es) reservadas, impresas o terminadas. "
                     "Conservá la cantidad histórica y registrá el ajuste como una línea nueva."
                 )
         existing_ids = {int(row[0]) for row in self.connection.execute(
             "SELECT id FROM order_jobs WHERE order_id=?", (order_id,)
         )}
+        if len(supplied_ids) != sum(job.get("id") is not None for job in clean_jobs) or not supplied_ids <= existing_ids:
+            raise ValueError("Los trabajos deben ser únicos y pertenecer al pedido.")
+        for job in clean_jobs:
+            original = jobs[job["sort_order"]] if job["sort_order"] < len(jobs) else {}
+            if job.get("id") is not None and "distribution_policy" not in original:
+                policy = self.connection.execute("SELECT distribution_policy FROM order_jobs WHERE id=?", (job["id"],)).fetchone()
+                if policy:
+                    job["distribution_policy"] = policy[0]
+            if job["distribution_policy"] not in {"legacy", "complete", "partial"}:
+                raise ValueError("La política de distribución no es válida.")
         for obsolete_id in existing_ids - supplied_ids:
             history = self.connection.execute(
-                "SELECT 1 FROM plancha_item_assignments WHERE order_job_id=? AND state IN ('printed','finished') LIMIT 1",
+                "SELECT 1 FROM plancha_item_assignments WHERE order_job_id=? LIMIT 1",
                 (obsolete_id,),
             ).fetchone()
             if history:
@@ -1680,12 +1727,36 @@ class ImageDatabase:
             self.connection.execute("DELETE FROM order_jobs WHERE id=?", (obsolete_id,))
         for job in clean_jobs:
             if job.get("id") is not None:
+                previous = dict(self.connection.execute("SELECT * FROM order_jobs WHERE id=?", (job["id"],)).fetchone())
+                commercial_keys = ("product_id", "variant_id", "subtotal", "cost_total", "price_rule_id")
+                if any(previous.get(key) != job.get(key) for key in commercial_keys):
+                    self.connection.execute(
+                        "INSERT INTO order_events(order_id,event_type,message,data_json,created_at) VALUES(?,?,?,?,?)",
+                        (order_id, "Trabajo comercial", f"Cambio comercial del trabajo #{job['id']}", json.dumps({
+                            "order_job_id": job["id"], "origin": "order_editor",
+                            "before": {key: previous.get(key) for key in commercial_keys},
+                            "after": {key: job.get(key) for key in commercial_keys},
+                        }, ensure_ascii=False), now),
+                    )
+                self.connection.execute("UPDATE order_jobs SET distribution_policy=? WHERE id=?", (job["distribution_policy"], job["id"]))
                 self.connection.execute(
                     """UPDATE order_jobs SET title=?,material=?,size=?,quantity=?,unit_kind=?,subtotal=?,discount_percent=?,
-                       extra_services=?,status=?,notes=?,sort_order=?,updated_at=? WHERE id=? AND order_id=?""",
+                       extra_services=?,status=?,notes=?,sort_order=?,cost_mp=?,cost_mo=?,cost_cf=?,cost_total=?,
+                       product_id=?,variant_id=?,price_list_id=?,price_rule_id=?,unit_price_snapshot=?,fixed_price_snapshot=?,
+                       manual_override=?,manual_override_reason=?,base_price_snapshot=?,suggested_price_snapshot=?,
+                       applied_price_snapshot=?,manual_price_snapshot=?,price_source=?,productive_cost=?,
+                       commercial_cost_allocated=?,final_cost=?,productive_margin=?,final_margin=?,
+                       productive_classification=?,production_mode=?,updated_at=? WHERE id=? AND order_id=?""",
                     (job["title"], job["material"], job["size"], job["quantity"], job["unit_kind"], job["subtotal"],
                      job["discount_percent"], job["extra_services"], job["status"], job["notes"],
-                     job["sort_order"], now, int(job["id"]), order_id),
+                     job["sort_order"], job["cost_mp"], job["cost_mo"], job["cost_cf"], job["cost_total"],
+                     job["product_id"], job["variant_id"], job["price_list_id"], job["price_rule_id"],
+                     job["unit_price_snapshot"], job["fixed_price_snapshot"], job["manual_override"],
+                     job["manual_override_reason"], job["base_price_snapshot"], job["suggested_price_snapshot"],
+                     job["applied_price_snapshot"], job["manual_price_snapshot"], job["price_source"],
+                     job["productive_cost"], job["commercial_cost_allocated"], job["final_cost"],
+                     job["productive_margin"], job["final_margin"], job["productive_classification"],
+                     job["production_mode"], now, int(job["id"]), order_id),
                 )
                 continue
             cursor = self.connection.execute(
@@ -1712,6 +1783,7 @@ class ImageDatabase:
                 ),
             )
             job["id"] = int(cursor.lastrowid)
+            self.connection.execute("UPDATE order_jobs SET distribution_policy=? WHERE id=?", (job["distribution_policy"], job["id"]))
             try:
                 jobs[job["sort_order"]]["id"] = job["id"]
             except (IndexError, TypeError):
@@ -2266,7 +2338,9 @@ class ImageDatabase:
             ) AS job_financials ON job_financials.order_id = orders.id
             LEFT JOIN (
                 SELECT order_id, SUM(amount) AS paid_amount
-                FROM order_payments GROUP BY order_id
+                FROM order_payments
+                WHERE COALESCE(cancelled_at, '') = ''
+                GROUP BY order_id
             ) AS payment_totals ON payment_totals.order_id = orders.id
         """
         clauses: list[str] = ["COALESCE(orders.is_archived, 0) = 0"]
@@ -2391,6 +2465,9 @@ class ImageDatabase:
         if current == "Entregado":
             raise ValueError("El pedido ya está marcado como Entregado.")
         with self.connection:
+            from app.services.delivery_readiness import assert_deliverable
+            self.connection.execute("UPDATE orders SET id=id WHERE id=?", (order_id,))
+            assert_deliverable(self.connection, order_id)
             self.connection.execute(
                 "UPDATE order_jobs SET status = 'Entregado', updated_at = ? WHERE order_id = ?",
                 (now, order_id),
@@ -2494,7 +2571,6 @@ class ImageDatabase:
         if not client:
             raise ValueError("Indicá el cliente del pedido.")
         whatsapp = str(values.get("whatsapp", "")).strip()
-        client_id = self._ensure_client(client, whatsapp, now)
         quantity = max(0, int(values.get("quantity", 0) or 0))
         try:
             print_priority = _manual_priority_value(values.get("print_priority", 0))
@@ -2543,6 +2619,12 @@ class ImageDatabase:
                 )
         sole_job_id = None
         with self.connection:
+            client_id = self._ensure_client(client, whatsapp, now)
+            if status.strip().casefold() in {"entregado", "terminado", "completado"}:
+                previous_status = self.connection.execute("SELECT status FROM orders WHERE id=?", (order_id,)).fetchone()
+                if previous_status and previous_status[0] != status:
+                    from app.services.delivery_readiness import assert_deliverable
+                    assert_deliverable(self.connection, order_id)
             self.connection.execute(
                 """UPDATE orders SET client = ?, whatsapp = ?, client_id = ?,
                    status = ?, material = ?, size = ?, quantity = ?, price = ?, discount_percent = ?,
@@ -2570,9 +2652,16 @@ class ImageDatabase:
                 if job.get("id") is not None and str(job.get("id")).isdigit()
             ]
             sole_job_id = persisted_job_ids[0] if len(persisted_job_ids) == 1 else None
-            jobs_by_id = {int(job["id"]): job for job in (jobs or []) if job.get("id") is not None}
+            jobs_by_id = {int(job["id"]): job for job in self.order_jobs(order_id)}
+            if not persisted_job_ids:
+                sole_job_id = next(iter(jobs_by_id)) if len(jobs_by_id) == 1 else None
+            line_ids = [str(d["design_line_id"]) for d in designs if d.get("design_line_id")]
+            if len(line_ids) != len(set(line_ids)):
+                raise ValueError("La misma línea de diseño no puede distribuirse dos veces.")
             distributed: dict[int, int] = {}
             for design in designs:
+                if int(design.get("quantity", 1) or 0) <= 0:
+                    raise ValueError("La cantidad de cada diseño debe ser mayor que cero.")
                 linked = design.get("order_job_id") or sole_job_id
                 if linked is None and design.get("order_job_index") is not None and jobs is not None:
                     try:
@@ -2581,6 +2670,11 @@ class ImageDatabase:
                         linked = None
                 if linked is not None:
                     linked = int(linked)
+                    if linked not in jobs_by_id:
+                        raise ValueError("El diseño referencia un trabajo ajeno al pedido.")
+                    job_unit = jobs_by_id[linked].get("unit_kind")
+                    if design.get("unit_kind") and job_unit and design["unit_kind"] != job_unit:
+                        raise ValueError("La unidad del diseño debe coincidir con la del trabajo.")
                     distributed[linked] = distributed.get(linked, 0) + max(1, int(design.get("quantity", 1) or 1))
             for job_id, assigned in distributed.items():
                 requested = int(jobs_by_id.get(job_id, {}).get("quantity") or 0)
@@ -2589,6 +2683,9 @@ class ImageDatabase:
                         f"Los diseños del trabajo '{jobs_by_id[job_id].get('title') or job_id}' distribuyen "
                         f"{assigned} unidades, pero el trabajo solicita {requested}."
                     )
+            for job_id, job in jobs_by_id.items():
+                if job.get("distribution_policy") == "complete" and distributed.get(job_id, 0) != int(job["quantity"]):
+                    raise ValueError(f"La distribución completa de '{job['title']}' debe coincidir con la cantidad solicitada.")
             self.connection.execute("DELETE FROM order_designs WHERE order_id = ?", (order_id,))
             self.connection.execute("DELETE FROM order_design_job_links WHERE order_id = ?", (order_id,))
             self.connection.execute("DELETE FROM order_design_demand_lines WHERE order_id = ?", (order_id,))
@@ -2930,10 +3027,10 @@ class ImageDatabase:
                 raise ValueError("El trabajo ya no existe en este pedido.")
             job = dict(row)
             if self.connection.execute(
-                "SELECT 1 FROM plancha_item_assignments WHERE order_job_id=? AND state<>'released' LIMIT 1",
+                "SELECT 1 FROM plancha_item_assignments WHERE order_job_id=? LIMIT 1",
                 (job_id,),
             ).fetchone():
-                raise ValueError("El trabajo tiene unidades preparadas o producidas y no puede eliminarse.")
+                raise ValueError("El trabajo conserva reservas o historial productivo y no puede eliminarse.")
             self.connection.execute("DELETE FROM order_design_job_links WHERE order_job_id=?", (job_id,))
             self.connection.execute("DELETE FROM order_jobs WHERE id = ? AND order_id = ?", (job_id, order_id))
             remaining = self.connection.execute(
@@ -2995,7 +3092,8 @@ class ImageDatabase:
         if not row:
             return {"subtotal": 0.0, "discount_percent": 0.0, "budget_total": 0.0, "paid_amount": 0.0, "pending_amount": 0.0, "payment_status": "Pendiente", "cost_mp": 0.0, "cost_mo": 0.0, "cost_cf": 0.0, "seller_commission_percent": 0.0, "seller_commission_amount": 0.0, "cost_total": 0.0, "margin": 0.0}
         paid = self.connection.execute(
-            "SELECT COALESCE(SUM(amount), 0) FROM order_payments WHERE order_id = ?", (order_id,)
+            """SELECT COALESCE(SUM(amount), 0) FROM order_payments
+               WHERE order_id = ? AND COALESCE(cancelled_at, '') = ''""", (order_id,)
         ).fetchone()[0]
         jobs = self.order_jobs(order_id)
         if jobs:
@@ -3227,24 +3325,37 @@ class ImageDatabase:
             "paid_delta_pct":      paid_delta_pct,
         }
 
-    def register_order_payment(self, order_id: int, amount: float, method: str = "", note: str = "") -> dict:
+    def register_order_payment(self, order_id: int, amount: float, method: str = "", note: str = "",
+                               idempotency_key: str = "") -> dict:
         from datetime import datetime
 
         amount = round(float(amount), 2)
-        if amount <= 0:
+        if not math.isfinite(amount) or amount <= 0:
             raise ValueError("El cobro debe ser mayor que cero.")
+        key = str(idempotency_key or "").strip()
         now = datetime.now().isoformat(timespec="seconds")
         with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            if not self.connection.execute("SELECT 1 FROM orders WHERE id=?", (order_id,)).fetchone():
+                raise ValueError("El pedido no existe.")
+            if key:
+                existing = self.connection.execute(
+                    "SELECT * FROM order_payments WHERE order_id=? AND idempotency_key=?", (order_id, key),
+                ).fetchone()
+                if existing:
+                    if (float(existing['amount']), existing['method'], existing['note']) != (amount, method.strip(), note.strip()):
+                        raise ValueError("La clave de pago ya fue utilizada con datos incompatibles.")
+                    return self.order_financials(order_id)
             self.connection.execute(
-                "INSERT INTO order_payments(order_id, amount, method, note, paid_at, created_at) VALUES(?, ?, ?, ?, ?, ?)",
-                (order_id, amount, method.strip(), note.strip(), now, now),
+                """INSERT INTO order_payments(order_id, amount, method, note, paid_at, created_at, idempotency_key)
+                   VALUES(?, ?, ?, ?, ?, ?, ?)""",
+                (order_id, amount, method.strip(), note.strip(), now, now, key),
             )
-        financials = self.order_financials(order_id)
-        self.connection.execute(
-            "UPDATE orders SET budget_total = ?, paid_amount = ?, payment_status = ?, updated_at = ? WHERE id = ?",
-            (financials["budget_total"], financials["paid_amount"], financials["payment_status"], now, order_id),
-        )
-        self.connection.commit()
+            financials = self.order_financials(order_id)
+            self.connection.execute(
+                "UPDATE orders SET budget_total = ?, paid_amount = ?, payment_status = ?, updated_at = ? WHERE id = ?",
+                (financials["budget_total"], financials["paid_amount"], financials["payment_status"], now, order_id),
+            )
         self.add_order_event(order_id, "Cobro", f"Cobro registrado: ${amount:,.2f}" + (f" · {method.strip()}" if method.strip() else ""), {"amount": amount, "method": method, "note": note})
         try:
             self.event_repo.publish_event(
@@ -3266,8 +3377,8 @@ class ImageDatabase:
         )
         return [dict(row) for row in rows]
 
-    def cancel_order_payment(self, order_id: int, payment_id: int) -> dict:
-        """Cancel a recorded payment and rebuild the order financial summary."""
+    def cancel_order_payment(self, order_id: int, payment_id: int, reason: str = "") -> dict:
+        """Anula un cobro sin borrar su registro contable ni su trazabilidad."""
         from datetime import datetime
 
         payment = self.connection.execute(
@@ -3275,20 +3386,27 @@ class ImageDatabase:
         ).fetchone()
         if not payment:
             raise ValueError("El cobro ya no existe o no pertenece a este pedido.")
+        if str(payment["cancelled_at"] or ""):
+            raise ValueError("El cobro ya fue cancelado.")
         amount = float(payment["amount"] or 0)
         method = str(payment["method"] or "").strip()
         now = datetime.now().isoformat(timespec="seconds")
         with self.connection:
-            self.connection.execute("DELETE FROM order_payments WHERE id = ?", (payment_id,))
-        financials = self.order_financials(order_id)
-        self.connection.execute(
-            "UPDATE orders SET budget_total = ?, paid_amount = ?, payment_status = ?, updated_at = ? WHERE id = ?",
-            (financials["budget_total"], financials["paid_amount"], financials["payment_status"], now, order_id),
-        )
-        self.connection.commit()
+            cursor = self.connection.execute(
+                """UPDATE order_payments SET cancelled_at=?, cancellation_reason=?
+                   WHERE id=? AND order_id=? AND COALESCE(cancelled_at,'')=''""",
+                (now, str(reason or "").strip(), payment_id, order_id),
+            )
+            if not cursor.rowcount:
+                raise ValueError("El cobro ya fue cancelado.")
+            financials = self.order_financials(order_id)
+            self.connection.execute(
+                "UPDATE orders SET budget_total = ?, paid_amount = ?, payment_status = ?, updated_at = ? WHERE id = ?",
+                (financials["budget_total"], financials["paid_amount"], financials["payment_status"], now, order_id),
+            )
         self.add_order_event(
             order_id, "Cobro cancelado", f"Cobro cancelado: ${amount:,.2f}" + (f" · {method}" if method else ""),
-            {"payment_id": payment_id, "amount": amount, "method": method},
+            {"payment_id": payment_id, "amount": amount, "method": method, "reason": str(reason or "").strip()},
         )
         return self.order_financials(order_id)
 
@@ -3325,9 +3443,11 @@ class ImageDatabase:
                       orders.whatsapp, orders.created_at, orders.order_date, orders.status,
                       orders.budget_total,
                       COALESCE((SELECT SUM(amount) FROM order_payments
-                                WHERE order_id = orders.id), 0) AS paid_amount,
+                                WHERE order_id = orders.id
+                                  AND COALESCE(cancelled_at, '') = ''), 0) AS paid_amount,
                       COALESCE((SELECT MAX(paid_at) FROM order_payments
-                                WHERE order_id = orders.id), '') AS last_payment_at,
+                                WHERE order_id = orders.id
+                                  AND COALESCE(cancelled_at, '') = ''), '') AS last_payment_at,
                       COALESCE((SELECT GROUP_CONCAT(
                           CASE WHEN TRIM(COALESCE(title, '')) <> '' THEN title ELSE 'Producto' END
                           || CASE WHEN TRIM(COALESCE(material, '')) <> '' THEN ' · ' || material ELSE '' END,
@@ -3523,6 +3643,7 @@ class ImageDatabase:
                    COALESCE(SUM(amount), 0) AS paid
             FROM order_payments
             WHERE paid_at IS NOT NULL
+              AND COALESCE(cancelled_at, '') = ''
               AND strftime('%Y-%m', paid_at) = ?
             GROUP BY d
             """,
@@ -6734,6 +6855,11 @@ class ImageDatabase:
             ).fetchone()
             if not job or int(job[0]) != int(order_id):
                 raise ValueError("La procedencia de un elemento no coincide con el trabajo del pedido.")
+            raw_quantity = float(item.get("production_quantity", 1))
+            if not math.isfinite(raw_quantity) or raw_quantity <= 0:
+                raise ValueError("La cantidad productiva debe ser mayor que cero.")
+            if item_id in desired:
+                raise ValueError("La plancha contiene un elemento productivo repetido.")
             desired[item_id] = {
                 "item_id": item_id, "requested_unit_key": unit_key,
                 "order_id": int(order_id), "order_job_id": int(order_job_id),
@@ -6741,7 +6867,7 @@ class ImageDatabase:
                 "image_path": str(item.get("path") or ""),
                 "copy_number": max(1, int(item.get("copy_number") or 1)),
                 "unit_kind": str(item.get("production_unit_kind") or "item"),
-                "quantity": max(0.0, float(item.get("production_quantity") or 1)),
+                "quantity": raw_quantity,
             }
         existing = {
             str(row["item_id"]): dict(row)
@@ -6956,6 +7082,8 @@ class ImageDatabase:
                 ).fetchone()
                 if produced or printed_history:
                     raise RuntimeError("La plancha tiene producción registrada y debe conservarse como historial.")
+                if self.connection.execute("SELECT 1 FROM production_batch_planchas WHERE plancha_id=?", (plancha_id,)).fetchone():
+                    raise RuntimeError("La plancha pertenece a una tanda; cancelá la tanda para conservar su trazabilidad.")
                 self.connection.execute("DELETE FROM plancha_item_assignments WHERE plancha_id = ?", (plancha_id,))
                 self.connection.execute("DELETE FROM order_previews WHERE plancha_id = ?", (plancha_id,))
                 self.connection.execute("DELETE FROM print_history WHERE plancha_id = ?", (plancha_id,))
@@ -7389,6 +7517,8 @@ class ImageDatabase:
         project = self.plancha_project(plancha_id)
         if not project:
             raise ValueError("La plancha no está guardada.")
+        if project.get("production_status") == "Cancelada":
+            raise ValueError("La plancha fue retirada de una tanda cancelada y no puede imprimirse.")
         order = self.order(int(project["order_id"])) if project.get("order_id") else None
         priority = max(0, int((order or {}).get("print_priority", 0) or 0))
         delivery_date = (order or {}).get("delivery_date", "") or ""
