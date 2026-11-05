@@ -151,7 +151,8 @@ class StickerHardeningTests(unittest.TestCase):
             }])
             item = project.items[0]
             self.assertAlmostEqual(max(item.production_width_cm, item.production_height_cm), production_min_for_nominal(8.))
-            self.assertAlmostEqual(item.production_width_cm / item.production_height_cm, 2.)
+            self.assertAlmostEqual(item.production_height_cm / item.production_width_cm, 2.)
+            self.assertEqual(item.rotation, 90)
             image = Image.new("RGBA", (100, 100))
             draw = ImageDraw.Draw(image)
             draw.ellipse((8, 8, 91, 91), fill="white")

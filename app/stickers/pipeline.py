@@ -1599,8 +1599,11 @@ class StickerProcessor:
         from PIL import Image
         import numpy as np
 
-        # Get bounding box of the alpha mask
-        bbox = alpha.getbbox()
+        # Ignorar contaminación alfa imperceptible. Sin este umbral, uno o
+        # dos píxeles con opacidad 1..8 pueden conservar todo el lienzo y el
+        # sticker queda visualmente pequeño al normalizar el master cuadrado.
+        visible_alpha = alpha.point(lambda value: 255 if value > 8 else 0)
+        bbox = visible_alpha.getbbox()
         if bbox is None:
             return rgba
 

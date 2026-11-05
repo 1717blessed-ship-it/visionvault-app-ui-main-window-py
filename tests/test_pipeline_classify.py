@@ -259,6 +259,27 @@ class TestProcessFlows(unittest.TestCase):
                     self.assertTrue(Path(result.artifacts[key]).exists(),
                                     msg=f"{key} no existe en disco")
 
+    def test_strip_existing_border_accepts_dark_uint8_background_without_dtype_cast(self):
+        """Regresión: la saturación fraccionaria no se vuelca en un out int16."""
+        import numpy as np
+        from app.stickers.pipeline import ClassifyResult, ImageCase, StickerProcessor
+
+        classify = ClassifyResult(
+            case=ImageCase.B, design_mode="Color uniforme", reasons=["regresión"],
+            has_transparency=False, has_white_border=True, has_grey_border=False,
+            has_black_outline=False, uniform_background=True, is_photo=False,
+            bg_color=(0, 0, 0),
+        )
+        for source in (
+            Image.new("RGBA", (40, 40), (0, 0, 0, 255)),
+            Image.fromarray(np.full((40, 40, 4), (12, 10, 8, 255), dtype=np.uint8), "RGBA"),
+        ):
+            ImageDraw.Draw(source).rectangle((10, 10, 29, 29), fill=(220, 60, 40, 255))
+            alpha = StickerProcessor._strip_existing_border(source, classify)
+            self.assertEqual(alpha.mode, "L")
+            self.assertEqual(alpha.getpixel((0, 0)), 0)
+            self.assertEqual(alpha.getpixel((20, 20)), 255)
+
     def test_master_tiene_dpi_300_y_tamano_correcto(self):
         from app.stickers.pipeline import ProcessingProfile
         result = self._run(_png_transparent())

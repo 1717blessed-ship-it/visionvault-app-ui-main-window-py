@@ -177,6 +177,22 @@ class TestIntegratedBackgroundFix:
         assert cropped.size[0] > 50
         assert cropped.size[1] > 50
 
+    def test_safe_crop_ignores_nearly_invisible_alpha_residue(self, processor):
+        rgba = Image.new("RGBA", (200, 200), (0, 0, 0, 0))
+        alpha = Image.new("L", (200, 200), 0)
+        rgba.putpixel((2, 2), (255, 255, 255, 4))
+        alpha.putpixel((2, 2), 4)
+        for x in range(80, 120):
+            for y in range(60, 140):
+                rgba.putpixel((x, y), (255, 0, 0, 255))
+                alpha.putpixel((x, y), 255)
+
+        cropped = processor._safe_crop_with_margin(
+            rgba, alpha, safety_margin_px=0,
+        )
+
+        assert cropped.size == (40, 80)
+
     def test_flow_c_with_integrated_background(self, processor, tmp_path):
         """Test Flow C with integrated background PNG."""
         # Create test PNG with integrated dark background

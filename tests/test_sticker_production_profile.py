@@ -63,7 +63,8 @@ def test_creator_resolution_does_not_become_plancha_physical_size():
     assert max(item.production_width_cm, item.production_height_cm) == pytest.approx(
         production_min_for_nominal(nominal))
     assert max(item.production_width_cm, item.production_height_cm) < profile.resolved_asset_target_size_cm
-    assert item.production_width_cm / item.production_height_cm == pytest.approx(2.0)
+    assert item.production_height_cm / item.production_width_cm == pytest.approx(2.0)
+    assert item.rotation == 90
 
 
 def test_resolution_change_preserves_normalized_mask_topology():

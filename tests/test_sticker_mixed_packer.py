@@ -61,6 +61,11 @@ def test_sticker_mixed_packer_preserves_rectangular_aspect_and_rotation():
     assert len(packed) == 2
     assert all(max(item.width_cm, item.height_cm) / min(item.width_cm, item.height_cm) == pytest.approx(2) for item in packed)
     assert all(item.nominal_size_cm == 8 for item in packed)
+    assert all(item.height_cm > item.width_cm for item in source)
+    assert all(item.rotation == 90 for item in source)
+    assert all(item.height_cm > item.width_cm for item in packed)
+    assert all(item.rotation == 90 for item in packed)
+    assert all(not item.rotation_allowed for item in source)
 
 
 def test_sticker_mixed_packer_keeps_existing_rectangular_orientation():
@@ -68,9 +73,6 @@ def test_sticker_mixed_packer_keeps_existing_rectangular_orientation():
         "path": "rotated-wide.png", "visible_width": 200, "visible_height": 100,
         "order_id": 3, "order_size_cm": 8,
     }]).items
-    source[0].width_cm, source[0].height_cm = source[0].height_cm, source[0].width_cm
-    source[0].rotation = 90
-
     packed = _all_items(StickerMixedPacker(allow_rotation=False).pack(source))
 
     assert len(packed) == 1
