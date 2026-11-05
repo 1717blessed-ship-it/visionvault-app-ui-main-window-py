@@ -23,6 +23,8 @@ __pycache__/
 .pytest*/
 .pytest-*/
 .pytest_*/
+pytest-*/
+pytest_*/
 .codex_test_tmp/
 .test*/
 _test*/
@@ -125,3 +127,19 @@ ui_settings.json
 *.backup-*
 diagnostic_sample.png
 diagnostico_regresion_or_fix.zip
+
+# Historical loose files kept locally during repository closure. Maintained
+# documentation, tools and tests belong under docs/, tools|scripts/ and tests/.
+/.devin/
+/*.md
+/*.txt
+/*.py
+/*.ps1
+/*.bat
+/*.cmd
+/app/stickers/*.backup_or_fix
+/examples/demo_*grey_halo*.py
+/examples/validate_with_real_image.py
+/mobile/doccione_mobile/*.md
+/mobile/doccione_mobile/*.ps1
+/mobile/doccione_mobile/*.bat
